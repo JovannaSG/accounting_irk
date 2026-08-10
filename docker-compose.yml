@@ -5,7 +5,6 @@ services:
     container_name: accounting_irk
     ports:
       - "8501:8501"
-      - "8000:8000"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]
