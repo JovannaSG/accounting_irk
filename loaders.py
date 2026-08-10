@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import numbers
 import re
+import warnings
 from html.parser import HTMLParser
 from typing import Optional
 
@@ -112,6 +113,10 @@ def _to_number(v) -> float:
     try:
         return float(s)
     except ValueError:
+        warnings.warn(
+            f"Нечисловое значение в ячейке ОСВ: {v!r} — заменено на 0",
+            stacklevel=2,
+        )
         return 0.0
 
 

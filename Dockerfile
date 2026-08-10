@@ -6,10 +6,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py auditor.py loaders.py api_client.py ./
+COPY app.py auditor.py loaders.py api_client.py ml.py ./
 COPY sample_data.csv sample_documents.csv ./
 
 EXPOSE 8501

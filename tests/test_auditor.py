@@ -60,6 +60,18 @@ def test_settlement_and_loss_accounts_not_red():
     assert not [e for e in errors if "Красное сальдо" in e["title"]]
 
 
+def test_red_balance_period_of_occurrence():
+    df = osv([
+        ["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 5000, 0],      # норма
+        ["2026-02-28", "50", "Касса", "A", 0, 5000, 0, 0, 0, 5000],   # красное в феврале
+    ])
+    auditor = AutoAuditor1C(df)
+    errors = auditor.run_audit()
+    red = [e for e in errors if "Красное сальдо" in e["title"]]
+    assert len(red) == 1
+    assert "отрицательное сальдо с 2026-02-28" in red[0]["data"].iloc[0]["Комментарий"]
+
+
 # ---------------- 4.2 Развернутое сальдо ----------------
 def test_expanded_balance():
     df = osv([
@@ -97,6 +109,18 @@ def test_unclosed_closing_account():
     assert list(unclosed[0]["data"]["Счет"]) == ["26"]
 
 
+def test_unclosed_period_of_occurrence():
+    df = osv([
+        ["2026-01-31", "26", "Общехоз", "A", 0, 0, 0, 0, 0, 0],
+        ["2026-02-28", "26", "Общехоз", "A", 0, 0, 0, 0, 120000, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    errors = auditor.run_audit()
+    unclosed = [e for e in errors if "Незакрытое сальдо на конец месяца" in e["title"]]
+    assert len(unclosed) == 1
+    assert "остаток с 2026-02-28" in unclosed[0]["data"].iloc[0]["Комментарий"]
+
+
 def test_stuck_balance_across_periods():
     df = osv([
         ["2026-01-31", "76.05", "Вектор", "AP", 0, 0, 0, 0, 0, 20000],
@@ -116,6 +140,42 @@ def test_no_stuck_with_single_period():
     auditor = AutoAuditor1C(df)
     errors = auditor.run_audit()
     assert not [e for e in errors if "Зависшее сальдо" in e["title"]]
+
+
+def test_group_balances_disabled_by_default():
+    df = osv([
+        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 0, 0, 500000, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    errors = auditor.run_audit()
+    assert not [e for e in errors if "Контроль групп счетов" in e["title"]]
+
+
+def test_group_balances_finds_unclosed_group():
+    # Денежные средства (группа 51) не должны иметь остатка на конец периода
+    df = osv([
+        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 0, 0, 500000, 0],
+        ["2026-01-31", "41", "Товары", "A", 0, 0, 0, 0, 100000, 0],
+    ])
+    auditor = AutoAuditor1C(df, balance_group_checks=True)
+    errors = auditor.run_audit()
+    groups = [e for e in errors if "Контроль групп счетов" in e["title"]]
+    assert len(groups) == 1
+    subconto = set(groups[0]["data"]["Субконто"])
+    assert "Денежные средства" in subconto
+    assert "Товары" in subconto
+
+
+def test_group_balances_skips_closed_group():
+    df = osv([
+        ["2026-01-31", "66", "Кредит", "P", 0, 0, 0, 0, 0, 0],
+        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 0, 0, 100000, 0],
+    ])
+    auditor = AutoAuditor1C(df, balance_group_checks=True)
+    errors = auditor.run_audit()
+    groups = [e for e in errors if "Контроль групп счетов" in e["title"]]
+    assert len(groups) == 1
+    assert "Кредиты и займы" not in set(groups[0]["data"]["Субконто"])
 
 
 # ---------------- 4.4 Счет 000 ----------------
@@ -178,6 +238,131 @@ def test_settlements_heuristic_without_documents():
     assert list(heuristic[0]["data"]["Субконто"]) == ["Ромашка"]
 
 
+def test_settlement_advance_consumed_against_debt():
+    # Аванс 50 000 зачитывается против отгрузки 100 000 → остаток долга 50 000
+    balances = osv([
+        ["2026-02-28", "62.01", "ИП Смирнов", "AP", 0, 0, 0, 0, 50000, 0],
+    ])
+    docs = _docs([
+        ["2026-01-20", "Отгрузка №1", "ИП Смирнов", "62.01", "отгрузка", 100000],
+        ["2026-01-25", "Аванс №1", "ИП Смирнов", "51", "аванс", 50000],
+    ])
+    auditor = AutoAuditor1C(balances, documents_df=docs)
+    errors = auditor.run_audit()
+    unclosed = [e for e in errors if "не закрыты документами" in e["title"]]
+    assert len(unclosed) == 1
+    row = unclosed[0]["data"].iloc[0]
+    assert row["Сумма"] == pytest.approx(50000)
+    assert "остаток долга 50,000.00" in row["Комментарий"]
+    assert "зачтено 50,000.00" in row["Комментарий"]
+
+
+def test_settlement_unused_advance_flagged():
+    # Только аванс без отгрузок → незачтенный аванс (кредитовый остаток)
+    balances = osv([
+        ["2026-02-28", "62.02", "ООО Вектор", "AP", 0, 0, 0, 0, 0, 20000],
+    ])
+    docs = _docs([
+        ["2026-01-12", "Аванс №1", "ООО Вектор", "51", "аванс", 20000],
+    ])
+    auditor = AutoAuditor1C(balances, documents_df=docs)
+    errors = auditor.run_audit()
+    unclosed = [e for e in errors if "не закрыты документами" in e["title"]]
+    assert len(unclosed) == 1
+    row = unclosed[0]["data"].iloc[0]
+    assert row["Сумма"] == pytest.approx(20000)
+    assert row["КонецКредит"] == pytest.approx(20000)
+    assert "незачтенный аванс 20,000.00" in row["Комментарий"]
+
+
+def test_settlement_overpayment_flagged():
+    balances = osv([
+        ["2026-02-28", "62.01", "ИП Смирнов", "AP", 0, 0, 0, 0, 0, 20000],
+    ])
+    docs = _docs([
+        ["2026-01-20", "Отгрузка №1", "ИП Смирнов", "62.01", "отгрузка", 50000],
+        ["2026-02-01", "Оплата №1", "ИП Смирнов", "51", "оплата", 70000],
+    ])
+    auditor = AutoAuditor1C(balances, documents_df=docs)
+    errors = auditor.run_audit()
+    unclosed = [e for e in errors if "не закрыты документами" in e["title"]]
+    assert len(unclosed) == 1
+    row = unclosed[0]["data"].iloc[0]
+    assert row["Сумма"] == pytest.approx(20000)
+    assert "переплата 20,000.00" in row["Комментарий"]
+
+
+def test_settlement_aging_oldest_unpaid_shipment():
+    balances = osv([
+        ["2026-02-28", "62.01", "ИП Смирнов", "AP", 0, 0, 0, 0, 100000, 0],
+    ])
+    docs = _docs([
+        ["2025-11-12", "Отгрузка №1", "ИП Смирнов", "62.01", "отгрузка", 100000],
+    ])
+    auditor = AutoAuditor1C(balances, documents_df=docs)
+    errors = auditor.run_audit()
+    unclosed = [e for e in errors if "не закрыты документами" in e["title"]]
+    row = unclosed[0]["data"].iloc[0]
+    assert "старейший непогашенный долг от 2025-11-12" in row["Комментарий"]
+    assert "возраст 108 дн." in row["Комментарий"]
+
+
+def test_settlement_osv_account_breakdown_and_split_warning():
+    # Долг 60.01 Д и аванс 60.02 К у одного контрагента: по-счетная разбивка + warning
+    balances = osv([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", 0, 0, 0, 0, 45000, 0],
+        ["2026-02-28", "60.02", "ООО Ромашка", "AP", 0, 0, 0, 0, 0, 30000],
+    ])
+    docs = _docs([
+        ["2026-01-10", "Аванс №1", "ООО Ромашка", "51", "аванс", 30000],
+    ])
+    auditor = AutoAuditor1C(balances, documents_df=docs)
+    errors = auditor.run_audit()
+    split = [e for e in errors if "по разным счетам" in e["title"]]
+    assert len(split) == 1
+    row = split[0]["data"].iloc[0]
+    assert "60.01" in row["Счет"] and "60.02" in row["Счет"]
+    unclosed = [e for e in errors if "не закрыты документами" in e["title"]]
+    assert unclosed[0]["data"].iloc[0]["Счет"] == "60.01, 60.02"
+
+
+def test_settlement_split_warning_not_for_cross_group():
+    # Контрагент одновременно поставщик (60.01 К) и покупатель (62.01 Д) — норма
+    balances = osv([
+        ["2026-02-28", "60.01", "ООО Вектор", "AP", 0, 0, 0, 0, 0, 50000],
+        ["2026-02-28", "62.01", "ООО Вектор", "AP", 0, 0, 0, 0, 30000, 0],
+    ])
+    auditor = AutoAuditor1C(balances)
+    errors = auditor.run_audit()
+    assert not [e for e in errors if "по разным счетам" in e["title"]]
+
+
+def test_settlement_expected_payment_text():
+    balances = osv([
+        ["2026-02-28", "62.01", "ИП Смирнов", "AP", 0, 0, 0, 0, 100000, 0],
+    ])
+    docs = _docs([
+        ["2025-11-12", "Отгрузка №1", "ИП Смирнов", "62.01", "отгрузка", 100000],
+    ])
+    auditor = AutoAuditor1C(balances, documents_df=docs)
+    errors = auditor.run_audit()
+    row = [e for e in errors if "не закрыты документами" in e["title"]][0]["data"].iloc[0]
+    assert "ожидается оплата по отгрузке от 2025-11-12 на 100,000.00" in row["Комментарий"]
+
+
+def test_settlement_expected_shipment_text():
+    balances = osv([
+        ["2026-02-28", "62.02", "ООО Вектор", "AP", 0, 0, 0, 0, 0, 20000],
+    ])
+    docs = _docs([
+        ["2026-01-12", "Аванс №1", "ООО Вектор", "51", "аванс", 20000],
+    ])
+    auditor = AutoAuditor1C(balances, documents_df=docs)
+    errors = auditor.run_audit()
+    row = [e for e in errors if "не закрыты документами" in e["title"]][0]["data"].iloc[0]
+    assert "ожидается отгрузка/зачет по авансу от 2026-01-12 на 20,000.00" in row["Комментарий"]
+
+
 # ---------------- Валидация ----------------
 def test_missing_columns_raises():
     with pytest.raises(ValueError, match="Отсутствуют обязательные колонки"):
@@ -237,6 +422,100 @@ def test_account_group():
     assert account_group("60.01") == "60"
     assert account_group("000") == "000"
     assert account_group("90") == "90"
+
+
+# ---------------- Переключатели проверок ----------------
+def test_checks_subset_disables_others():
+    df = osv([
+        ["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 5000],       # 4.1
+        ["2026-01-31", "60.01", "Ромашка", "AP", 0, 0, 0, 0, 45000, 30000],  # 4.2
+        ["2026-01-31", "26", "Общехоз", "A", 0, 0, 0, 0, 120000, 0],   # 4.3
+        ["2026-01-31", "000", "-", "AP", 0, 0, 0, 0, 1000, 0],         # 4.4
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance", "account_000"})
+    errors = auditor.run_audit()
+    titles = [e["title"] for e in errors]
+    assert any("Красное сальдо" in t for t in titles)
+    assert any("счете 000" in t for t in titles)
+    assert not any("Развернутое сальдо" in t for t in titles)
+    assert not any("закрываемые счета" in t for t in titles)
+
+
+def test_checks_unknown_key_raises():
+    df = osv([["2026-01-31", "51", "Расчетный", "A", 0, 0, 0, 0, 100, 0]])
+    with pytest.raises(ValueError, match="Неизвестные ключи проверок"):
+        AutoAuditor1C(df, checks={"nonexistent"})
+
+
+def test_checks_empty_set_runs_nothing():
+    df = osv([["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 5000]])
+    auditor = AutoAuditor1C(df, checks=set())
+    assert auditor.run_audit() == []
+    assert auditor.report()["status"] == "ok"
+
+
+# ---------------- Метаданные отчета ----------------
+def test_report_meta_keys():
+    df = osv([["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 5000]])
+    auditor = AutoAuditor1C(
+        df,
+        meta={"organization": "ООО Тест", "period": "Январь 2026", "title": "ОСВ"},
+    )
+    auditor.run_audit()
+    report = auditor.report()
+    assert report["organization"] == "ООО Тест"
+    assert report["period"] == "Январь 2026"
+    assert report["title"] == "ОСВ"
+
+
+def test_summary_contains_recommendations():
+    df = osv([["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 5000]])
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+    summary = auditor.summary_df()
+    assert "Рекомендации" in summary.columns
+    assert summary.iloc[0]["Рекомендации"]  # непустая рекомендация по 4.1
+
+
+def test_to_pdf():
+    pytest.importorskip("fpdf")
+    df = osv([["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 5000]])
+    auditor = AutoAuditor1C(
+        df, meta={"organization": "ООО Тест", "period": "Январь 2026"}
+    )
+    auditor.run_audit()
+    data = auditor.to_pdf()
+    assert data.startswith(b"%PDF")
+
+
+def test_to_pdf_multiple_recommendations():
+    pytest.importorskip("fpdf")
+    rows = [
+        ["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 5000],
+        ["2026-01-31", "000", "Вспомогательный", "A", 0, 0, 0, 0, 1000, 0],
+        ["2026-01-31", "26", "Общехоз. расходы", "A", 0, 0, 0, 0, 3000, 0],
+    ]
+    auditor = AutoAuditor1C(osv(rows))
+    auditor.run_audit()
+    assert len(auditor.summary_df()) > 1
+    data = auditor.to_pdf()
+    assert data.startswith(b"%PDF")
+
+
+def test_excel_contains_meta_sheet():
+    df = osv([["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 5000]])
+    auditor = AutoAuditor1C(df, meta={"organization": "ООО Тест"})
+    auditor.run_audit()
+
+    import openpyxl
+    import io
+
+    wb = openpyxl.load_workbook(io.BytesIO(auditor.to_excel()))
+    assert "Об отчете" in wb.sheetnames
+    ws = wb["Об отчете"]
+    values = {(r[0], r[1]) for r in ws.iter_rows(values_only=True)}
+    assert ("Параметр", "Значение") in values
+    assert ("Организация", "ООО Тест") in values
 
 
 def test_normalize_balances_keeps_zero_string_account():

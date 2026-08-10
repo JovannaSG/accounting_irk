@@ -1,3 +1,4 @@
+import logging
 from typing import Any, Optional
 
 import requests
@@ -5,7 +6,10 @@ from requests.auth import HTTPBasicAuth
 
 import pandas as pd
 
+from auditor import OSV_COLUMNS
 from loaders import PLAN_OF_ACCOUNTS, _infer_type
+
+logger = logging.getLogger(__name__)
 
 # Кандидаты на имена полей виртуальной таблицы регистра бухгалтерии.
 # Точный состав полей OData-запросов к BalanceAndTurnovers официально не
@@ -18,10 +22,6 @@ _OSV_FIELDS = {
     "КонецДебет": ["ОстатокДтКонеч", "СКД", "КонецДебет"],
     "КонецКредит": ["ОстатокКтКонеч", "СКК", "КонецКредит"],
 }
-
-OSV_COLUMNS = ["Период", "Счет", "Субконто", "Тип",
-               "НачалоДебет", "НачалоКредит", "ОборотДебет",
-               "ОборотКредит", "КонецДебет", "КонецКредит"]
 
 
 class OneCClient:
@@ -116,7 +116,7 @@ class OneCClient:
             "$skip": 0,
         }
 
-        print("Fetching data from 1C...")
+        logger.info("Загрузка движений регистра бухгалтерии из 1C...")
         records = self._paginate(endpoint, params)
         return self._flatten_and_clean(records)
 
@@ -126,7 +126,7 @@ class OneCClient:
         """
 
         if not records:
-            print("No data found for the specified period.")
+            logger.info("Движения за указанный период не найдены.")
             return pd.DataFrame()
 
         # This is the magic function that turns nested JSON into flat columns
@@ -212,10 +212,10 @@ class OneCClient:
             "$skip": 0,
         }
 
-        print(f"Fetching OSV from 1C ({period_start} ... {period_end})...")
+        logger.info(f"Загрузка ОСВ из 1C ({period_start} ... {period_end})...")
         records = self._paginate(endpoint, params)
         if not records:
-            print("No OSV data found for the specified period.")
+            logger.info("ОСВ за указанный период не найдена.")
             return pd.DataFrame(columns=OSV_COLUMNS)
 
         # Если пришёл только GUID счета — подгружаем план счетов для расшифровки.
