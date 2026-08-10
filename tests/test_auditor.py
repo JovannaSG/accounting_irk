@@ -13,18 +13,18 @@ def osv(rows, cols=None):
 
 
 # ---------------- 4.1 Красное сальдо ----------------
-def test_red_balance_active_and_passive():
+def test_red_balance_active_negative_only():
     df = osv([
         ["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 5000],      # A с К -> ошибка
-        ["2026-01-31", "66", "Кредит", "P", 0, 0, 0, 0, 100000, 0],    # P с Д -> ошибка
+        ["2026-01-31", "66", "Кредит", "P", 0, 0, 0, 0, 100000, 0],    # P с Д -> не ошибка
         ["2026-01-31", "51", "Расчетный", "A", 0, 0, 0, 0, 500000, 0], # норма
         ["2026-01-31", "70", "Зарплата", "P", 0, 0, 0, 0, 0, 120000],   # норма
     ])
     auditor = AutoAuditor1C(df)
     errors = auditor.run_audit()
     red = [e for e in errors if "Красное сальдо" in e["title"]]
-    assert len(red) == 2
-    assert set(red[0]["data"]["Счет"]) | set(red[1]["data"]["Счет"]) == {"50", "66"}
+    assert len(red) == 1
+    assert set(red[0]["data"]["Счет"]) == {"50"}
 
 
 def test_red_balance_net_value_not_raw_columns():

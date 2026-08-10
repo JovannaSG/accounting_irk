@@ -4,6 +4,7 @@ import traceback
 from typing import Optional
 
 import pandas as pd
+import fpdf
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 import streamlit as st
@@ -17,13 +18,7 @@ from auditor import (
 )
 from loaders import load_osv_file
 
-st.set_page_config(page_title="ИИ-Аудитор 1С", page_icon="🕵️‍♂️", layout="wide")
-
-try:
-    import fpdf  # noqa: F401
-    pdf_available = True
-except ImportError:
-    pdf_available = False
+st.set_page_config(page_title="ИИ-Аудитор 1С", page_icon="", layout="wide")
 
 st.title("🕵️‍♂️ ИИ-Аудитор: Прототип (без 1С)")
 st.markdown(
@@ -46,20 +41,25 @@ def load_csv(uploaded) -> pd.DataFrame:
 
 
 def _filter_documents_by_period(
-    documents: pd.DataFrame, selected_periods: list[str]
+    documents: pd.DataFrame,
+    selected_periods: list[str]
 ) -> pd.DataFrame:
-    """Оставляет операции не позднее конца последнего выбранного периода."""
+    """
+    Оставляет операции не позднее конца последнего выбранного периода
+    """
+
     if documents is None or documents.empty:
         return documents
     ends = pd.to_datetime(
-        pd.Series([p for p in selected_periods if p]), errors="coerce"
+        pd.Series([p for p in selected_periods if p]),
+        errors="coerce"
     ).dropna()
     if ends.empty:
         return documents
     return documents[documents["Дата"] <= ends.max()]
 
 
-SUMMARY_COLUMNS = [
+SUMMARY_COLUMNS: list[str] = [
     "Имя Базы",
     "Дата просмотра",
     "Счет с красным сальдо",
@@ -69,10 +69,13 @@ SUMMARY_COLUMNS = [
     "Счета с незакрытыми документами",
 ]
 
-_TITLE_RED = ("Красное сальдо",)
-_TITLE_EXPANDED = ("Развернутое сальдо по аналитике",)
-_TITLE_UNCLOSED = ("Незакрытое сальдо на конец месяца", "Зависшее сальдо")
-_TITLE_DOCS = ("Контрагенты: расчеты не закрыты документами",)
+_TITLE_RED: tuple = ("Красное сальдо",)
+_TITLE_EXPANDED: tuple = ("Развернутое сальдо по аналитике",)
+_TITLE_UNCLOSED: tuple = (
+    "Незакрытое сальдо на конец месяца",
+    "Зависшее сальдо"
+)
+_TITLE_DOCS: tuple = ("Контрагенты: расчеты не закрыты документами",)
 
 
 def _title_matches(title: str, keys: tuple[str, ...]) -> bool:
@@ -84,7 +87,8 @@ def _split_accounts(value) -> list[str]:
 
 
 def build_summary_view(
-    details: pd.DataFrame, db_name: str = "—"
+    details: pd.DataFrame,
+    db_name: str = "—"
 ) -> pd.DataFrame:
     """
     Сводная ведомость «строка = счет» (только для отображения на экране).
@@ -92,6 +96,7 @@ def build_summary_view(
     Колонки: Имя Базы, Дата просмотра, счета с красным/развернутым сальдо,
     счета с незакрытым периодом (+ периоды), счета с незакрытыми документами.
     """
+
     if details is None or details.empty:
         return pd.DataFrame(columns=SUMMARY_COLUMNS)
 
@@ -138,7 +143,10 @@ def run_audit(
     checks: Optional[set[str]] = None,
     meta: Optional[dict] = None,
 ) -> AutoAuditor1C:
-    """Собирает аудитора с заданными настройками и выполняет проверки."""
+    """
+    Собирает аудитора с заданными настройками и выполняет проверки
+    """
+
     auditor = AutoAuditor1C(
         balances,
         documents,
@@ -158,7 +166,10 @@ def run_audit(
 
 
 def _render_results(result: dict) -> None:
-    """Отображает результаты аудита с фильтрами (только отображение)."""
+    """
+    Отображает результаты аудита с фильтрами (только отображение)
+    """
+
     auditor: AutoAuditor1C = result["auditor"]
     errors = result["errors"]
     report = result["report"]
@@ -179,20 +190,34 @@ def _render_results(result: dict) -> None:
 
     details = report["details"].copy()
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     c1.metric("Красных флагов", report["total_flags"])
-    c2.metric("Общая сумма отклонений", f"{report['total_amount']:,.2f}")
-    c3.metric("Проверок с находками", len(errors))
+    c2.metric("Проверок с находками", len(errors))
 
     available_checks = sorted(details["Проверка"].dropna().unique().tolist())
     available_accounts = sorted(details["Счет"].astype(str).dropna().unique().tolist())
     available_cps = sorted(details["Субконто"].astype(str).dropna().unique().tolist())
 
-    with st.expander("🔎 Фильтры отображения (в Excel выгружается полный отчет)", expanded=False):
+    with st.expander(
+        "🔎 Фильтры отображения (в Excel выгружается полный отчет)",
+        expanded=False
+    ):
         f1, f2, f3 = st.columns(3)
-        sel_checks = f1.multiselect("Проверки", options=available_checks, key="f_checks")
-        sel_accounts = f2.multiselect("Счета", options=available_accounts, key="f_accounts")
-        sel_cps = f3.multiselect("Контрагенты", options=available_cps, key="f_cps")
+        sel_checks = f1.multiselect(
+            "Проверки",
+            options=available_checks,
+            key="f_checks"
+        )
+        sel_accounts = f2.multiselect(
+            "Счета",
+            options=available_accounts,
+            key="f_accounts"
+        )
+        sel_cps = f3.multiselect(
+            "Контрагенты",
+            options=available_cps,
+            key="f_cps"
+        )
 
     details_view = details
     if sel_checks:
@@ -222,18 +247,15 @@ def _render_results(result: dict) -> None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    if pdf_available:
-        try:
-            st.download_button(
-                "💾 Выгрузить отчет в PDF",
-                data=auditor.to_pdf(),
-                file_name="audit_report.pdf",
-                mime="application/pdf",
-            )
-        except Exception as exc:
-            st.caption(f"PDF недоступен: {exc}")
-    else:
-        st.caption("PDF-экспорт недоступен — установите fpdf2: `pip install fpdf2`")
+    try:
+        st.download_button(
+            "💾 Выгрузить отчет в PDF",
+            data=auditor.to_pdf(),
+            file_name="audit_report.pdf",
+            mime="application/pdf",
+        )
+    except Exception as exc:
+        st.caption(f"PDF недоступен: {exc}")
 
     st.markdown("---")
     st.subheader("🧾 Детализация по проверкам")
@@ -248,8 +270,10 @@ def _render_results(result: dict) -> None:
         if data.empty:
             continue
         icon = "🔴" if res["level"] == "error" else "🟡"
-        with st.expander(f"{icon} {res['title']} — строк: {len(data)}, сумма: {res['amount']:,.2f}"):
-            recommendation = RECOMMENDATIONS.get(res["title"], "")
+        with st.expander(
+            f"{icon} {res['title']} — строк: {len(data)}, сумма: {res['amount']:,.2f}"):
+            recommendation = RECOMMENDATIONS.get(res["title"], ""
+        )
             if recommendation:
                 st.markdown(f"💡 **Рекомендация:** {recommendation}")
             st.dataframe(data, width="stretch", hide_index=True)
@@ -261,11 +285,6 @@ osv_file = st.sidebar.file_uploader(
     "ОСВ (CSV / XLS / XLSX / HTML)",
     type=["csv", "xls", "xlsx", "html", "htm"],
     key="osv"
-)
-doc_file = st.sidebar.file_uploader(
-    "Движения/документы (CSV, опционально)",
-    type=["csv"],
-    key="docs"
 )
 use_mock = st.sidebar.button("Использовать тестовые данные")
 
@@ -353,9 +372,6 @@ try:
     elif "mock_data" in st.session_state:
         balances = st.session_state["mock_data"]["balances"]
         documents = st.session_state["mock_data"]["documents"]
-
-    if not use_mock and doc_file is not None:
-        documents = normalize_documents(load_csv(doc_file))
 except (ValueError, OSError) as exc:
     st.sidebar.error(str(exc))
     st.stop()

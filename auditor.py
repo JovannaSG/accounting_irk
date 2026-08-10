@@ -82,10 +82,6 @@ RECOMMENDATIONS: dict[str, str] = {
         "Проверьте проводки по счету и корректность начальных остатков. "
         "Отрицательный остаток по активному счету — признак ошибки в учете."
     ),
-    "Красное сальдо: пассивный счет с дебетовым остатком": (
-        "Проверьте проводки по счету и корректность начальных остатков. "
-        "Отрицательный остаток по пассивному счету — признак ошибки в учете."
-    ),
     "Развернутое сальдо по аналитике": (
         "У одного контрагента/договора одновременно дебетовый и кредитовый остаток. "
         "Проверьте, не требуется ли зачет аванса или сторнирование ошибочной проводки."
@@ -417,22 +413,16 @@ class AutoAuditor1C:
     def check_red_balance(self) -> None:
         b = self.balances
         net = b["КонецДебет"] - b["КонецКредит"]
+        # Красное сальдо — только отрицательный остаток по активному счету.
+        # Дебетовый остаток по пассивному счету ошибкой не считается.
         active = self._annotate_since(
             b,
             (b["Тип"] == "A") & (net < 0),
             "Активный счет имеет кредитовое (отрицательное) сальдо",
             "отрицательное сальдо с",
         )
-        passive = self._annotate_since(
-            b,
-            (b["Тип"] == "P") & (net > 0),
-            "Пассивный счет имеет дебетовое (отрицательное) сальдо",
-            "отрицательное сальдо с",
-        )
         if not active.empty:
             self._add("error", "Красное сальдо: активный счет с кредитовым остатком", active)
-        if not passive.empty:
-            self._add("error", "Красное сальдо: пассивный счет с дебетовым остатком", passive)
 
     # ============ 4.2 Развернутое сальдо ============
     def check_expanded_balance(self) -> None:
@@ -1071,8 +1061,11 @@ class AutoAuditor1C:
         pdf.add_page()
 
         pdf.set_font("DejaVu", size=14)
-        pdf.cell(0, 10, self.meta.get("title") or "Отчет автоматического аудита 1С",
-                 new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+        pdf.cell(
+            0, 10,
+            self.meta.get("title") or "Отчет автоматического аудита 1С",
+            new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C"
+        )
         pdf.ln(2)
 
         pdf.set_font("DejaVu", size=10)
@@ -1081,16 +1074,30 @@ class AutoAuditor1C:
             ("Период", self.meta.get("period", "")),
         ):
             if value:
-                pdf.cell(0, 6, f"{label}: {value}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.cell(0, 6, f"Сформировано: {pd.Timestamp.now().strftime('%d.%m.%Y %H:%M')}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                pdf.cell(
+                    0, 6,
+                    f"{label}: {value}",
+                    new_x=XPos.LMARGIN, new_y=YPos.NEXT
+                )
+        pdf.cell(
+            0, 6,
+            f"Сформировано: {pd.Timestamp.now().strftime('%d.%m.%Y %H:%M')}",
+            new_x=XPos.LMARGIN, new_y=YPos.NEXT
+        )
         pdf.ln(3)
 
         report = self.report()
         pdf.set_font("DejaVu", size=12)
-        pdf.cell(0, 8, f"Статус: {report['status_label']}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(
+            0, 8, f"Статус: {report['status_label']}",
+            new_x=XPos.LMARGIN, new_y=YPos.NEXT
+        )
         pdf.set_font("DejaVu", size=10)
-        pdf.cell(0, 6, f"Красных флагов: {report['total_flags']}; "
-                       f"общая сумма отклонений: {report['total_amount']:,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(
+            0, 6,
+            f"Красных флагов: {report['total_flags']}; ",
+            new_x=XPos.LMARGIN, new_y=YPos.NEXT
+        )
         pdf.ln(3)
 
         summary = self.summary_df()
@@ -1115,8 +1122,10 @@ class AutoAuditor1C:
         for _, r in summary.iterrows():
             if not r["Рекомендации"]:
                 continue
-            pdf.multi_cell(0, 5, f"{r['Проверка']}: {r['Рекомендации']}",
-                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.multi_cell(
+                0, 5, f"{r['Проверка']}: {r['Рекомендации']}",
+                new_x=XPos.LMARGIN, new_y=YPos.NEXT
+            )
         pdf.ln(4)
 
         details = self.details_df()
