@@ -15,13 +15,21 @@ logger = logging.getLogger(__name__)
 # Точный состав полей OData-запросов к BalanceAndTurnovers официально не
 # документирован, поэтому имена резолвятся гибко (первый найденный ключ).
 _OSV_FIELDS = {
-    "НачалоДебет": ["ОстатокДт", "СНД", "НачалоДебет"],
-    "НачалоКредит": ["ОстатокКт", "СНК", "НачалоКредит"],
-    "ОборотДебет": ["ОборотДт", "ОД", "ОборотДебет"],
-    "ОборотКредит": ["ОборотКт", "ОК", "ОборотКредит"],
-    "КонецДебет": ["ОстатокДтКонеч", "СКД", "КонецДебет"],
-    "КонецКредит": ["ОстатокКтКонеч", "СКК", "КонецКредит"],
+    "НачалоДебет": ["СуммаOpeningBalanceDr", "ОстатокДт", "СНД", "НачалоДебет"],
+    "НачалоКредит": ["СуммаOpeningBalanceCr", "ОстатокКт", "СНК", "НачалоКредит"],
+    "ОборотДебет": ["СуммаTurnoverDr", "ОборотДт", "ОД", "ОборотДебет"],
+    "ОборотКредит": ["СуммаTurnoverCr", "ОборотКт", "ОК", "ОборотКредит"],
+    "КонецДебет": ["СуммаClosingBalanceDr", "ОстатокДтКонеч", "СКД", "КонецДебет"],
+    "КонецКредит": ["СуммаClosingBalanceCr", "ОстатокКтКонеч", "СКК", "КонецКредит"],
 }
+
+# Поля, запрашиваемые у BalanceAndTurnovers. 1С группирует строки виртуальной
+# таблицы по выбранным полям: без $select возвращаются тысячи строк в разрезе
+# организаций/субконто, а с ним — одна строка на счёт. Поэтому select обязателен.
+_OSV_SELECT = ",".join(
+    ["Account_Key"]
+    + [candidates[0] for candidates in _OSV_FIELDS.values()]
+)
 
 
 class OneCClient:
@@ -138,9 +146,7 @@ class OneCClient:
             'Period': 'Дата',
             'AccountDr.Code': 'Дебет',
             'AccountCr.Code': 'Кредит',
-            'Amount': 'Сумма',
-            'ExtDimension1Dr.Description': 'Субконто_Дт',
-            'ExtDimension1Cr.Description': 'Субконто_Кт',
+            'Сумма': 'Сумма',
             'Recorder_Type': 'Документ'
         }
 
@@ -179,12 +185,12 @@ class OneCClient:
 
     @staticmethod
     def _record_account_code(rec: dict, code_by_key: dict[str, str]) -> Optional[str]:
-        acct = rec.get("Счет")
+        acct = rec.get("Счет") or rec.get("Account")
         if isinstance(acct, dict):
             code = acct.get("Code") or acct.get("Код")
             if code:
                 return str(code)
-        key = rec.get("Счет_Key")
+        key = rec.get("Account_Key") or rec.get("Счет_Key")
         if key and str(key) in code_by_key:
             return code_by_key[str(key)]
         return None
@@ -207,7 +213,7 @@ class OneCClient:
 
         params: dict[str, Any] = {
             "$format": "json",
-            "$expand": "Счет",
+            "$select": _OSV_SELECT,
             "$top": 1000,
             "$skip": 0,
         }
@@ -250,17 +256,178 @@ class OneCClient:
 
         return pd.DataFrame(rows, columns=OSV_COLUMNS)
 
+    def fetch_osv_monthly(
+        self,
+        period_start: str,
+        period_end: str,
+    ) -> pd.DataFrame:
+        """
+        ОСВ по месяцам диапазона [period_start, period_end].
+
+        Отдельный запрос на каждый календарный месяц (StartPeriod = начало
+        месяца, EndPeriod = конец месяца, для последнего месяца — period_end).
+        В результате каждая строка получает Период = конец своего месяца, что
+        даёт несколько периодов — работают проверки «зависшее сальдо» (4.3)
+        и ML «скачки оборотов».
+
+        Формат входа: 'YYYY-MM-DDTHH:MM:SS'. Пустой результат — пустой
+        DataFrame со схемой OSV_COLUMNS.
+        """
+
+        import calendar
+
+        start = pd.to_datetime(period_start, errors="coerce")
+        end = pd.to_datetime(period_end, errors="coerce")
+        if pd.isna(start) or pd.isna(end) or start > end:
+            raise ValueError(
+                f"Некорректный диапазон периода ОСВ: {period_start} ... {period_end}"
+            )
+
+        frames: list[pd.DataFrame] = []
+        cursor = start.normalize().replace(day=1, hour=0, minute=0, second=0)
+        while cursor <= end:
+            month_end = cursor.replace(
+                day=calendar.monthrange(cursor.year, cursor.month)[1],
+                hour=23, minute=59, second=59,
+            )
+            period_end_actual = min(month_end, end)
+            month_start_str = cursor.strftime("%Y-%m-%dT00:00:00")
+            month_end_str = period_end_actual.strftime("%Y-%m-%dT23:59:59")
+            frames.append(self.fetch_osv(month_start_str, month_end_str))
+
+            if cursor.month == 12:
+                cursor = cursor.replace(year=cursor.year + 1, month=1)
+            else:
+                cursor = cursor.replace(month=cursor.month + 1)
+
+        if not frames:
+            return pd.DataFrame(columns=OSV_COLUMNS)
+        df = pd.concat(frames, ignore_index=True)
+        return df[[c for c in OSV_COLUMNS if c in df.columns]]
+
+    def fetch_osv_account_subconto(
+        self,
+        period_start: str,
+        period_end: str,
+        account_code: str,
+    ) -> pd.DataFrame:
+        """
+        Fetches the detailed OSV with subconto for a specific account.
+        Queries the virtual table with ExtDimension1 included.
+        Filters by account_code on the client side since server-side filter on Account_Key is forbidden.
+        """
+        register = "AccountingRegister_Хозрасчетный"
+        method = (
+            f"BalanceAndTurnovers(StartPeriod=datetime'{period_start}', "
+            f"EndPeriod=datetime'{period_end}')"
+        )
+        endpoint = f"{self.base_url}/odata/standard.odata/{register}/{method}"
+
+        # We select Account_Key, ExtDimension1, and the numeric fields.
+        select_fields = [
+            "Account_Key",
+            "ExtDimension1",
+        ]
+        for candidates in _OSV_FIELDS.values():
+            select_fields.append(candidates[0])
+
+        select_str = ",".join(select_fields)
+
+        # Try with $expand=ExtDimension1 first
+        records = []
+        try:
+            params = {
+                "$format": "json",
+                "$select": select_str,
+                "$expand": "ExtDimension1",
+                "$top": 1000,
+                "$skip": 0,
+            }
+            records = self._paginate(endpoint, params)
+        except Exception:
+            # Fallback to no $expand
+            params = {
+                "$format": "json",
+                "$select": select_str,
+                "$top": 1000,
+                "$skip": 0,
+            }
+            records = self._paginate(endpoint, params)
+
+        if not records:
+            return pd.DataFrame(columns=OSV_COLUMNS)
+
+        if any(not self._record_account_code(r, {}) for r in records):
+            self.fetch_chart_of_accounts()
+        code_by_key = self._code_by_key
+
+        rows: list[dict[str, Any]] = []
+        for rec in records:
+            acc_code = self._record_account_code(rec, code_by_key) or "?"
+            if acc_code != account_code:
+                continue
+
+            # Resolve subconto representation
+            subconto_val = rec.get("ExtDimension1")
+            subconto_str = "-"
+            if isinstance(subconto_val, dict):
+                subconto_str = (
+                    subconto_val.get("Description") or
+                    subconto_val.get("Наименование") or
+                    subconto_val.get("Name") or
+                    subconto_val.get("Code") or
+                    subconto_val.get("Код") or
+                    str(subconto_val)
+                )
+            elif subconto_val:
+                subconto_str = str(subconto_val)
+
+            row: dict[str, Any] = {
+                "Период": period_end,
+                "Счет": acc_code,
+                "Субконто": subconto_str,
+            }
+            for target, candidates in _OSV_FIELDS.items():
+                value = None
+                for key in candidates:
+                    if key in rec:
+                        value = rec[key]
+                        break
+                row[target] = float(value) if value is not None else 0.0
+            rows.append(row)
+
+        if not rows:
+            return pd.DataFrame(columns=OSV_COLUMNS)
+
+        by_code: dict[str, list[dict]] = {}
+        for r in rows:
+            by_code.setdefault(r["Счет"], []).append(r)
+        for code, code_rows in by_code.items():
+            t = _infer_type(code, PLAN_OF_ACCOUNTS, code_rows)
+            for r in code_rows:
+                r["Тип"] = t
+
+        return pd.DataFrame(rows, columns=OSV_COLUMNS)
+
 
 def _cli() -> None:
     import argparse
     import os
 
     parser = argparse.ArgumentParser(description="Получение ОСВ из 1C (в т.ч. 1C:Fresh) через OData")
-    parser.add_argument("url", nargs="?",
-                        default=os.environ.get("ONEC_URL", "https://1cfresh.com/a/sbm_demo/1962515"),
-                        help="URL приложения, например https://1cfresh.com/a/sbm_demo/1962515")
-    parser.add_argument("user", nargs="?", default=os.environ.get("ONEC_USER", "ODataUser"))
-    parser.add_argument("password", nargs="?", default=os.environ.get("ONEC_PASS", ""))
+    parser.add_argument(
+        "url", nargs="?",
+        default=os.environ.get("ONEC_URL", "https://msk1.1cfresh.com/a/ea/3418453"),
+        help="URL приложения, например https://1cfresh.com/a/sbm_demo/1962515"
+    )
+    parser.add_argument(
+        "user", nargs="?",
+        default=os.environ.get("ONEC_USER", "odata.user")
+    )
+    parser.add_argument(
+        "password", nargs="?",
+        default=os.environ.get("ONEC_PASS", "odatauser2026!!")
+    )
     parser.add_argument("--start", default="2026-01-01T00:00:00")
     parser.add_argument("--end", default="2026-06-30T23:59:59")
     args = parser.parse_args()

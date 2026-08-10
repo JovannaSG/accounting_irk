@@ -5,6 +5,7 @@ __pycache__/
 *.egg-info/
 .env
 login_data.txt
+t.txt
 
 /*.xls
 /*.xlsx
