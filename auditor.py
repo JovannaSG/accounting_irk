@@ -157,7 +157,8 @@ DETAIL_COLUMNS: list[str] = [
 
 @dataclass
 class Finding:
-    """Одна находка контрольной проверки.
+    """
+    Одна находка контрольной проверки.
 
     Хранит результат проверки как пары «заголовок — таблица строк».
     Совместим со словарным интерфейсом (e["title"], e["data"], ...),
@@ -189,14 +190,19 @@ class Finding:
         return ((key, getattr(self, key)) for key in self.keys())
 
     def to_dict(self) -> dict:
-        return {"level": self.level, "title": self.title,
-                "data": self.data, "amount": self.amount}
+        return {
+            "level": self.level,
+            "title": self.title,
+            "data": self.data,
+            "amount": self.amount
+        }
 
 
 def account_group(code: object) -> str:
     """
     Группа счета: '60.01' -> '60'; '000' -> '000'
     """
+
     return str(code).strip().split(".")[0]
 
 
@@ -347,7 +353,10 @@ class AutoAuditor1C:
 
     # ============ Вспомогательные методы ============
     def _check_enabled(self, key: str) -> bool:
-        """True, если проверка с данным ключом включена (по умолчанию все включены)."""
+        """
+        True, если проверка с данным ключом включена (по умолчанию все включены)
+        """
+
         if not CHECK_KEYS.get(key):
             raise ValueError(f"Неизвестный ключ проверки: {key}")
         return self.checks is None or key in self.checks
@@ -365,7 +374,10 @@ class AutoAuditor1C:
 
     @staticmethod
     def _first_occurrence(b: pd.DataFrame, keys: list[str], flag: pd.Series) -> dict[tuple, str]:
-        """Первый период (по дате), когда flag == True, для каждой группы keys."""
+        """
+        Первый период (по дате), когда flag == True, для каждой группы keys
+        """
+
         b2 = b.loc[flag, keys + ["Период"]].copy()
         b2["_sort"] = pd.to_datetime(b2["Период"], errors="coerce", format="mixed")
         b2 = b2.sort_values(keys + ["_sort"])
@@ -383,10 +395,12 @@ class AutoAuditor1C:
         base_comment: str,
         since_text: str,
     ) -> pd.DataFrame:
-        """Возвращает строки флага с комментарием о периоде возникновения.
+        """
+        Возвращает строки флага с комментарием о периоде возникновения.
 
         Например «…; отрицательное сальдо с 2026-01-31» для 4.1.
         """
+
         sub = b[flag].copy()
         if sub.empty:
             return sub
@@ -471,7 +485,10 @@ class AutoAuditor1C:
 
     @staticmethod
     def _matches_group_preset(code: str, preset: list[str]) -> bool:
-        """Совпадает ли счет с кодом пресета (код с точкой — точно, без — по группе)."""
+        """
+        Совпадает ли счет с кодом пресета (код с точкой — точно, без — по группе)
+        """
+
         code = str(code)
         for p in preset:
             if "." in p:
@@ -482,12 +499,14 @@ class AutoAuditor1C:
         return False
 
     def check_group_balances(self) -> None:
-        """Контроль групп счетов (расширенный 4.3): незакрытые остатки групп.
+        """
+        Контроль групп счетов (расширенный 4.3): незакрытые остатки групп.
 
         Для каждой группы из GROUP_PRESETS берется остаток на конец последнего
         периода. Строки агрегируются по родительским счетам (Субконто == "-");
         если их нет в файле — по всем строкам группы (субконто).
         """
+
         if not self.balance_group_checks:
             return
         b = self.balances
@@ -567,7 +586,10 @@ class AutoAuditor1C:
         return out
 
     def _reference_date(self) -> pd.Timestamp:
-        """Опорная дата для aging: конец последнего периода ОСВ (или последняя операция)."""
+        """
+        Опорная дата для aging: конец последнего периода ОСВ (или последняя операция)
+        """
+
         dates = pd.to_datetime(self.balances["Период"], errors="coerce").dropna()
         if not dates.empty:
             return dates.max()
@@ -583,6 +605,7 @@ class AutoAuditor1C:
         FIFO: дата старейшей строки (дата, сумма), остаток которой не погашен.
         Используется только для описания (aging) — не источник новых ошибок.
         """
+
         rows = [r for r in rows if pd.notna(r[0]) and r[1] > 0]
         rows.sort(key=lambda r: r[0])
         remaining = consume
@@ -607,6 +630,7 @@ class AutoAuditor1C:
           переплата     = кредит_сторона - незачтенный аванс
         Сумма компонент всегда равна |отгружено - оплачено - авансы|.
         """
+
         open_amount = shipped - paid - advances
         debt = max(open_amount, 0.0)
         credit_side = max(-open_amount, 0.0)
@@ -623,6 +647,7 @@ class AutoAuditor1C:
         Ограничено группами 60 и 62: для 76 разные субсчета могут означать
         независимые расчеты без признака ошибки.
         """
+
         b = self.balances
         sett = b[
             (b["Счет"].map(account_group).isin(SETTLEMENT_GROUPS))
@@ -798,7 +823,10 @@ class AutoAuditor1C:
 
     # ============ ML-проверки (аномалии, дубли) ============
     def check_amount_anomalies(self) -> None:
-        """ML: нетипичная сумма операции по истории контрагента."""
+        """
+        ML: нетипичная сумма операции по истории контрагента
+        """
+
         if self.documents is None:
             return
         found = ml.detect_amount_anomalies(
@@ -810,7 +838,10 @@ class AutoAuditor1C:
         self._add("warning", "ML: нетипичная сумма операции", found)
 
     def check_turnover_jumps(self) -> None:
-        """ML: резкий скачок оборотов между периодами."""
+        """
+        ML: резкий скачок оборотов между периодами
+        """
+
         found = ml.detect_turnover_jumps(
             self.balances,
             ratio=self.jump_ratio,
@@ -819,7 +850,10 @@ class AutoAuditor1C:
         self._add("warning", "ML: резкий скачок оборотов между периодами", found)
 
     def check_duplicate_counterparties(self) -> None:
-        """ML: нечёткий поиск дублей контрагентов."""
+        """
+        ML: нечёткий поиск дублей контрагентов
+        """
+
         names: list[object] = []
         if "Субконто" in self.balances.columns:
             names += list(self.balances["Субконто"].dropna())
@@ -829,7 +863,10 @@ class AutoAuditor1C:
         self._add("warning", "ML: возможные дубли контрагентов", found)
 
     def run_ml_checks(self) -> None:
-        """Запускает включенные ML-проверки."""
+        """
+        Запускает включенные ML-проверки
+        """
+
         if not self.ml_enabled:
             return
         if self.ml_amount_anomalies:
@@ -889,7 +926,10 @@ class AutoAuditor1C:
         return pd.DataFrame(rows, columns=DETAIL_COLUMNS)
 
     def _meta_payload(self) -> dict:
-        """Реквизиты отчета (организация/период/заголовок) из self.meta."""
+        """
+        Реквизиты отчета (организация/период/заголовок) из self.meta
+        """
+
         payload: dict = {}
         for key in ("title", "organization", "period"):
             value = self.meta.get(key)
@@ -964,13 +1004,23 @@ class AutoAuditor1C:
     # ============ PDF-отчет (ТЗ п.6.2) ============
     @staticmethod
     def _find_pdf_font() -> Optional[str]:
-        """Ищет TTF-шрифт с кириллицей (DejaVu) в типовых местах."""
+        """
+        Ищет TTF-шрифт с кириллицей: встроенный DejaVu, затем системные (Windows/Linux).
+        """
+
         import os
 
+        bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "DejaVuSans.ttf")
         candidates = [
+            bundled,
+            r"C:\Windows\Fonts\arial.ttf",
+            r"C:\Windows\Fonts\segoeui.ttf",
+            r"C:\Windows\Fonts\times.ttf",
+            r"C:\Windows\Fonts\DejaVuSans.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         ]
         for path in candidates:
             if os.path.exists(path):
@@ -997,8 +1047,9 @@ class AutoAuditor1C:
         Печатный отчет в PDF (ТЗ п.6.2): шапка с реквизитами, сводный
         и детальный отчет, рекомендации.
 
-        Требует fpdf2 и шрифт DejaVu с кириллицей (fonts-dejavu-core).
+        Требует fpdf2 и шрифт с кириллицей (встроенный fonts/DejaVuSans.ttf).
         """
+
         try:
             from fpdf import FPDF
             from fpdf.enums import XPos, YPos
@@ -1010,8 +1061,8 @@ class AutoAuditor1C:
         font_path = self._find_pdf_font()
         if font_path is None:  # pragma: no cover - зависит от окружения
             raise RuntimeError(
-                "Не найден шрифт DejaVu (нужен для кириллицы). "
-                "Установите пакет fonts-dejavu-core."
+                "Не найден шрифт с кириллицей для PDF. Проверьте наличие "
+                "fonts/DejaVuSans.ttf рядом с auditor.py."
             )
 
         pdf = FPDF(format="A4")

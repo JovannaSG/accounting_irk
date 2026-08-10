@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py auditor.py loaders.py api_client.py ml.py ./
 COPY sample_data.csv sample_documents.csv ./
+COPY fonts ./fonts
 
 EXPOSE 8501
 

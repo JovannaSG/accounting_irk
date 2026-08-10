@@ -1,8 +1,11 @@
 import io
+import os
 import traceback
 from typing import Optional
 
 import pandas as pd
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 import streamlit as st
 
 from auditor import (
@@ -54,6 +57,77 @@ def _filter_documents_by_period(
     if ends.empty:
         return documents
     return documents[documents["Дата"] <= ends.max()]
+
+
+SUMMARY_COLUMNS = [
+    "Имя Базы",
+    "Дата просмотра",
+    "Счет с красным сальдо",
+    "Счет с развернутым сальдо",
+    "Счет с незакрытым периодом",
+    "Период",
+    "Счета с незакрытыми документами",
+]
+
+_TITLE_RED = ("Красное сальдо",)
+_TITLE_EXPANDED = ("Развернутое сальдо по аналитике",)
+_TITLE_UNCLOSED = ("Незакрытое сальдо на конец месяца", "Зависшее сальдо")
+_TITLE_DOCS = ("Контрагенты: расчеты не закрыты документами",)
+
+
+def _title_matches(title: str, keys: tuple[str, ...]) -> bool:
+    return any(k.lower() in str(title).lower() for k in keys)
+
+
+def _split_accounts(value) -> list[str]:
+    return [a.strip() for a in str(value).split(",") if a.strip()]
+
+
+def build_summary_view(
+    details: pd.DataFrame, db_name: str = "—"
+) -> pd.DataFrame:
+    """
+    Сводная ведомость «строка = счет» (только для отображения на экране).
+
+    Колонки: Имя Базы, Дата просмотра, счета с красным/развернутым сальдо,
+    счета с незакрытым периодом (+ периоды), счета с незакрытыми документами.
+    """
+    if details is None or details.empty:
+        return pd.DataFrame(columns=SUMMARY_COLUMNS)
+
+    d = details.copy()
+    d["Счет"] = d["Счет"].astype(str).fillna("")
+    d["Период"] = d["Период"].astype(str).fillna("")
+
+    def accounts_for(titles: tuple[str, ...]) -> set[str]:
+        mask = d["Проверка"].map(lambda t: _title_matches(t, titles))
+        return set(d.loc[mask, "Счет"].unique())
+
+    red = accounts_for(_TITLE_RED)
+    expanded = accounts_for(_TITLE_EXPANDED)
+    unclosed = accounts_for(_TITLE_UNCLOSED)
+    doc_accounts: set[str] = set()
+    for value in accounts_for(_TITLE_DOCS):
+        doc_accounts.update(_split_accounts(value))
+
+    now = pd.Timestamp.now().strftime("%d.%m.%Y %H:%M")
+    rows = []
+    for acc in sorted(red | expanded | unclosed | doc_accounts):
+        periods = d[
+            (d["Счет"] == acc)
+            & d["Проверка"].map(lambda t: _title_matches(t, _TITLE_UNCLOSED))
+        ]["Период"].unique()
+        period_str = ", ".join(p for p in periods if p) or "—"
+        rows.append({
+            "Имя Базы": db_name,
+            "Дата просмотра": now,
+            "Счет с красным сальдо": acc if acc in red else "—",
+            "Счет с развернутым сальдо": acc if acc in expanded else "—",
+            "Счет с незакрытым периодом": acc if acc in unclosed else "—",
+            "Период": period_str,
+            "Счета с незакрытыми документами": acc if acc in doc_accounts else "—",
+        })
+    return pd.DataFrame(rows, columns=SUMMARY_COLUMNS)
 
 
 def run_audit(
@@ -128,18 +202,12 @@ def _render_results(result: dict) -> None:
     if sel_cps:
         details_view = details_view[details_view["Субконто"].astype(str).isin(sel_cps)]
 
-    st.subheader("📈 Сводный отчет")
-    if details_view.empty:
+    st.subheader("📋 Сводная ведомость")
+    summary_view = build_summary_view(details_view)
+    if summary_view.empty:
         st.info("По выбранным фильтрам строк нет.")
-        summary_view = pd.DataFrame(columns=["Проверка", "Уровень", "Строк", "Сумма", "Рекомендации"])
     else:
-        summary_view = details_view.groupby(["Проверка", "Уровень"], as_index=False).agg(
-            Строк=("Сумма", "size"),
-            Сумма=("Сумма", "sum"),
-        )
-        rec_map = report["summary"].set_index("Проверка")["Рекомендации"].to_dict()
-        summary_view["Рекомендации"] = summary_view["Проверка"].map(rec_map)
-    st.dataframe(summary_view, width="stretch", hide_index=True)
+        st.dataframe(summary_view, width="stretch", hide_index=True)
 
     st.subheader("🔍 Детальный отчет")
     if details_view.empty:
@@ -262,24 +330,33 @@ documents: Optional[pd.DataFrame] = None
 source_info: dict = {}
 
 try:
-    if osv_file is not None:
+    if use_mock:
+        st.session_state["mock_data"] = {
+            "balances": normalize_balances(pd.read_csv(
+                os.path.join(_BASE_DIR, "sample_data.csv"), dtype=str
+            )),
+            "documents": normalize_documents(pd.read_csv(
+                os.path.join(_BASE_DIR, "sample_documents.csv"), dtype=str
+            )),
+        }
+        for k in ("osv", "docs"):
+            if k in st.session_state:
+                del st.session_state[k]
+        balances = st.session_state["mock_data"]["balances"]
+        documents = st.session_state["mock_data"]["documents"]
+    elif osv_file is not None:
         balances, source_info = load_osv_file(
             osv_file.name,
             osv_file.getvalue(),
             plan_override=plan_input
         )
-    elif use_mock or "mock_data" in st.session_state:
-        if use_mock:
-            st.session_state["mock_data"] = {
-                "balances": normalize_balances(pd.read_csv("sample_data.csv", dtype=str)),
-                "documents": normalize_documents(pd.read_csv("sample_documents.csv", dtype=str)),
-            }
+    elif "mock_data" in st.session_state:
         balances = st.session_state["mock_data"]["balances"]
         documents = st.session_state["mock_data"]["documents"]
 
-    if doc_file is not None:
+    if not use_mock and doc_file is not None:
         documents = normalize_documents(load_csv(doc_file))
-except ValueError as exc:
+except (ValueError, OSError) as exc:
     st.sidebar.error(str(exc))
     st.stop()
 
