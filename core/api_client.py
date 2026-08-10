@@ -1,4 +1,6 @@
 import logging
+import os
+import sys
 from typing import Any, Optional
 
 import requests
@@ -6,8 +8,11 @@ from requests.auth import HTTPBasicAuth
 
 import pandas as pd
 
-from auditor import OSV_COLUMNS
-from loaders import PLAN_OF_ACCOUNTS, _infer_type
+if __package__ in (None, ""):  # разрешаем запуск как скрипта: python core/api_client.py
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.auditor import OSV_COLUMNS
+from core.loaders import PLAN_OF_ACCOUNTS, _infer_type
 
 logger = logging.getLogger(__name__)
 

@@ -3,9 +3,9 @@ import pytest
 
 from streamlit.testing.v1 import AppTest
 
-import http_client
+from app import http_client
 
-APP = "app.py"
+APP = "app/ui.py"
 
 
 def _osv_df() -> pd.DataFrame:
@@ -81,7 +81,7 @@ def _mock_http_client(monkeypatch):
 
 
 def test_api_source_loads_osv_and_runs_audit(monkeypatch):
-    from api_client import OneCClient
+    from core.api_client import OneCClient
     monkeypatch.setattr(
         OneCClient, "fetch_osv_monthly", lambda self, start, end: _osv_df()
     )
@@ -117,7 +117,7 @@ def test_api_source_loads_osv_and_runs_audit(monkeypatch):
 
 
 def test_api_source_error_is_shown(monkeypatch):
-    from api_client import OneCClient
+    from core.api_client import OneCClient
 
     def boom(self, start, end):
         raise ValueError("OData вернул 401 Unauthorized")

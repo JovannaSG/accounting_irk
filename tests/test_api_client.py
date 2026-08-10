@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 import requests
 
-from api_client import OneCClient, OSV_COLUMNS
+from core.api_client import OneCClient, OSV_COLUMNS
 
 
 def _guid_for(code: str) -> str:
@@ -203,7 +203,7 @@ def test_fetch_osv_404_hints_to_enable_register():
 
 
 def test_osv_feeds_auditor():
-    from auditor import AutoAuditor1C
+    from core.auditor import AutoAuditor1C
 
     record = _make_osv_row("20")
     record["СуммаOpeningBalanceDr"] = 0.0

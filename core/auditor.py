@@ -21,7 +21,7 @@ from typing import Any, Optional
 
 import pandas as pd
 
-import ml
+from core import ml
 
 COLUMN_ALIASES: dict[str, list[str]] = {
     "Счет": ["Счет", "Счёт", "account", "schet"],

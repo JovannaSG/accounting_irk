@@ -1,8 +1,8 @@
 import pandas as pd
 import pytest
 
-from auditor import AutoAuditor1C
-from ml import (
+from core.auditor import AutoAuditor1C
+from core.ml import (
     detect_amount_anomalies,
     detect_turnover_jumps,
     find_duplicate_counterparties,

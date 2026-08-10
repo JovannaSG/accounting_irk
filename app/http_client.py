@@ -1,29 +1,39 @@
 import os
 import json
 import requests
-from typing import Optional, Dict, Any, List
+from typing import Any
 
 # API Base URL from environment or default to localhost:8000
 API_BASE_URL = os.environ.get("AUDIT_API_URL", "http://127.0.0.1:8000")
 
+
 class APIError(Exception):
-    """Исключение для ошибок при обращении к бэкенду"""
+    """
+    Исключение для ошибок при обращении к бэкенду
+    """
+
     pass
+
 
 class ConnectionAPIError(APIError):
-    """Исключение при невозможности подключиться к бэкенду"""
+    """
+    Исключение при невозможности подключиться к бэкенду
+    """
+
     pass
 
-def _handle_response(response: requests.Response) -> Dict[str, Any]:
+
+def _handle_response(response: requests.Response) -> dict[str, Any]:
     try:
         data = response.json()
     except Exception:
         raise APIError(f"Неизвестный ответ сервера (HTTP {response.status_code}): {response.text}")
-        
+
     if response.status_code >= 400:
         detail = data.get("detail", "Неизвестная ошибка")
         raise APIError(str(detail))
     return data
+
 
 def check_health() -> bool:
     try:
@@ -32,8 +42,9 @@ def check_health() -> bool:
     except requests.RequestException:
         return False
 
-def run_audit_mock(options: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{API_BASE_URL}/api/audit/mock"
+
+def run_audit_mock(options: dict[str, Any]) -> dict[str, Any]:
+    url: str = f"{API_BASE_URL}/api/audit/mock"
     try:
         r = requests.post(url, json={"options": options}, timeout=60)
         return _handle_response(r)
@@ -42,16 +53,17 @@ def run_audit_mock(options: Dict[str, Any]) -> Dict[str, Any]:
     except requests.RequestException as e:
         raise APIError(f"Ошибка запроса: {e}")
 
+
 def run_audit_1c(
     api_url: str,
     api_user: str,
     api_pass: str,
     start_date: str,
     end_date: str,
-    options: Dict[str, Any]
-) -> Dict[str, Any]:
-    url = f"{API_BASE_URL}/api/audit/1c"
-    payload = {
+    options: dict[str, Any]
+) -> dict[str, Any]:
+    url: str = f"{API_BASE_URL}/api/audit/1c"
+    payload: dict[str, Any] = {
         "url": api_url,
         "user": api_user,
         "password": api_pass,
@@ -67,23 +79,24 @@ def run_audit_1c(
     except requests.RequestException as e:
         raise APIError(f"Ошибка запроса: {e}")
 
+
 def run_audit_file(
     osv_name: str,
     osv_bytes: bytes,
-    doc_name: Optional[str],
-    doc_bytes: Optional[bytes],
-    options: Dict[str, Any]
-) -> Dict[str, Any]:
-    url = f"{API_BASE_URL}/api/audit/file"
+    doc_name: str | None,
+    doc_bytes: bytes | None,
+    options: dict[str, Any]
+) -> dict[str, Any]:
+    url: str = f"{API_BASE_URL}/api/audit/file"
     
-    files = {
+    files: dict[str, Any] = {
         "osv_file": (osv_name, osv_bytes, "application/octet-stream")
     }
     if doc_name and doc_bytes:
         files["doc_file"] = (doc_name, doc_bytes, "application/octet-stream")
-        
+
     # Options need to be mapped to individual form parameters
-    data = {
+    data: dict[str, Any] = {
         "checks": ",".join(options.get("checks", [])),
         "closing_accounts": ",".join(options.get("closing_accounts", [])),
         "plan_override": options.get("plan_override", ""),
@@ -97,7 +110,7 @@ def run_audit_file(
         "dup_threshold": options.get("dup_threshold", 90),
         "anomaly_min_abs": options.get("anomaly_min_abs", 1000.0),
     }
-    
+
     try:
         r = requests.post(url, files=files, data=data, timeout=60)
         return _handle_response(r)
@@ -106,7 +119,8 @@ def run_audit_file(
     except requests.RequestException as e:
         raise APIError(f"Ошибка запроса: {e}")
 
-def get_account_detail(audit_id: str, account_code: str) -> Dict[str, Any]:
+
+def get_account_detail(audit_id: str, account_code: str) -> dict[str, Any]:
     url = f"{API_BASE_URL}/api/account/detail"
     payload = {
         "audit_id": audit_id,
@@ -120,8 +134,9 @@ def get_account_detail(audit_id: str, account_code: str) -> Dict[str, Any]:
     except requests.RequestException as e:
         raise APIError(f"Ошибка запроса: {e}")
 
+
 def get_excel_report(audit_id: str) -> bytes:
-    url = f"{API_BASE_URL}/api/audit/{audit_id}/excel"
+    url: str = f"{API_BASE_URL}/api/audit/{audit_id}/excel"
     try:
         r = requests.get(url, timeout=30)
         if r.status_code >= 400:
@@ -130,8 +145,9 @@ def get_excel_report(audit_id: str) -> bytes:
     except requests.RequestException as e:
         raise APIError(f"Ошибка выгрузки Excel: {e}")
 
+
 def get_pdf_report(audit_id: str) -> bytes:
-    url = f"{API_BASE_URL}/api/audit/{audit_id}/pdf"
+    url: str = f"{API_BASE_URL}/api/audit/{audit_id}/pdf"
     try:
         r = requests.get(url, timeout=30)
         if r.status_code >= 400:

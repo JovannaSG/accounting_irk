@@ -21,7 +21,7 @@ from typing import Optional
 
 import pandas as pd
 
-from auditor import account_group, normalize_balances
+from core.auditor import account_group, normalize_balances
 
 ACCOUNT_CODE_RE = re.compile(r"^[0-9]+(?:\.[A-Za-zА-Яа-я0-9]+)*$")
 TOTAL_KEYWORDS: tuple = ("total", "итого", "всего", "итог", "итого по")

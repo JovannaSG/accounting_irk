@@ -4,28 +4,38 @@ import json
 import uuid
 import time
 import logging
-from typing import Optional, List, Dict, Any
-from datetime import date, datetime
+from typing import Any
+from datetime import datetime
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, status, BackgroundTasks
+from fastapi import (
+    FastAPI, HTTPException,
+    UploadFile, File, Form,
+    status, BackgroundTasks
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from api_client import OneCClient
-from auditor import (
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
+
+from core.api_client import OneCClient
+from core.auditor import (
     AutoAuditor1C,
     DEFAULT_CLOSING_ACCOUNTS,
     normalize_balances,
     normalize_documents,
 )
-from loaders import load_osv_file
+from core.loaders import load_osv_file
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("audit-server")
 
-app = FastAPI(title="ИИ-Аудитор 1С API", description="Бэкенд сервис для ИИ-Аудитора 1С")
+app = FastAPI(
+    title="ИИ-Аудитор 1С API",
+    description="Бэкенд сервис для ИИ-Аудитора 1С"
+)
 
 # Allow CORS for Streamlit
 app.add_middleware(
@@ -37,7 +47,7 @@ app.add_middleware(
 )
 
 # In-memory store: {audit_id: {"balances_df": df, "documents_df": df, "meta": dict, "source": dict, "created_at": float}}
-cache_store: Dict[str, Dict[str, Any]] = {}
+cache_store: dict[str, dict[str, Any]] = {}
 
 def clean_old_cache():
     now = time.time()
@@ -52,11 +62,11 @@ def clean_old_cache():
 
 # API Models
 class AuditOptions(BaseModel):
-    checks: List[str] = Field(default=["red_balance", "expanded_balance", "unclosed_month_end", "account_000", "settlements"])
-    closing_accounts: List[str] = Field(default=DEFAULT_CLOSING_ACCOUNTS)
-    plan_override: Optional[str] = ""
-    organization: Optional[str] = ""
-    periods: Optional[List[str]] = None
+    checks: list[str] = Field(default=["red_balance", "expanded_balance", "unclosed_month_end", "account_000", "settlements"])
+    closing_accounts: list[str] = Field(default=DEFAULT_CLOSING_ACCOUNTS)
+    plan_override: str | None = ""
+    organization: str | None = ""
+    periods: list[str] | None = None
     balance_group_checks: bool = False
     ml_enabled: bool = True
     ml_amount_anomalies: bool = True
@@ -124,11 +134,11 @@ def build_summary_view_api(details_df: pd.DataFrame, db_name: str) -> pd.DataFra
 
 def run_audit_core(
     balances: pd.DataFrame,
-    documents: Optional[pd.DataFrame],
+    documents: pd.DataFrame | None,
     options: AuditOptions,
     db_name: str,
     source_info: dict,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     # Filter balances by selected periods if specified
     filtered_balances = balances.copy()
     if options.periods is not None:
@@ -216,9 +226,8 @@ def health():
 def audit_mock(req: AuditMockRequest, bg_tasks: BackgroundTasks):
     bg_tasks.add_task(clean_old_cache)
     try:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        balances = normalize_balances(pd.read_csv(os.path.join(base_dir, "sample_data.csv"), dtype=str))
-        documents = normalize_documents(pd.read_csv(os.path.join(base_dir, "sample_documents.csv"), dtype=str))
+        balances = normalize_balances(pd.read_csv(os.path.join(_DATA_DIR, "sample_data.csv"), dtype=str))
+        documents = normalize_documents(pd.read_csv(os.path.join(_DATA_DIR, "sample_documents.csv"), dtype=str))
         
         source_info = {
             "title": "ОСВ (Тестовая)",
@@ -262,12 +271,12 @@ def audit_1c(req: Audit1CRequest, bg_tasks: BackgroundTasks):
 async def audit_file(
     bg_tasks: BackgroundTasks,
     osv_file: UploadFile = File(...),
-    doc_file: Optional[UploadFile] = File(None),
+    doc_file: UploadFile | None = File(None),
     checks: str = Form("red_balance,expanded_balance,unclosed_month_end,account_000,settlements"),
     closing_accounts: str = Form(""),
     plan_override: str = Form(""),
     organization: str = Form(""),
-    periods: Optional[str] = Form(None),
+    periods: str | None = Form(None),
     balance_group_checks: bool = Form(False),
     ml_enabled: bool = Form(True),
     ml_amount_anomalies: bool = Form(True),

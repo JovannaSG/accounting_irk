@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from auditor import AutoAuditor1C, account_group, normalize_balances
+from core.auditor import AutoAuditor1C, account_group, normalize_balances
 
 
 def osv(rows, cols=None):
@@ -519,7 +519,7 @@ def test_excel_contains_meta_sheet():
 
 
 def test_normalize_balances_keeps_zero_string_account():
-    df = pd.read_csv("sample_data.csv", dtype=str)
+    df = pd.read_csv("data/sample_data.csv", dtype=str)
     norm = normalize_balances(df)
     assert "000" in set(norm["Счет"])
     assert set(norm["Тип"]) <= {"A", "P", "AP"}

@@ -1,5 +1,6 @@
 import io
 import os
+import sys
 import traceback
 from datetime import date
 from typing import Optional
@@ -7,19 +8,23 @@ from typing import Optional
 import pandas as pd
 import fpdf
 
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+_DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
+
 import streamlit as st
 
-import http_client
-from api_client import OneCClient
-from auditor import (
+from app import http_client
+from core.api_client import OneCClient
+from core.auditor import (
     AutoAuditor1C,
     DEFAULT_CLOSING_ACCOUNTS,
     RECOMMENDATIONS,
     normalize_balances,
     normalize_documents,
 )
-from loaders import load_osv_file
+from core.loaders import load_osv_file
 
 st.set_page_config(page_title="ИИ-Аудитор 1С", page_icon="", layout="wide")
 
@@ -30,7 +35,7 @@ backend_ok = http_client.check_health()
 if not backend_ok:
     st.warning(
         "🔌 Внимание: Бэкенд-сервер API (порт 8000) недоступен. "
-        "Пожалуйста, запустите приложение через команду `python run.py`, "
+        "Пожалуйста, запустите приложение через команду `python app/run.py`, "
         "чтобы включить полный функционал аудита и проваливания в отчеты."
     )
 
@@ -146,7 +151,7 @@ def _render_results(result: dict) -> None:
     st.caption("💡 Кликните по строке счёта в таблице ниже, чтобы провалиться в детальный отчёт по этому счёту!")
 
     # Rebuild redesigned summary dynamically from filtered details
-    from server import build_summary_view_api
+    from app.server import build_summary_view_api
     summary_view = build_summary_view_api(details_view, db_name)
 
     selected_account = None
@@ -391,10 +396,10 @@ try:
     if use_mock:
         st.session_state["mock_data"] = {
             "balances": normalize_balances(pd.read_csv(
-                os.path.join(_BASE_DIR, "sample_data.csv"), dtype=str
+                os.path.join(_DATA_DIR, "sample_data.csv"), dtype=str
             )),
             "documents": normalize_documents(pd.read_csv(
-                os.path.join(_BASE_DIR, "sample_documents.csv"), dtype=str
+                os.path.join(_DATA_DIR, "sample_documents.csv"), dtype=str
             )),
         }
         for k in ("osv", "docs", "api_balances"):
@@ -493,7 +498,7 @@ if st.button("🚀 Запустить Аудит", type="primary", key="btn_audi
     try:
         if not backend_ok:
             raise http_client.ConnectionAPIError(
-                "Сервер API (бэкенд) недоступен. Запустите приложение через `python run.py`."
+                "Сервер API (бэкенд) недоступен. Запустите приложение через `python app/run.py`."
             )
         with st.spinner("Анализируем данные через API-бэкенд..."):
             if use_mock:

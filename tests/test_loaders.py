@@ -3,8 +3,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from auditor import AutoAuditor1C
-from loaders import (
+from core.auditor import AutoAuditor1C
+from core.loaders import (
     _to_number,
     detect_format,
     extract_osv,
@@ -105,7 +105,7 @@ def test_load_real_xls_types_via_plan():
 
 def test_plan_of_accounts_matches_1c83():
     """Ключевые счета должны соответствовать плану счетов 1С:Бухгалтерия 8 ред. 3.0."""
-    from loaders import PLAN_OF_ACCOUNTS
+    from core.loaders import PLAN_OF_ACCOUNTS
     ap = {"16", "40", "60", "62", "68", "69", "70", "71", "73",
           "75", "76", "79", "84", "90", "91", "96", "99"}
     assert {c: PLAN_OF_ACCOUNTS[c] for c in sorted(ap)} == {c: "AP" for c in sorted(ap)}
