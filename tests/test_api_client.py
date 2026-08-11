@@ -322,3 +322,67 @@ def test_fetch_osv_account_subconto_filters_and_resolves():
     url, params, _ = session.calls[0]
     assert url == jan_ep
     assert params.get("$expand") == "ExtDimension1"
+
+
+def test_fetch_osv_account_subconto_monthly_two_months():
+    jan_ep = _osv_endpoint("2026-01-01T00:00:00", "2026-01-31T23:59:59")
+    feb_ep = _osv_endpoint("2026-02-01T00:00:00", "2026-02-28T23:59:59")
+
+    def subconto_row(code: str, subconto, closing_dr: float) -> dict:
+        row = _make_osv_row(code)
+        row["ExtDimension1"] = subconto
+        row["СуммаClosingBalanceDr"] = closing_dr
+        row["СуммаClosingBalanceCr"] = 0.0
+        return row
+
+    session = FakeSession(pages={
+        jan_ep: [
+            subconto_row("60", {"Наименование": "ООО Ромашка"}, 500.0),
+            subconto_row("51", {"Наименование": "Банк"}, 10.0),
+        ],
+        feb_ep: [
+            subconto_row("60", {"Наименование": "ООО Ромашка"}, 700.0),
+        ],
+        CHART_EP: _chart_rows(["60", "51"]),
+    })
+    client = OneCClient(FRESH_BASE, "u", "p")
+    client.session = session
+
+    df = client.fetch_osv_account_subconto_monthly(
+        "2026-01-01T00:00:00", "2026-02-28T23:59:59", "60"
+    )
+
+    assert list(df.columns) == OSV_COLUMNS
+    assert set(df["Счет"]) == {"60"}
+    assert set(df["Период"]) == {"2026-01-31T23:59:59", "2026-02-28T23:59:59"}
+    assert len(df) == 2
+
+    jan = df[df["Период"] == "2026-01-31T23:59:59"]
+    feb = df[df["Период"] == "2026-02-28T23:59:59"]
+    assert jan.iloc[0]["КонецДебет"] == pytest.approx(500.0)
+    assert feb.iloc[0]["КонецДебет"] == pytest.approx(700.0)
+    assert jan.iloc[0]["Субконто"] == "ООО Ромашка"
+
+    requested = {url for url, _, _ in session.calls}
+    assert jan_ep in requested and feb_ep in requested
+
+
+def test_fetch_osv_account_subconto_monthly_empty():
+    jan_ep = _osv_endpoint("2026-01-01T00:00:00", "2026-01-31T23:59:59")
+    session = FakeSession(pages={jan_ep: []})
+    client = OneCClient(FRESH_BASE, "u", "p")
+    client.session = session
+
+    df = client.fetch_osv_account_subconto_monthly(
+        "2026-01-01T00:00:00", "2026-01-31T23:59:59", "60"
+    )
+    assert df.empty
+    assert list(df.columns) == OSV_COLUMNS
+
+
+def test_fetch_osv_account_subconto_monthly_invalid_range():
+    client = OneCClient(FRESH_BASE, "u", "p")
+    with pytest.raises(ValueError, match="Некорректный диапазон"):
+        client.fetch_osv_account_subconto_monthly(
+            "2026-06-30T23:59:59", "2026-01-01T00:00:00", "60"
+        )

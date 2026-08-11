@@ -915,6 +915,89 @@ class AutoAuditor1C:
                 })
         return pd.DataFrame(rows, columns=DETAIL_COLUMNS)
 
+    @staticmethod
+    def _account_codes_in(cell: object) -> list[str]:
+        """Разбирает значение «Счет» (возможно «51, 62.01») на отдельные коды."""
+        return [
+            c.strip()
+            for c in str(cell).replace(";", ",").split(",")
+            if c.strip()
+        ]
+
+    def accounts_with_errors(self) -> list[str]:
+        """Отсортированный список счетов, по которым есть нарушения."""
+        codes: set[str] = set()
+        details = self.details_df()
+        if not details.empty:
+            for cell in details["Счет"].dropna():
+                codes.update(self._account_codes_in(cell))
+        return sorted(codes)
+
+    def account_report_df(self, account_code: str) -> pd.DataFrame:
+        """Все нарушения выбранного счета одним списком (строки детального
+        отчета, где в «Счет» присутствует account_code)."""
+        details = self.details_df()
+        if details.empty:
+            return details
+        return details[
+            details["Счет"].map(
+                lambda cell: account_code in self._account_codes_in(cell)
+            )
+        ]
+
+    def account_subconto(self, account_code: str) -> list[str]:
+        """Субконто/контрагенты, задействованные по счету (из ОСВ и документов)."""
+        names: set[str] = set()
+        if "Счет" in self.balances.columns and "Субконто" in self.balances.columns:
+            rows = self.balances[self.balances["Счет"] == account_code]["Субконто"]
+            names.update(
+                str(n).strip() for n in rows.dropna() if str(n).strip() != "-"
+            )
+        if (
+            self.documents is not None
+            and "Счет" in self.documents.columns
+            and "Контрагент" in self.documents.columns
+        ):
+            rows = self.documents[self.documents["Счет"] == account_code]["Контрагент"]
+            names.update(
+                str(n).strip() for n in rows.dropna() if str(n).strip()
+            )
+        return sorted(names)
+
+    def account_subconto_duplicates(
+        self,
+        account_code: str,
+        threshold: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """ML-поиск возможных дублей контрагентов внутри выбранного счета."""
+        names = self.account_subconto(account_code)
+        if not names:
+            return pd.DataFrame(columns=["Субконто", "Название А", "Название Б", "Сходство", "Комментарий"])
+        return ml.find_duplicate_counterparties(
+            names, threshold=threshold if threshold is not None else self.dup_threshold
+        )
+
+    def accounts_summary_df(self) -> pd.DataFrame:
+        """Сводка по счетам для листа «По счетам» в экспорте Excel/PDF."""
+        columns = ["Счет", "Кол-во нарушений", "Проверки", "Периоды", "Сумма", "Дубли контрагентов"]
+        details = self.details_df()
+        if details.empty:
+            return pd.DataFrame(columns=columns)
+        rows = []
+        for account in self.accounts_with_errors():
+            g = self.account_report_df(account)
+            checks = sorted(set(g["Проверка"].astype(str)))
+            periods = sorted(p for p in set(g["Период"].astype(str)) if p)
+            rows.append({
+                "Счет": account,
+                "Кол-во нарушений": len(g),
+                "Проверки": "; ".join(checks),
+                "Периоды": ", ".join(periods),
+                "Сумма": round(float(g["Сумма"].sum()), 2),
+                "Дубли контрагентов": len(self.account_subconto_duplicates(account)),
+            })
+        return pd.DataFrame(rows, columns=columns)
+
     def _meta_payload(self) -> dict:
         """
         Реквизиты отчета (организация/период/заголовок) из self.meta
@@ -941,9 +1024,12 @@ class AutoAuditor1C:
             result.update(status="warning", status_label="Есть ошибки")
         return result
 
-    def to_excel(self) -> bytes:
+    def to_excel(self, account_pass: Optional[dict] = None) -> bytes:
         """
-        Сводный + детальный отчет с цветовой индикацией (ТЗ п.6, 14)
+        Сводный + детальный отчет с цветовой индикацией (ТЗ п.6, 14).
+
+        :param account_pass: результат автопрохода по счетам (см. core.account_pass)
+            — добавляет лист «Проход по счетам».
         """
 
         import openpyxl
@@ -951,6 +1037,13 @@ class AutoAuditor1C:
 
         summary = self.summary_df()
         details = self.details_df()
+        by_account = self.accounts_summary_df()
+
+        pass_details = pd.DataFrame()
+        if account_pass is not None:
+            pd_ = account_pass.get("details_df")
+            if pd_ is not None and not getattr(pd_, "empty", True):
+                pass_details = pd_
 
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -965,6 +1058,9 @@ class AutoAuditor1C:
 
             summary.to_excel(writer, sheet_name="Сводный отчет", index=False)
             details.to_excel(writer, sheet_name="Детальный отчет", index=False)
+            by_account.to_excel(writer, sheet_name="По счетам", index=False)
+            if not pass_details.empty:
+                pass_details.to_excel(writer, sheet_name="Проход по счетам", index=False)
 
             wb = writer.book
             header_fill = PatternFill("solid", fgColor="4472C4")
@@ -972,7 +1068,15 @@ class AutoAuditor1C:
             red_fill = PatternFill("solid", fgColor="FFC7CE")
             yellow_fill = PatternFill("solid", fgColor="FFEB9C")
 
-            for sheet, level_col in (("Сводный отчет", 2), ("Детальный отчет", 2)):
+            sheets_to_color = [
+                ("Сводный отчет", 2),
+                ("Детальный отчет", 2),
+                ("По счетам", 2),
+            ]
+            if not pass_details.empty:
+                sheets_to_color.append(("Проход по счетам", 2))
+
+            for sheet, level_col in sheets_to_color:
                 ws = wb[sheet]
                 for cell in ws[1]:
                     cell.fill = header_fill
@@ -1032,10 +1136,13 @@ class AutoAuditor1C:
             pdf.cell(w, 6, str(v), border=1)
         pdf.ln()
 
-    def to_pdf(self) -> bytes:
+    def to_pdf(self, account_pass: Optional[dict] = None) -> bytes:
         """
         Печатный отчет в PDF (ТЗ п.6.2): шапка с реквизитами, сводный
-        и детальный отчет, рекомендации.
+        и детальный отчет, рекомендации, отчет по счетам.
+
+        :param account_pass: результат автопрохода по счетам (см. core.account_pass)
+            — добавляет раздел «Автопроход по счетам».
 
         Требует fpdf2 и шрифт с кириллицей (встроенный fonts/DejaVuSans.ttf).
         """
@@ -1146,5 +1253,98 @@ class AutoAuditor1C:
                 f"{r['Сумма']:,.0f}",
                 str(r["Комментарий"])[:45],
             ], det_widths)
+
+        # Отчет по счетам
+        accounts = self.accounts_with_errors()
+        if accounts:
+            pdf.add_page()
+            pdf.set_font("DejaVu", size=12)
+            pdf.cell(0, 8, "Отчет по счетам", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            acc_widths = [34, 34, 18, 18, 34, 18]
+            self._pdf_header(pdf, ["Проверка", "Период", "Субконто", "Дебет", "Кредит", "Сумма"], acc_widths)
+            for account in accounts:
+                acc_rep = self.account_report_df(account)
+                dups = self.account_subconto_duplicates(account)
+                pdf.set_font("DejaVu", size=10)
+                pdf.cell(
+                    0, 7,
+                    f"Счет {account} — нарушений: {len(acc_rep)}, "
+                    f"дублей контрагентов: {len(dups)}",
+                    new_x=XPos.LMARGIN, new_y=YPos.NEXT
+                )
+                pdf.set_font("DejaVu", size=7)
+                for _, r in acc_rep.iterrows():
+                    self._pdf_row(pdf, [
+                        str(r["Проверка"])[:20],
+                        str(r["Период"])[:12],
+                        str(r["Субконто"])[:12],
+                        f"{r['Дебет']:,.0f}",
+                        f"{r['Кредит']:,.0f}",
+                        f"{r['Сумма']:,.0f}",
+                    ], acc_widths)
+                if not dups.empty:
+                    pdf.set_font("DejaVu", size=7)
+                    for _, d in dups.iterrows():
+                        pdf.cell(
+                            0, 5,
+                            f"  Дубль: {d['Название А']} ≈ {d['Название Б']} "
+                            f"({d['Сходство']:.0f}%)",
+                            new_x=XPos.LMARGIN, new_y=YPos.NEXT
+                        )
+                pdf.ln(2)
+
+        # Автопроход по счетам (1С:Фреш)
+        if account_pass is not None:
+            pass_details = account_pass.get("details_df")
+            if pass_details is not None and not getattr(pass_details, "empty", True):
+                pass_summary = account_pass.get("summary_df")
+                pass_dups = account_pass.get("duplicates_df")
+
+                pdf.add_page()
+                pdf.set_font("DejaVu", size=12)
+                pdf.cell(
+                    0, 8, "Автопроход по счетам (1С:Фреш)",
+                    new_x=XPos.LMARGIN, new_y=YPos.NEXT
+                )
+                if pass_summary is not None and not getattr(pass_summary, "empty", True):
+                    pdf.set_font("DejaVu", size=8)
+                    sum_widths = [40, 30, 22, 22, 34, 40]
+                    self._pdf_header(pdf, list(pass_summary.columns), sum_widths)
+                    for _, r in pass_summary.iterrows():
+                        self._pdf_row(pdf, [
+                            str(r["Счет"])[:8],
+                            str(r["Строк нарушений"]),
+                            str(r["Уровень"])[:10],
+                            str(r["Субконто"]),
+                            f"{r['Сумма']:,.0f}",
+                            str(r["Ошибка"])[:35],
+                        ], sum_widths)
+                    pdf.ln(3)
+
+                pdf.set_font("DejaVu", size=10)
+                for account in sorted(set(str(c) for c in pass_details["Счет"].dropna())):
+                    acc_rows = pass_details[pass_details["Счет"].astype(str) == account]
+                    dups_n = 0
+                    if pass_dups is not None and not pass_dups.empty:
+                        dups_n = int((pass_dups["Счет"].astype(str) == account).sum())
+                    pdf.cell(
+                        0, 7,
+                        f"Счет {account} — нарушений: {len(acc_rows)}, "
+                        f"дублей контрагентов: {dups_n}",
+                        new_x=XPos.LMARGIN, new_y=YPos.NEXT
+                    )
+                    pdf.set_font("DejaVu", size=7)
+                    for _, r in acc_rows.iterrows():
+                        self._pdf_row(pdf, [
+                            str(r.get("Проверка", ""))[:20],
+                            str(r.get("Уровень", "")),
+                            str(r.get("Период", ""))[:12],
+                            str(r.get("Субконто", ""))[:14],
+                            f"{r.get('Дебет', 0.0):,.0f}",
+                            f"{r.get('Кредит', 0.0):,.0f}",
+                            f"{r.get('Сумма', 0.0):,.0f}",
+                        ], [48, 16, 28, 30, 22, 22, 26])
+                    pdf.set_font("DejaVu", size=10)
+                    pdf.ln(2)
 
         return bytes(pdf.output())

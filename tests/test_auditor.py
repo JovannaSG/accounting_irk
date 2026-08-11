@@ -523,3 +523,135 @@ def test_normalize_balances_keeps_zero_string_account():
     norm = normalize_balances(df)
     assert "000" in set(norm["Счет"])
     assert set(norm["Тип"]) <= {"A", "P", "AP"}
+
+
+# ---------------- Отчет по счету ----------------
+def test_accounts_with_errors_and_account_report_df():
+    df = osv([
+        ["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 5000],               # 4.1 -> 50
+        ["2026-01-31", "60.01", "Ромашка", "AP", 0, 0, 45000, 0, 45000, 30000],  # 4.2 -> 60.01
+        ["2026-01-31", "000", "-", "AP", 0, 0, 1000, 0, 1000, 0],              # 4.4 -> 000
+    ])
+    auditor = AutoAuditor1C(
+        df, checks={"red_balance", "expanded_balance", "account_000"}
+    )
+    auditor.run_audit()
+
+    accounts = auditor.accounts_with_errors()
+    assert "000" in accounts and "50" in accounts and "60.01" in accounts
+
+    rep = auditor.account_report_df("60.01")
+    assert not rep.empty
+    assert set(rep["Счет"]) == {"60.01"}
+
+    rep_000 = auditor.account_report_df("000")
+    assert not rep_000.empty
+    assert all("счете 000" in t or "000" in t for t in rep_000["Проверка"])
+
+
+def test_account_report_df_multiple_accounts_in_cell():
+    # В детальном отчете встречаются строки с «Счет» = «51, 62.01»
+    df = osv([
+        ["2026-01-31", "51", "-", "A", 0, 0, 100000, 0, 100000, 0],
+        ["2026-01-31", "62.01", "Долг", "AP", 0, 0, 50000, 0, 50000, 0],
+    ])
+    docs = pd.DataFrame([
+        ["2026-01-31", "Ромашка", "реализация", "60.01", 50000],
+        ["2026-01-31", "Ромашка", "оплата", "62.01", 10000],
+    ], columns=["Дата", "Контрагент", "Вид", "Счет", "Сумма"])
+    auditor = AutoAuditor1C(
+        df, documents_df=docs, checks={"settlements"}, ml_enabled=False
+    )
+    auditor.run_audit()
+
+    # 4.5 строит строки с объединенными счетами контрагента
+    cell_values = {str(c) for c in auditor.details_df()["Счет"].dropna()}
+    multi = [c for c in cell_values if "," in c]
+    assert multi, f"Ожидались составные счета, получены: {cell_values}"
+
+    accounts = auditor.accounts_with_errors()
+    assert "60.01" in accounts and "62.01" in accounts
+    for c in multi:
+        for part in c.split(","):
+            part = part.strip()
+            assert part in accounts
+            assert not auditor.account_report_df(part).empty
+
+
+def test_account_subconto_and_duplicates():
+    df = osv([
+        ["2026-01-31", "60.01", "ООО Ромашка", "AP", 0, 0, 45000, 0, 0, 45000],
+        ["2026-01-31", "60.01", "ООО Ромашка Плюс", "AP", 0, 0, 0, 30000, 30000, 0],
+        ["2026-01-31", "51", "-", "A", 0, 0, 100000, 0, 100000, 0],
+    ])
+    auditor = AutoAuditor1C(df, checks=set(), ml_enabled=False, dup_threshold=70)
+    auditor.run_audit()
+
+    assert auditor.account_subconto("60.01") == ["ООО Ромашка", "ООО Ромашка Плюс"]
+    assert auditor.account_subconto("51") == []
+
+    dups = auditor.account_subconto_duplicates("60.01")
+    assert len(dups) == 1
+    row = dups.iloc[0]
+    assert {"ООО Ромашка", "ООО Ромашка Плюс"} <= {row["Название А"], row["Название Б"]}
+    assert row["Сходство"] >= 70
+
+
+def test_accounts_summary_df_structure():
+    df = osv([
+        ["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 5000],
+        ["2026-01-31", "60.01", "Ромашка", "AP", 0, 0, 45000, 0, 45000, 30000],
+        ["2026-01-31", "000", "-", "AP", 0, 0, 1000, 0, 1000, 0],
+    ])
+    auditor = AutoAuditor1C(
+        df, checks={"red_balance", "expanded_balance", "account_000"}, ml_enabled=False
+    )
+    auditor.run_audit()
+
+    summary = auditor.accounts_summary_df()
+    assert not summary.empty
+    assert list(summary.columns) == [
+        "Счет", "Кол-во нарушений", "Проверки", "Периоды", "Сумма", "Дубли контрагентов"
+    ]
+    assert set(summary["Счет"]) >= {"000", "50", "60.01"}
+    assert summary["Кол-во нарушений"].sum() == len(auditor.details_df())
+
+
+def test_excel_contains_by_account_sheet():
+    df = osv([["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 5000]])
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+
+    import io
+    import openpyxl
+
+    wb = openpyxl.load_workbook(io.BytesIO(auditor.to_excel()))
+    assert "По счетам" in wb.sheetnames
+    ws = wb["По счетам"]
+    headers = [c.value for c in ws[1]]
+    assert "Счет" in headers
+    assert any(r[0] == "50" for r in ws.iter_rows(min_row=2, values_only=True))
+
+
+def test_pdf_contains_account_section():
+    pytest.importorskip("fpdf")
+    df = osv([["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 5000]])
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+
+    data = auditor.to_pdf()
+    assert data.startswith(b"%PDF")
+    # Раздел «Отчет по счетам» добавляет страницу в PDF (текст хранится кодами
+    # глифов, поэтому проверяем число страниц дерева /Pages через /Kids).
+    import re
+
+    pages = re.search(rb"/Count (\d+)\n/Kids", data)
+    assert pages, "Не найден узел /Pages в PDF"
+    assert int(pages.group(1)) == 2, "Ожидалась доп. страница с отчетом по счетам"
+
+    clean = osv([["2026-01-31", "51", "Расчетный", "A", 0, 0, 100000, 0, 100000, 0]])
+    auditor_ok = AutoAuditor1C(clean)
+    auditor_ok.run_audit()
+    data_ok = auditor_ok.to_pdf()
+    pages_ok = re.search(rb"/Count (\d+)\n/Kids", data_ok)
+    assert pages_ok and int(pages_ok.group(1)) == 1

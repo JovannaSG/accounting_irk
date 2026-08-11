@@ -200,6 +200,76 @@ class OneCClient:
             return code_by_key[str(key)]
         return None
 
+    def _record_subconto(self, rec: dict) -> str:
+        """Представление субконто (контрагента) из ExtDimension1 записи регистра."""
+        subconto_val = rec.get("ExtDimension1")
+        if isinstance(subconto_val, dict):
+            return (
+                subconto_val.get("Description")
+                or subconto_val.get("Наименование")
+                or subconto_val.get("Name")
+                or subconto_val.get("Code")
+                or subconto_val.get("Код")
+                or str(subconto_val)
+            )
+        if subconto_val:
+            return str(subconto_val)
+        return "-"
+
+    def _records_to_osv(
+        self,
+        records: list[dict],
+        period_end: str,
+        account_code: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        Собирает DataFrame со схемой OSV_COLUMNS из записей BalanceAndTurnovers.
+
+        При account_code не равном None строки других счетов отбрасываются
+        (серверный $filter по Account_Key OData запрещает, поэтому фильтрация
+        клиентская).
+        """
+        if not records:
+            return pd.DataFrame(columns=OSV_COLUMNS)
+
+        # Если пришёл только GUID счета — подгружаем план счетов для расшифровки.
+        if any(not self._record_account_code(r, {}) for r in records):
+            self.fetch_chart_of_accounts()
+        code_by_key = self._code_by_key
+
+        rows: list[dict[str, Any]] = []
+        for rec in records:
+            acc_code = self._record_account_code(rec, code_by_key) or "?"
+            if account_code is not None and acc_code != account_code:
+                continue
+            row: dict[str, Any] = {
+                "Период": period_end,
+                "Счет": acc_code,
+                "Субконто": self._record_subconto(rec),
+            }
+            for target, candidates in _OSV_FIELDS.items():
+                value = None
+                for key in candidates:
+                    if key in rec:
+                        value = rec[key]
+                        break
+                row[target] = float(value) if value is not None else 0.0
+            rows.append(row)
+
+        if not rows:
+            return pd.DataFrame(columns=OSV_COLUMNS)
+
+        # Тип (A/P/AP) — по типовому плану счетов 1С 8.3, эвристика по остаткам.
+        by_code: dict[str, list[dict]] = {}
+        for r in rows:
+            by_code.setdefault(r["Счет"], []).append(r)
+        for code, code_rows in by_code.items():
+            t = _infer_type(code, PLAN_OF_ACCOUNTS, code_rows)
+            for r in code_rows:
+                r["Тип"] = t
+
+        return pd.DataFrame(rows, columns=OSV_COLUMNS)
+
     def fetch_osv(self, period_start: str, period_end: str) -> pd.DataFrame:
         """
         Fetches the balance sheet (ОСВ) for a period via the virtual table
@@ -228,38 +298,41 @@ class OneCClient:
         if not records:
             logger.info("ОСВ за указанный период не найдена.")
             return pd.DataFrame(columns=OSV_COLUMNS)
+        return self._records_to_osv(records, period_end)
 
-        # Если пришёл только GUID счета — подгружаем план счетов для расшифровки.
-        if any(not self._record_account_code(r, {}) for r in records):
-            self.fetch_chart_of_accounts()
-        code_by_key = self._code_by_key
+    @staticmethod
+    def _month_ranges(period_start: str, period_end: str):
+        """
+        Генератор (start_str, end_str) по календарным месяцам диапазона.
 
-        rows: list[dict[str, Any]] = []
-        for rec in records:
-            row: dict[str, Any] = {
-                "Период": period_end,
-                "Счет": self._record_account_code(rec, code_by_key) or "?",
-                "Субконто": "-",
-            }
-            for target, candidates in _OSV_FIELDS.items():
-                value = None
-                for key in candidates:
-                    if key in rec:
-                        value = rec[key]
-                        break
-                row[target] = float(value) if value is not None else 0.0
-            rows.append(row)
+        Начало = первое число месяца 00:00:00, конец = последнее число месяца
+        23:59:59 (для последнего месяца — period_end). Формат входа/выхода:
+        'YYYY-MM-DDTHH:MM:SS'.
+        """
+        import calendar
 
-        # Тип (A/P/AP) — по типовому плану счетов 1С 8.3, эвристика по остаткам.
-        by_code: dict[str, list[dict]] = {}
-        for r in rows:
-            by_code.setdefault(r["Счет"], []).append(r)
-        for code, code_rows in by_code.items():
-            t = _infer_type(code, PLAN_OF_ACCOUNTS, code_rows)
-            for r in code_rows:
-                r["Тип"] = t
+        start = pd.to_datetime(period_start, errors="coerce")
+        end = pd.to_datetime(period_end, errors="coerce")
+        if pd.isna(start) or pd.isna(end) or start > end:
+            raise ValueError(
+                f"Некорректный диапазон периода ОСВ: {period_start} ... {period_end}"
+            )
 
-        return pd.DataFrame(rows, columns=OSV_COLUMNS)
+        cursor = start.normalize().replace(day=1, hour=0, minute=0, second=0)
+        while cursor <= end:
+            month_end = cursor.replace(
+                day=calendar.monthrange(cursor.year, cursor.month)[1],
+                hour=23, minute=59, second=59,
+            )
+            period_end_actual = min(month_end, end)
+            yield (
+                cursor.strftime("%Y-%m-%dT00:00:00"),
+                period_end_actual.strftime("%Y-%m-%dT23:59:59"),
+            )
+            if cursor.month == 12:
+                cursor = cursor.replace(year=cursor.year + 1, month=1)
+            else:
+                cursor = cursor.replace(month=cursor.month + 1)
 
     def fetch_osv_monthly(
         self,
@@ -275,35 +348,14 @@ class OneCClient:
         даёт несколько периодов — работают проверки «зависшее сальдо» (4.3)
         и ML «скачки оборотов».
 
-        Формат входа: 'YYYY-MM-DDTHH:MM:SS'. Пустой результат — пустой
-        DataFrame со схемой OSV_COLUMNS.
+        Пустой результат — пустой DataFrame со схемой OSV_COLUMNS.
         """
 
-        import calendar
-
-        start = pd.to_datetime(period_start, errors="coerce")
-        end = pd.to_datetime(period_end, errors="coerce")
-        if pd.isna(start) or pd.isna(end) or start > end:
-            raise ValueError(
-                f"Некорректный диапазон периода ОСВ: {period_start} ... {period_end}"
-            )
-
         frames: list[pd.DataFrame] = []
-        cursor = start.normalize().replace(day=1, hour=0, minute=0, second=0)
-        while cursor <= end:
-            month_end = cursor.replace(
-                day=calendar.monthrange(cursor.year, cursor.month)[1],
-                hour=23, minute=59, second=59,
-            )
-            period_end_actual = min(month_end, end)
-            month_start_str = cursor.strftime("%Y-%m-%dT00:00:00")
-            month_end_str = period_end_actual.strftime("%Y-%m-%dT23:59:59")
+        for month_start_str, month_end_str in self._month_ranges(
+            period_start, period_end
+        ):
             frames.append(self.fetch_osv(month_start_str, month_end_str))
-
-            if cursor.month == 12:
-                cursor = cursor.replace(year=cursor.year + 1, month=1)
-            else:
-                cursor = cursor.replace(month=cursor.month + 1)
 
         if not frames:
             return pd.DataFrame(columns=OSV_COLUMNS)
@@ -362,57 +414,37 @@ class OneCClient:
         if not records:
             return pd.DataFrame(columns=OSV_COLUMNS)
 
-        if any(not self._record_account_code(r, {}) for r in records):
-            self.fetch_chart_of_accounts()
-        code_by_key = self._code_by_key
+        return self._records_to_osv(records, period_end, account_code)
 
-        rows: list[dict[str, Any]] = []
-        for rec in records:
-            acc_code = self._record_account_code(rec, code_by_key) or "?"
-            if acc_code != account_code:
-                continue
+    def fetch_osv_account_subconto_monthly(
+        self,
+        period_start: str,
+        period_end: str,
+        account_code: str,
+    ) -> pd.DataFrame:
+        """
+        Отчёт по счёту с субконто по месяцам диапазона [period_start, period_end].
 
-            # Resolve subconto representation
-            subconto_val = rec.get("ExtDimension1")
-            subconto_str = "-"
-            if isinstance(subconto_val, dict):
-                subconto_str = (
-                    subconto_val.get("Description") or
-                    subconto_val.get("Наименование") or
-                    subconto_val.get("Name") or
-                    subconto_val.get("Code") or
-                    subconto_val.get("Код") or
-                    str(subconto_val)
-                )
-            elif subconto_val:
-                subconto_str = str(subconto_val)
+        Аналог fetch_osv_monthly, но в разрезе аналитики выбранного счёта:
+        отдельный запрос на каждый календарный месяц (см. fetch_osv_account_subconto).
+        Период каждой строки = конец её месяца, поэтому работают ML-проверки,
+        требующие историю за 2+ периода (аномалии сумм, скачки оборотов).
 
-            row: dict[str, Any] = {
-                "Период": period_end,
-                "Счет": acc_code,
-                "Субконто": subconto_str,
-            }
-            for target, candidates in _OSV_FIELDS.items():
-                value = None
-                for key in candidates:
-                    if key in rec:
-                        value = rec[key]
-                        break
-                row[target] = float(value) if value is not None else 0.0
-            rows.append(row)
+        Пустой результат — пустой DataFrame со схемой OSV_COLUMNS.
+        """
 
-        if not rows:
+        frames: list[pd.DataFrame] = []
+        for month_start_str, month_end_str in self._month_ranges(
+            period_start, period_end
+        ):
+            frames.append(self.fetch_osv_account_subconto(
+                month_start_str, month_end_str, account_code
+            ))
+
+        if not frames:
             return pd.DataFrame(columns=OSV_COLUMNS)
-
-        by_code: dict[str, list[dict]] = {}
-        for r in rows:
-            by_code.setdefault(r["Счет"], []).append(r)
-        for code, code_rows in by_code.items():
-            t = _infer_type(code, PLAN_OF_ACCOUNTS, code_rows)
-            for r in code_rows:
-                r["Тип"] = t
-
-        return pd.DataFrame(rows, columns=OSV_COLUMNS)
+        df = pd.concat(frames, ignore_index=True)
+        return df[[c for c in OSV_COLUMNS if c in df.columns]]
 
 
 def _cli() -> None:

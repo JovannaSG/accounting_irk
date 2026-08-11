@@ -15,6 +15,7 @@ _DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
 import streamlit as st
 
 from core.api_client import OneCClient
+from core.account_pass import run_account_pass
 from core.auditor import (
     AutoAuditor1C,
     DEFAULT_CLOSING_ACCOUNTS,
@@ -201,6 +202,205 @@ def _load_account_detail(result: dict, account_code: str):
     return by_period, by_subconto
 
 
+def _render_account_report(result: dict) -> None:
+    """Отчёт по счёту: все нарушения счёта, субконто/контрагенты, дубли."""
+    auditor = result.get("auditor")
+    if auditor is None:
+        return
+
+    st.markdown("---")
+    st.subheader("📑 Отчёт по счёту")
+    st.caption(
+        "Общий анализ → отчёт по каждому счёту: все нарушения, "
+        "субконто/контрагенты и возможные дубли контрагентов."
+    )
+
+    try:
+        accounts = auditor.accounts_with_errors()
+    except Exception as exc:
+        st.info(f"Отчёт по счёту недоступен: {exc}")
+        return
+
+    if not accounts:
+        st.info("Нет счетов с нарушениями.")
+        return
+
+    selected_account = st.selectbox(
+        "Счёт",
+        options=accounts,
+        index=0,
+        key="account_report_select",
+        format_func=lambda acc: f"Счёт {acc}",
+    )
+
+    try:
+        acc_rep = auditor.account_report_df(selected_account)
+        subconto_names = auditor.account_subconto(selected_account)
+        dups = auditor.account_subconto_duplicates(selected_account)
+    except Exception as exc:
+        st.error(f"Ошибка при формировании отчёта по счёту {selected_account}: {exc}")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Нарушений по счёту", len(acc_rep))
+    try:
+        total = acc_rep["Сумма"].sum()
+        c2.metric("Сумма, ₽", f"{total:,.2f}")
+    except Exception:
+        pass
+    c3.metric("Субконто/контрагентов", len(subconto_names))
+
+    st.markdown(f"**Все нарушения счёта {selected_account}**")
+    if acc_rep.empty:
+        st.info("Нет строк нарушений по этому счёту.")
+    else:
+        st.dataframe(acc_rep, width="stretch", hide_index=True)
+
+    st.markdown(f"**Субконто / контрагенты по счёту {selected_account}**")
+    if not subconto_names:
+        st.info("Субконто по этому счёту не найдено.")
+    else:
+        search = st.text_input(
+            "🔎 Поиск по субконто/контрагенту",
+            key="account_subconto_search",
+        )
+        names_view = subconto_names
+        if search.strip():
+            needle = search.strip().lower()
+            names_view = [n for n in names_view if needle in n.lower()]
+        if not names_view:
+            st.info("Поиск не дал результатов.")
+        else:
+            st.dataframe(
+                pd.DataFrame({"Субконто / Контрагент": names_view}),
+                width="stretch",
+                hide_index=True,
+            )
+
+        st.markdown("**Возможные дубли контрагентов**")
+        if dups.empty:
+            st.caption("Дублей среди субконто этого счёта не обнаружено.")
+        else:
+            st.dataframe(dups, width="stretch", hide_index=True)
+
+    balances_df = result.get("balances_df")
+    if balances_df is not None:
+        with st.expander("📅 ОСВ по месяцам по счёту", expanded=False):
+            df_acc = balances_df[balances_df["Счет"] == selected_account]
+            df_acc = df_acc.sort_values("Период")
+            if df_acc.empty:
+                st.info("Нет данных по периодам.")
+            else:
+                st.dataframe(df_acc, width="stretch", hide_index=True)
+
+
+def _run_account_pass_for_result(result: dict, options: dict) -> None:
+    """Автопроход по счетам: сразу после общего аудита, только для 1С:Фреш."""
+    source = result.get("source") or {}
+    if not source.get("url"):
+        st.session_state["account_pass"] = None
+        return
+
+    auditor = result.get("auditor")
+    if auditor is None:
+        st.session_state["account_pass"] = None
+        return
+    accounts = auditor.accounts_with_errors()
+    if not accounts:
+        st.session_state["account_pass"] = None
+        return
+
+    meta = {"organization": options.get("organization") or ""}
+    real_periods = [p for p in (options.get("periods") or []) if p]
+    if real_periods:
+        meta["period"] = ", ".join(real_periods)
+
+    cache_key = (source.get("start_s"), source.get("end_s"))
+    cache = st.session_state.setdefault("account_pass_fetch_cache", {})
+
+    def fetch(account: str) -> pd.DataFrame:
+        key = (cache_key, account)
+        if key not in cache:
+            client = OneCClient(
+                str(source["url"]).strip(),
+                str(source["user"]).strip(),
+                str(source.get("password") or ""),
+            )
+            cache[key] = client.fetch_osv_account_subconto_monthly(
+                str(source["start_s"]), str(source["end_s"]), account
+            )
+        return cache[key]
+
+    progress_bar = st.progress(0.0, text="Автопроход по счетам...")
+    try:
+        def progress(done: int, total: int, account: str) -> None:
+            progress_bar.progress(
+                done / total,
+                text=f"Автопроход по счетам: {account} ({done}/{total})",
+            )
+
+        pass_data = run_account_pass(
+            accounts, fetch, options, meta=meta, progress=progress
+        )
+    finally:
+        progress_bar.empty()
+
+    pass_data["audit_id"] = result["audit_id"]
+    st.session_state["account_pass"] = pass_data
+
+
+def _render_account_pass(result: dict) -> None:
+    """Секция «Автопроход по счетам»: нарушения внутри отчёта по каждому счёту."""
+    pass_data = st.session_state.get("account_pass")
+    if pass_data is None:
+        return
+    if pass_data.get("audit_id") != result.get("audit_id"):
+        return
+
+    st.markdown("---")
+    st.subheader("🔄 Автопроход по счетам (1С:Фреш)")
+    st.caption(
+        "Для каждого счёта с нарушениями из общего отчёта запрошен индивидуальный "
+        "отчёт по счёту из 1С и повторно выполнены включённые проверки "
+        "и ML-дубли контрагентов внутри счёта."
+    )
+
+    summary_df = pass_data.get("summary_df")
+    if summary_df is None or summary_df.empty:
+        st.info("Автопроход не выявил данных по счетам.")
+        return
+
+    failed = summary_df[summary_df["Ошибка"].astype(str).str.len() > 0]
+    if not failed.empty:
+        details_fail = "; ".join(
+            f"{r['Счет']} — {r['Ошибка']}" for _, r in failed.iterrows()
+        )
+        st.warning(f"Не удалось получить индивидуальный отчёт по {len(failed)} счёту(ам): {details_fail}")
+
+    st.dataframe(summary_df, width="stretch", hide_index=True)
+
+    details_df = pass_data.get("details_df")
+    dups_df = pass_data.get("duplicates_df")
+
+    for _, row in summary_df.iterrows():
+        account = str(row["Счет"])
+        if str(row["Ошибка"]) and str(row["Ошибка"]) != "nan":
+            continue
+        n_violations = int(row["Строк нарушений"])
+        with st.expander(f"📄 Счёт {account} — нарушений внутри: {n_violations}"):
+            if details_df is not None and not details_df.empty:
+                acc_det = details_df[details_df["Счет"].astype(str) == account]
+                if not acc_det.empty:
+                    st.dataframe(acc_det, width="stretch", hide_index=True)
+                else:
+                    st.info("Нарушений внутри отчёта по счёту не найдено.")
+            if dups_df is not None and not dups_df.empty:
+                acc_dups = dups_df[dups_df["Счет"].astype(str) == account]
+                if not acc_dups.empty:
+                    st.markdown("**ML-дубли контрагентов внутри счёта:**")
+                    st.dataframe(acc_dups, width="stretch", hide_index=True)
+
+
 def _render_results(result: dict) -> None:
     """Отображает результаты аудита с фильтрами и проваливанием внутрь."""
     errors = result.get("errors", [])
@@ -217,6 +417,8 @@ def _render_results(result: dict) -> None:
         if "audit" in st.session_state:
             del st.session_state["audit"]
         st.session_state.pop("summary_df", None)
+        st.session_state.pop("account_pass", None)
+        st.session_state.pop("account_pass_fetch_cache", None)
         st.rerun()
 
     if status_code == "ok":
@@ -326,6 +528,9 @@ def _render_results(result: dict) -> None:
             except Exception as exc:
                 st.error(f"Не удалось загрузить детальный отчёт: {exc}")
 
+    _render_account_report(result)
+    _render_account_pass(result)
+
     st.subheader("🔍 Детальный отчет")
     if details_view.empty:
         st.info("Нет строк по выбранным фильтрам.")
@@ -333,9 +538,12 @@ def _render_results(result: dict) -> None:
         st.dataframe(details_view, width="stretch", hide_index=True)
 
     if result.get("auditor") is not None:
+        pass_data = st.session_state.get("account_pass")
+        if pass_data is not None and pass_data.get("audit_id") != result.get("audit_id"):
+            pass_data = None
         c_excel, c_pdf = st.columns(2)
         try:
-            excel_data = result["auditor"].to_excel()
+            excel_data = result["auditor"].to_excel(account_pass=pass_data)
             c_excel.download_button(
                 "💾 Выгрузить отчет в Excel",
                 data=excel_data,
@@ -347,7 +555,7 @@ def _render_results(result: dict) -> None:
             c_excel.caption(f"Excel экспорт недоступен: {exc}")
 
         try:
-            pdf_data = result["auditor"].to_pdf()
+            pdf_data = result["auditor"].to_pdf(account_pass=pass_data)
             c_pdf.download_button(
                 "💾 Выгрузить отчет в PDF",
                 data=pdf_data,
@@ -506,6 +714,8 @@ if fetch_api:
             "end_s": end_s,
         }
         st.session_state["api_db_name"] = api_url.strip()
+        st.session_state.pop("account_pass", None)
+        st.session_state.pop("account_pass_fetch_cache", None)
         for k in ("osv", "docs", "audit", "mock_data"):
             st.session_state.pop(k, None)
     except (ValueError, OSError) as exc:
@@ -631,6 +841,7 @@ if st.button("🚀 Запустить Аудит", type="primary", key="btn_audi
             res = _run_audit_local(balances, doc_filtered, options, db_name, source_info)
         st.session_state["audit"] = res
         st.session_state.pop("summary_df", None)
+        _run_account_pass_for_result(res, options)
     except Exception as exc:
         st.error(f"Ошибка при выполнении проверки: {exc}")
         st.code(traceback.format_exc(), language="python")
