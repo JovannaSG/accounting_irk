@@ -933,23 +933,43 @@ class AutoAuditor1C:
                 codes.update(self._account_codes_in(cell))
         return sorted(codes)
 
+    def account_subaccounts(self, account_code: str) -> list[str]:
+        """Субсчета счета: '60' -> ['60.01', '60.02', ...], '60.01' -> ['60.01']."""
+        code = str(account_code).strip()
+        if "." in code:
+            return [code]
+        if self.balances is not None and "Счет" in self.balances.columns:
+            values = self.balances["Счет"].dropna()
+            codes: set[str] = set()
+            idx = 0
+            while idx < len(values):
+                item = str(values.iloc[idx]).strip()
+                if account_group(item) == code:
+                    codes.add(item)
+                idx += 1
+            if codes:
+                return sorted(codes)
+        return [code]
+
     def account_report_df(self, account_code: str) -> pd.DataFrame:
-        """Все нарушения выбранного счета одним списком (строки детального
-        отчета, где в «Счет» присутствует account_code)."""
+        """Все нарушения выбранного счета одним списком: для родительского
+        счета учитываются и строки его субсчетов («хождение по субсчетам»)."""
         details = self.details_df()
         if details.empty:
             return details
+        subaccounts = set(self.account_subaccounts(account_code))
         return details[
             details["Счет"].map(
-                lambda cell: account_code in self._account_codes_in(cell)
+                lambda cell: bool(set(self._account_codes_in(cell)) & subaccounts)
             )
         ]
 
     def account_subconto(self, account_code: str) -> list[str]:
         """Субконто/контрагенты, задействованные по счету (из ОСВ и документов)."""
         names: set[str] = set()
+        subaccounts = self.account_subaccounts(account_code)
         if "Счет" in self.balances.columns and "Субконто" in self.balances.columns:
-            rows = self.balances[self.balances["Счет"] == account_code]["Субконто"]
+            rows = self.balances[self.balances["Счет"].isin(subaccounts)]["Субконто"]
             names.update(
                 str(n).strip() for n in rows.dropna() if str(n).strip() != "-"
             )
@@ -958,7 +978,7 @@ class AutoAuditor1C:
             and "Счет" in self.documents.columns
             and "Контрагент" in self.documents.columns
         ):
-            rows = self.documents[self.documents["Счет"] == account_code]["Контрагент"]
+            rows = self.documents[self.documents["Счет"].isin(subaccounts)]["Контрагент"]
             names.update(
                 str(n).strip() for n in rows.dropna() if str(n).strip()
             )
