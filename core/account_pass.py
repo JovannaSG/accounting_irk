@@ -12,29 +12,34 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Callable
 
 import pandas as pd
 
 from core.auditor import DETAIL_COLUMNS, AutoAuditor1C
 
 # Столбцы сводки автопрохода.
-PASS_SUMMARY_COLUMNS = [
-    "Счет", "Строк нарушений", "Уровень", "Субконто", "Сумма", "Ошибка",
+PASS_SUMMARY_COLUMNS: list[str] = [
+    "Счет", "Строк нарушений", "Уровень",
+    "Субконто", "Сумма", "Ошибка",
 ]
 
-# Столбцы сводки дублей контрагентов в автопроходе (со «Счет» в начале).
-PASS_DUPLICATES_COLUMNS = [
-    "Счет", "Субконто", "Название А", "Название Б", "Сходство", "Комментарий",
+# Столбцы сводки дублей контрагентов в автопроходе (со «Счет» в начале)
+PASS_DUPLICATES_COLUMNS: list[str] = [
+    "Счет", "Субконто", "Название А",
+    "Название Б", "Сходство", "Комментарий",
 ]
 
 
 def _build_auditor(
     balances: pd.DataFrame,
     options: dict,
-    meta: Optional[dict] = None,
+    meta: dict | None = None,
 ) -> AutoAuditor1C:
-    """Собирает аудитор с теми же настройками, что и общий аудит."""
+    """
+    Собирает аудитор с теми же настройками, что и общий аудит
+    """
+
     return AutoAuditor1C(
         balances,
         None,  # реестр документов для 1С:Фреш недоступен через OData
@@ -52,9 +57,13 @@ def _build_auditor(
 
 
 def _worst_level(details: pd.DataFrame) -> str:
-    """Уровень по максимальной тяжести строк нарушений (error > warning > ok)."""
+    """
+    Уровень по максимальной тяжести строк нарушений (error > warning > ok)
+    """
+
     if details is None or details.empty:
         return "ok"
+
     levels = set(str(l) for l in details["Уровень"].dropna())
     if "error" in levels:
         return "error"
@@ -67,8 +76,8 @@ def run_account_pass(
     accounts: list[str],
     fetch_balances: Callable[[str], pd.DataFrame],
     options: dict,
-    meta: Optional[dict] = None,
-    progress: Optional[Callable[[int, int, str], None]] = None,
+    meta: dict | None = None,
+    progress: Callable[[int, int, str]] | None = None,
 ) -> dict:
     """
     Автопроход по счетам: для каждого счёта берёт индивидуальный отчёт
@@ -87,6 +96,7 @@ def run_account_pass(
       duplicates_df — ML-дубли контрагентов по счетам (PASS_DUPLICATES_COLUMNS);
       by_account    — {code: {balances, details, subconto, dups, error}}.
     """
+
     ordered = sorted({str(a) for a in accounts})
     total = len(ordered)
 

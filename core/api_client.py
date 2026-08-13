@@ -1,15 +1,19 @@
 import logging
 import os
 import sys
-from typing import Any, Optional
+from typing import Any
 
 import requests
 from requests.auth import HTTPBasicAuth
 
 import pandas as pd
 
-if __package__ in (None, ""):  # разрешаем запуск как скрипта: python core/api_client.py
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# разрешаем запуск как скрипта: python core/api_client.py
+if __package__ in (None, ""):
+    sys.path.insert(
+        0,
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
 
 from core.auditor import OSV_COLUMNS
 from core.loaders import PLAN_OF_ACCOUNTS, _infer_type
@@ -19,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Кандидаты на имена полей виртуальной таблицы регистра бухгалтерии.
 # Точный состав полей OData-запросов к BalanceAndTurnovers официально не
 # документирован, поэтому имена резолвятся гибко (первый найденный ключ).
-_OSV_FIELDS = {
+_OSV_FIELDS: dict[str, list[str]] = {
     "НачалоДебет": ["СуммаOpeningBalanceDr", "ОстатокДт", "СНД", "НачалоДебет"],
     "НачалоКредит": ["СуммаOpeningBalanceCr", "ОстатокКт", "СНК", "НачалоКредит"],
     "ОборотДебет": ["СуммаTurnoverDr", "ОборотДт", "ОД", "ОборотДебет"],
@@ -31,7 +35,7 @@ _OSV_FIELDS = {
 # Поля, запрашиваемые у BalanceAndTurnovers. 1С группирует строки виртуальной
 # таблицы по выбранным полям: без $select возвращаются тысячи строк в разрезе
 # организаций/субконто, а с ним — одна строка на счёт. Поэтому select обязателен.
-_OSV_SELECT = ",".join(
+_OSV_SELECT: str = ",".join(
     ["Account_Key"]
     + [candidates[0] for candidates in _OSV_FIELDS.values()]
 )
@@ -40,31 +44,35 @@ _OSV_SELECT = ",".join(
 class OneCClient:
     def __init__(self, base_url: str, username: str, password: str) -> None:
         """
-        Initialize the 1C API client.
+        Инициализируйте клиент 1С API.
 
-        Works both for a self-hosted published base and for 1C:Fresh.
-        For Fresh, base_url is the application URL taken from the browser
-        (without the language code), e.g. https://1cfresh.com/a/sbm_demo/1962515
-        :param base_url: Base URL of the 1C application.
+        Работает как для самостоятельной опубликованной базы данных, так и для 1С:Fresh.
+        Для Fresh base_url - это URL-адрес приложения, взятый из браузера
+        (без указания языка), например https://1cfresh.com/a/sbm_demo/1962515
+        :параметр base_url: Базовый URL-адрес приложения 1С.
         """
 
         self.base_url = base_url.rstrip('/')
         self.session = requests.Session()
         self.session.auth = HTTPBasicAuth(username, password)
-        # Force 1C to return JSON instead of XML
+        # Принуждаем 1С вернуть json, а не xml
         self.session.headers.update({'Accept': 'application/json'})
         self._code_by_key: dict[str, str] = {}
 
-    # ------------------------------------------------------------------ #
-    # Общие методы                                                       #
-    # ------------------------------------------------------------------ #
-
+    #                           ========== Общие методы ==========
     def _paginate(self, endpoint: str, params: dict[str, Any]) -> list[dict]:
-        """Загружает все страницы стандартного интерфейса OData ($top/$skip)."""
+        """
+        Загружает все страницы стандартного интерфейса OData ($top/$skip)
+        """
+
         all_records: list[dict] = []
         while True:
             try:
-                response = self.session.get(endpoint, params=params, timeout=30)
+                response = self.session.get(
+                    endpoint,
+                    params=params,
+                    timeout=30
+                )
                 response.raise_for_status()
                 data = response.json()
             except requests.exceptions.HTTPError as e:
@@ -85,36 +93,40 @@ class OneCClient:
         return all_records
 
     @staticmethod
-    def _friendly_http_error(error: requests.exceptions.HTTPError, params: dict) -> str:
-        status = error.response.status_code if error.response is not None else None
-        url = error.response.url if error.response is not None else ""
+    def _friendly_http_error(error: requests.exceptions.HTTPError) -> str:
+        status: int | None  = None
+        url: str = ""
+        if error.response is not None:
+            status = error.response.status_code
+            url = error.response.url
+
         if status == 401:
             return (
                 "OData вернул 401 Unauthorized. Проверьте логин/пароль служебного "
                 "пользователя (роль «УдаленныйДоступOData» или «Полные права»). "
                 "Если в базе есть ограничения доступа к данным, добавьте в запрос "
-                "параметр allowedOnly=true. URL запроса: " + url
+                "параметр allowedOnly=true. URL запроса: "
+                + url
             )
         if status in (400, 404) and "BalanceAndTurnovers" in url:
             return (
                 "OData не нашел виртуальную таблицу регистра бухгалтерии. Убедитесь, "
                 "что в обработке «Настройка стандартного интерфейса OData» (вкладка "
-                "«Состав») включен доступ к регистру бухгалтерии «Хозрасчетный». URL: " + url
+                "«Состав») включен доступ к регистру бухгалтерии «Хозрасчетный». URL: "
+                + url
             )
         return f"OData-запрос завершился ошибкой {status}: {url}"
 
-    # ------------------------------------------------------------------ #
-    # Движения регистра бухгалтерии                                      #
-    # ------------------------------------------------------------------ #
-
+    #                      ========== Движения регистра бухгалтерии ==========
     def fetch_accounting_records(
         self,
         period_start: str,
         period_end: str
     ) -> pd.DataFrame:
         """
-        Fetches accounting records (Регистр бухгалтерии) for a specific period.
-        Returns one row per posting (movement), not an OSV.
+        Извлекает бухгалтерские записи (регистратор бухгалтерии)
+        за определенный период.
+        Возвращает одну строку для каждой проводки (перемещения), а не OSV
         """
 
         endpoint: str = f"{self.base_url}/odata/standard.odata/AccountingRegister_Хозрасчетный"
@@ -122,9 +134,12 @@ class OneCClient:
         params: dict[str, Any] = {
             "$format": "json",
             "$filter": f"Period ge datetime'{period_start}' and Period le datetime'{period_end}'",
-            # Expand related tables to get readable names instead of raw GUIDs
+            # Разверните связанные таблицы,
+            # чтобы получить читаемые имена
+            # вместо необработанных идентификаторов GUID
             "$expand": "AccountDr, AccountCr, ExtDimension1Dr, ExtDimension1Cr",
-            # 1C usually limits responses to 1000 rows. We need to fetch everything.
+            # 1С обычно ограничивает количество ответов 1000 строками.
+            # Нам нужно извлечь все
             "$top": 1000,
             "$skip": 0,
         }
@@ -135,73 +150,75 @@ class OneCClient:
 
     def _flatten_and_clean(self, records: list) -> pd.DataFrame:
         """
-        Flattens the deeply nested JSON from 1C into a 2D Pandas DataFrame.
+        Сглаживает глубоко вложенный JSON из 1С в 2D-фрейм данных Pandas.
         """
 
         if not records:
             logger.info("Движения за указанный период не найдены.")
             return pd.DataFrame()
 
-        # This is the magic function that turns nested JSON into flat columns
-        # e.g., {"AccountDr": {"Code": "51"}} becomes column "AccountDr.Code" with value "51"
-        df = pd.json_normalize(records)
+        rows: list[dict] = []
+        for rec in records:
+            acc_dr = rec.get("AccountDr") or {}
+            acc_cr = rec.get("AccountCr") or {}
 
-        # Map 1C's complex OData fields to our App's simple naming convention
-        rename_map: dict[str, Any] = {
-            'Period': 'Дата',
-            'AccountDr.Code': 'Дебет',
-            'AccountCr.Code': 'Кредит',
-            'Сумма': 'Сумма',
-            'Recorder_Type': 'Документ'
-        }
+            rows.append({
+                "Дата": rec.get("Period"),
+                "Дебет": acc_dr.get("Code") if isinstance(acc_dr, dict) else None,
+                "Кредит": acc_cr.get("Code") if isinstance(acc_cr, dict) else None,
+                "Сумма": rec.get("Сумма", rec.get("Amount", 0.0)),
+                "Документ": rec.get("Recorder_Type")
+            })
+        df = pd.DataFrame()
+        return df
 
-        # Rename columns (ignoring ones that might be missing from the specific query)
-        existing_cols = {k: v for k, v in rename_map.items() if k in df.columns}
-        df.rename(columns=existing_cols, inplace=True)
-
-        # Keep only the relevant columns to save memory
-        final_columns = list(existing_cols.values())
-        available_final_columns = [col for col in final_columns if col in df.columns]
-
-        return df[available_final_columns]
-
-    # ------------------------------------------------------------------ #
-    # ОСВ через виртуальную таблицу регистра бухгалтерии                 #
-    # ------------------------------------------------------------------ #
-
+    #           ========== ОСВ через виртуальную таблицу регистра бухгалтерии ==========
     def fetch_chart_of_accounts(self) -> dict[str, str]:
         """
         Возвращает справочник GUID -> код счета (план счетов «Хозрасчетный»).
         Используется, когда в ответе регистра приходит только Счет_Key (GUID).
         """
+
         if self._code_by_key:
             return self._code_by_key
 
         endpoint = f"{self.base_url}/odata/standard.odata/ChartOfAccounts_Хозрасчетный"
-        params: dict[str, Any] = {"$format": "json", "$select": "Ref_Key,Code", "$top": 1000, "$skip": 0}
+        params: dict[str, Any] = {
+            "$format": "json",
+            "$select": "Ref_Key,Code",
+            "$top": 1000,
+            "$skip": 0
+        }
         records = self._paginate(endpoint, params)
 
         for rec in records:
-            key = rec.get("Ref_Key") or rec.get("Ref_Key")
+            key = rec.get("Ref_Key") or rec.get("Ссылка")
             code = rec.get("Code") or rec.get("Код")
             if key and code:
                 self._code_by_key[str(key)] = str(code)
         return self._code_by_key
 
     @staticmethod
-    def _record_account_code(rec: dict, code_by_key: dict[str, str]) -> Optional[str]:
+    def _record_account_code(
+        rec: dict,
+        code_by_key: dict[str, str]
+    ) -> str | None:
         acct = rec.get("Счет") or rec.get("Account")
         if isinstance(acct, dict):
             code = acct.get("Code") or acct.get("Код")
             if code:
                 return str(code)
+
         key = rec.get("Account_Key") or rec.get("Счет_Key")
         if key and str(key) in code_by_key:
             return code_by_key[str(key)]
         return None
 
     def _record_subconto(self, rec: dict) -> str:
-        """Представление субконто (контрагента) из ExtDimension1 записи регистра."""
+        """
+        Представление субконто (контрагента) из ExtDimension1 записи регистра
+        """
+
         subconto_val = rec.get("ExtDimension1")
         if isinstance(subconto_val, dict):
             return (
@@ -220,7 +237,7 @@ class OneCClient:
         self,
         records: list[dict],
         period_end: str,
-        account_code: Optional[str] = None,
+        account_code: str | None = None,
     ) -> pd.DataFrame:
         """
         Собирает DataFrame со схемой OSV_COLUMNS из записей BalanceAndTurnovers.
@@ -229,6 +246,7 @@ class OneCClient:
         (серверный $filter по Account_Key OData запрещает, поэтому фильтрация
         клиентская).
         """
+
         if not records:
             return pd.DataFrame(columns=OSV_COLUMNS)
 
@@ -263,8 +281,14 @@ class OneCClient:
         by_code: dict[str, list[dict]] = {}
         for r in rows:
             by_code.setdefault(r["Счет"], []).append(r)
+
         for code, code_rows in by_code.items():
-            t = _infer_type(code, PLAN_OF_ACCOUNTS, code_rows)
+            if '.' in code:
+                parent_code = code.split('.')[0]
+            else:
+                parent_code = code
+
+            t = _infer_type(parent_code, PLAN_OF_ACCOUNTS, code_rows)
             for r in code_rows:
                 r["Тип"] = t
 
@@ -279,12 +303,13 @@ class OneCClient:
         Период, Счет, Субконто, Тип, НачалоДебет, НачалоКредит,
         ОборотДебет, ОборотКредит, КонецДебет, КонецКредит
         """
-        register = "AccountingRegister_Хозрасчетный"
-        method = (
+
+        register: str = "AccountingRegister_Хозрасчетный"
+        method: str = (
             f"BalanceAndTurnovers(StartPeriod=datetime'{period_start}', "
             f"EndPeriod=datetime'{period_end}')"
         )
-        endpoint = f"{self.base_url}/odata/standard.odata/{register}/{method}"
+        endpoint: str = f"{self.base_url}/odata/standard.odata/{register}/{method}"
 
         params: dict[str, Any] = {
             "$format": "json",
@@ -309,6 +334,7 @@ class OneCClient:
         23:59:59 (для последнего месяца — period_end). Формат входа/выхода:
         'YYYY-MM-DDTHH:MM:SS'.
         """
+
         import calendar
 
         start = pd.to_datetime(period_start, errors="coerce")
@@ -353,14 +379,16 @@ class OneCClient:
 
         frames: list[pd.DataFrame] = []
         for month_start_str, month_end_str in self._month_ranges(
-            period_start, period_end
+            period_start,
+            period_end
         ):
             frames.append(self.fetch_osv(month_start_str, month_end_str))
 
         if not frames:
             return pd.DataFrame(columns=OSV_COLUMNS)
         df = pd.concat(frames, ignore_index=True)
-        return df[[c for c in OSV_COLUMNS if c in df.columns]]
+        # Гарантируем схему даже если некоторые столбцы пустые
+        return df.reindex(columns=OSV_COLUMNS)
 
     def fetch_osv_account_subconto(
         self,
@@ -369,19 +397,21 @@ class OneCClient:
         account_code: str,
     ) -> pd.DataFrame:
         """
-        Fetches the detailed OSV with subconto for a specific account.
-        Queries the virtual table with ExtDimension1 included.
-        Filters by account_code on the client side since server-side filter on Account_Key is forbidden.
+        Извлекает подробную OSV с помощью subconto для конкретной учетной записи.
+        Запрашивает виртуальную таблицу с включенным расширением ExtDimension1.
+        Фильтрует по коду учетной записи на стороне клиента,
+        поскольку фильтрация на стороне сервера по ключу учетной записи запрещена
         """
-        register = "AccountingRegister_Хозрасчетный"
-        method = (
+
+        register: str = "AccountingRegister_Хозрасчетный"
+        method: str = (
             f"BalanceAndTurnovers(StartPeriod=datetime'{period_start}', "
             f"EndPeriod=datetime'{period_end}')"
         )
-        endpoint = f"{self.base_url}/odata/standard.odata/{register}/{method}"
+        endpoint: str = f"{self.base_url}/odata/standard.odata/{register}/{method}"
 
-        # We select Account_Key, ExtDimension1, and the numeric fields.
-        select_fields = [
+        # Выбираем Account_Key, ExtDimension1 и числовые поля
+        select_fields: list[str] = [
             "Account_Key",
             "ExtDimension1",
         ]
@@ -390,10 +420,10 @@ class OneCClient:
 
         select_str = ",".join(select_fields)
 
-        # Try with $expand=ExtDimension1 first
-        records = []
+        # Сначала запуск с помощью $expand=ExtDimension1
+        records: list[dict] = []
         try:
-            params = {
+            params: dict = {
                 "$format": "json",
                 "$select": select_str,
                 "$expand": "ExtDimension1",
@@ -401,9 +431,13 @@ class OneCClient:
                 "$skip": 0,
             }
             records = self._paginate(endpoint, params)
-        except Exception:
-            # Fallback to no $expand
-            params = {
+        except Exception as exc:  # noqa: BLE001 - старые конфигурации не знают $expand
+            logger.warning(
+                "Запрос с $expand=ExtDimension1 не удался (%s); повторяем без $expand",
+                exc,
+            )
+            # Запасной вариант без $expand
+            params: dict = {
                 "$format": "json",
                 "$select": select_str,
                 "$top": 1000,
@@ -435,23 +469,32 @@ class OneCClient:
 
         frames: list[pd.DataFrame] = []
         for month_start_str, month_end_str in self._month_ranges(
-            period_start, period_end
+            period_start,
+            period_end
         ):
-            frames.append(self.fetch_osv_account_subconto(
-                month_start_str, month_end_str, account_code
-            ))
+            frames.append(
+                self.fetch_osv_account_subconto(
+                    month_start_str,
+                    month_end_str,
+                    account_code
+                )
+            )
 
         if not frames:
             return pd.DataFrame(columns=OSV_COLUMNS)
+
         df = pd.concat(frames, ignore_index=True)
-        return df[[c for c in OSV_COLUMNS if c in df.columns]]
+        # Гарантируем схему
+        return df.reindex(columns=OSV_COLUMNS)
 
 
 def _cli() -> None:
     import argparse
     import os
 
-    parser = argparse.ArgumentParser(description="Получение ОСВ из 1C (в т.ч. 1C:Fresh) через OData")
+    parser = argparse.ArgumentParser(
+        description="Получение ОСВ из 1C (в т.ч. 1C:Fresh) через OData"
+    )
     parser.add_argument(
         "url", nargs="?",
         default=os.environ.get("ONEC_URL", "https://msk1.1cfresh.com/a/ea/3418453"),
@@ -463,7 +506,7 @@ def _cli() -> None:
     )
     parser.add_argument(
         "password", nargs="?",
-        default=os.environ.get("ONEC_PASS", "odatauser2026!!")
+        default=os.environ.get("ONEC_PASS", "")
     )
     parser.add_argument("--start", default="2026-01-01T00:00:00")
     parser.add_argument("--end", default="2026-06-30T23:59:59")

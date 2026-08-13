@@ -10,12 +10,10 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 import pandas as pd
 
 # Столбцы мастер-таблицы (строго по образцу).
-DASHBOARD_COLUMNS = [
+DASHBOARD_COLUMNS: list[str] = [
     "Бухгалтер",
     "База",
     "Дата просмотра",
@@ -25,10 +23,10 @@ DASHBOARD_COLUMNS = [
     "Не закрыты документами, счет",
 ]
 
-_DASH = "—"  # пустая ячейка вместо пустого списка
+_DASH: str = "—"  # пустая ячейка вместо пустого списка
 
 # Три блока детальной панели дашборда: маркеры заголовков проверок.
-BLOCK_RULES = {
+BLOCK_RULES: dict[str, list[str]] = {
     "red": ["Красное сальдо"],
     "unclosed": ["Незакрытое сальдо", "Зависшее сальдо", "Контроль групп"],
     "expanded": ["Развернутое сальдо"],
@@ -36,7 +34,10 @@ BLOCK_RULES = {
 
 
 def _block_columns() -> list[str]:
-    """Порядок блоков детальной панели."""
+    """
+    Порядок блоков детальной панели
+    """
+
     return list(BLOCK_RULES.keys())
 
 
@@ -47,6 +48,7 @@ def block_dfs(details: pd.DataFrame) -> dict[str, pd.DataFrame]:
     Строки ML-проверок и «расчеты не закрыты документами» (4.5) в блоки не
     попадают — они остаются в общей детализации по счетам.
     """
+
     result: dict[str, pd.DataFrame] = {}
     blocks = _block_columns()
     if details is None or details.empty or "Проверка" not in details.columns:
@@ -56,7 +58,7 @@ def block_dfs(details: pd.DataFrame) -> dict[str, pd.DataFrame]:
             idx += 1
         return result
 
-    idx = 0
+    idx: int = 0
     while idx < len(blocks):
         block = blocks[idx]
         markers = BLOCK_RULES[block]
@@ -70,10 +72,14 @@ def block_dfs(details: pd.DataFrame) -> dict[str, pd.DataFrame]:
     return result
 
 
-def accounts_list(df: pd.DataFrame) -> list[str]:
-    """Сортированные уникальные счета из колонки «Счет»."""
+def accounts_list(df: pd.DataFrame | None) -> list[str]:
+    """
+    Сортированные уникальные счета из колонки «Счет»
+    """
+
     if df is None or df.empty or "Счет" not in df.columns:
         return []
+
     values = df["Счет"].dropna().astype(str)
     seen: set[str] = set()
     idx = 0
@@ -95,6 +101,7 @@ def _collect_accounts(details: pd.DataFrame) -> dict[str, list[str]]:
       "Не закрыт период, счет, период"-> "счет, период";
       "Не закрыты документами, счет"  -> счета (расчеты не закрыты документами).
     """
+
     result: dict[str, list[str]] = {}
     col_idx = 0
     while col_idx < len(DASHBOARD_COLUMNS[3:]):
@@ -130,6 +137,7 @@ def build_master_row(result: dict) -> dict:
     """
     Сводная строка одной базы для мастер-таблицы дашборда.
     """
+
     details = result.get("details")
     collected: dict[str, list[str]] = {}
     if details is not None and not getattr(details, "empty", True):
@@ -140,6 +148,13 @@ def build_master_row(result: dict) -> dict:
         "База": str(result.get("db_name") or "") or _DASH,
         "Дата просмотра": str(result.get("viewed_at") or "") or _DASH,
     }
+
+    # При аудите «по месяцам» каждая строка истории соответствует отдельному
+    # периоду одной базы — чтобы строки в мастер-таблице не выглядели клонами,
+    # период добавляется к имени базы.
+    period = str(result.get("period") or "").strip()
+    if period and period not in row["База"]:
+        row["База"] = f"{row['База']} ({period})"
     col_idx = 0
     while col_idx < len(DASHBOARD_COLUMNS[3:]):
         col = DASHBOARD_COLUMNS[3:][col_idx]
@@ -153,6 +168,7 @@ def build_dashboard_df(history: list[dict]) -> pd.DataFrame:
     """
     Мастер-таблица дашборда: одна строка на результат аудита в истории.
     """
+
     rows: list[dict] = []
     idx = 0
     while idx < len(history):
@@ -160,14 +176,25 @@ def build_dashboard_df(history: list[dict]) -> pd.DataFrame:
         idx += 1
     if not rows:
         return pd.DataFrame(columns=DASHBOARD_COLUMNS)
+
     return pd.DataFrame(rows, columns=DASHBOARD_COLUMNS)
 
 
-def find_result(history: list[dict], db_name: str) -> Optional[dict]:
-    """Первый результат аудита для указанной базы."""
-    idx = 0
+def find_result(history: list[dict], db_name: str) -> dict | None:
+    """
+    Первый результат аудита для указанной базы (учитывает период в имени)
+    """
+
+    idx: int = 0
     while idx < len(history):
-        if str(history[idx].get("db_name")) == db_name:
-            return history[idx]
+        entry = history[idx]
+        base = str(entry.get("db_name") or "")
+        period = str(entry.get("period") or "").strip()
+        candidates = {base}
+        if period:
+            candidates.add(f"{base} ({period})")
+        if db_name in candidates:
+            return entry
         idx += 1
+
     return None

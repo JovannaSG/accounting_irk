@@ -1,4 +1,5 @@
 """
+TODO: needs review
 Загрузка и нормализация ОСВ из файлов, выгруженных из 1С.
 
 Поддерживаются форматы:
@@ -97,7 +98,7 @@ def _to_number(v) -> float:
     if isinstance(v, numbers.Number) and not isinstance(v, bool):
         return 0.0 if pd.isna(v) else float(v)
     s = str(v).strip().replace("\u00a0", "").replace(" ", "")
-    if not s or s in ("-", "—", "–", "—", "−"):
+    if not s or s in ("-", "—", "–", "−"):
         return 0.0
     if "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):

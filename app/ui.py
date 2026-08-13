@@ -3,7 +3,6 @@ import sys
 import traceback
 import uuid
 from datetime import date, datetime
-from typing import Optional
 
 import pandas as pd
 
@@ -15,17 +14,17 @@ _DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
 import streamlit as st
 
 from core.api_client import OneCClient
-from core.dashboard import accounts_list, block_dfs, build_dashboard_df, find_result
+from core.dashboard import accounts_list, block_dfs, build_dashboard_df
 from core.auditor import (
     AutoAuditor1C,
     DEFAULT_CLOSING_ACCOUNTS,
-    RECOMMENDATIONS,
+#    RECOMMENDATIONS,
     normalize_balances,
     normalize_documents,
 )
 from core.loaders import load_osv_file
 
-st.set_page_config(page_title="ИИ-Аудитор 1С", page_icon="", layout="wide")
+st.set_page_config(page_title="ИИ-Аудитор 1С", layout="wide")
 
 st.title("ИИ-Аудитор 1С")
 
@@ -42,22 +41,25 @@ def _filter_documents_by_period(
     documents: pd.DataFrame,
     selected_periods: list[str]
 ) -> pd.DataFrame:
-    """Оставляет операции не позднее конца последнего выбранного периода."""
+    """
+    Оставляет операции не позднее конца последнего выбранного периода
+    """
+
     if documents is None or documents.empty:
         return documents
-    
-    valid_periods = []
-    i = 0
+
+    valid_periods: list = []
+    i: int = 0
     while i < len(selected_periods):
         if selected_periods[i]:
             valid_periods.append(selected_periods[i])
         i += 1
-        
+
     ends = pd.to_datetime(
         pd.Series(valid_periods),
         errors="coerce"
     ).dropna()
-    
+
     if ends.empty:
         return documents
     return documents[documents["Дата"] <= ends.max()]
@@ -65,12 +67,15 @@ def _filter_documents_by_period(
 
 def _run_audit_local(
     balances: pd.DataFrame,
-    documents: Optional[pd.DataFrame],
+    documents: pd.DataFrame | None,
     options: dict,
     db_name: str,
     source_info: dict,
 ) -> dict:
-    """Локальный запуск аудита (без внешнего API-бэкенда)."""
+    """
+    Локальный запуск аудита (без внешнего API-бэкенда)
+    """
+
     filtered_balances = balances.copy()
     if options.get("periods") is not None:
         filtered_balances = filtered_balances[
@@ -79,35 +84,24 @@ def _run_audit_local(
     if filtered_balances.empty:
         raise ValueError("Выбранные периоды не содержат данных.")
 
-    doc_filtered = None
+    doc_filtered: pd.DataFrame | None = None
     if documents is not None:
-        doc_filtered = documents.copy()
-        if options.get("periods"):
-            valid_periods = []
-            i = 0
-            opts_periods = options["periods"]
-            while i < len(opts_periods):
-                if opts_periods[i]:
-                    valid_periods.append(opts_periods[i])
-                i += 1
-                
-            ends = pd.to_datetime(
-                pd.Series(valid_periods),
-                errors="coerce"
-            ).dropna()
-            if not ends.empty:
-                doc_filtered = doc_filtered[doc_filtered["Дата"] <= ends.max()]
+        opts_periods = options.get("periods") or []
+        doc_filtered = _filter_documents_by_period(
+            documents.copy(),
+            opts_periods
+        )
 
-    meta = {"organization": options.get("organization") or ""}
-    
-    real_periods = []
-    i = 0
+    meta: dict = {"organization": options.get("organization") or ""}
+
+    real_periods: list = []
+    i: int = 0
     opts_periods_check = options.get("periods") or []
     while i < len(opts_periods_check):
         if opts_periods_check[i]:
             real_periods.append(opts_periods_check[i])
         i += 1
-        
+
     if real_periods:
         meta["period"] = ", ".join(real_periods)
     if source_info.get("title"):
@@ -130,8 +124,8 @@ def _run_audit_local(
     auditor.run_audit()
     report = auditor.report()
 
-    errors_list = []
-    i = 0
+    errors_list: list = []
+    i: int = 0
     while i < len(auditor.errors):
         err = auditor.errors[i]
         errors_list.append({
@@ -159,12 +153,15 @@ def _run_audit_local(
 
 
 def _dashboard_duplicates_df(result: dict) -> pd.DataFrame:
-    """Полная таблица ML-дублей контрагентов из findings (колонки А/Б/Сходство)."""
+    """
+    Полная таблица ML-дублей контрагентов из findings (колонки А/Б/Сходство)
+    """
+
     auditor = result.get("auditor")
     if auditor is None:
         return pd.DataFrame()
-    frames = []
-    idx = 0
+    frames: list = []
+    idx: int = 0
     while idx < len(auditor.errors):
         err = auditor.errors[idx]
         if str(err["title"]).startswith("ML: возможные дубли контрагентов"):
@@ -178,9 +175,15 @@ def _dashboard_duplicates_df(result: dict) -> pd.DataFrame:
 
 
 def _render_dashboard_block(title: str, caption: str, block_df) -> None:
-    """Один блок детальной панели дашборда: список счетов + таблица строк."""
+    """
+    Один блок детальной панели дашборда: список счетов + таблица строк
+    """
+
     empty = block_df is None or getattr(block_df, "empty", True)
-    label = title if empty else f"{title} — счетов: {len(accounts_list(block_df))}"
+    if empty:
+        label = title
+    else:
+        label = f"{title} — счетов: {len(accounts_list(block_df))}"
     with st.expander(label, expanded=False):
         st.caption(caption)
         if empty:
@@ -192,11 +195,14 @@ def _render_dashboard_block(title: str, caption: str, block_df) -> None:
 
 
 def _render_dashboard_exports(result: dict) -> None:
-    """Кнопки выгрузки Excel/PDF для выбранной базы."""
+    """
+    Кнопки выгрузки Excel/PDF для выбранной базы
+    """
+
     auditor = result.get("auditor")
     if auditor is None:
         return
-        
+
     c_excel, c_pdf = st.columns(2)
     try:
         excel_data = auditor.to_excel()
@@ -222,23 +228,65 @@ def _render_dashboard_exports(result: dict) -> None:
         c_pdf.caption(f"PDF недоступен: {exc}")
 
 
+def find_result_safe(
+    history: list[dict],
+    target_base: str,
+    target_period: str | None = None
+) -> dict | None:
+    """
+    Безопасный поиск результата аудита по Базе и Периоду без использования for
+    """
+
+    i: int = 0
+    length: int = len(history)
+
+    while i < length:
+        res = history[i]
+        
+        # Проверяем совпадение по имени базы
+        if res.get("db_name") == target_base:
+            
+            # Если период передан и он не пустой/прочерк,
+            # проверяем точное совпадение
+            if target_period is not None and target_period != "—":
+                res_period = str(res.get("period", ""))
+                
+                if res_period == target_period:
+                    return res
+            else:
+                # Если период не важен (режим "За период в целом"),
+                # возвращаем первое совпадение по базе
+                return res
+                
+        i += 1
+        
+    return None
+
+
 def _render_dashboard(history: list[dict]) -> None:
-    """Сводный дашборд по базам (Master-Detail)."""
+    """
+    Сводный дашборд по базам (Master-Detail)
+    """
+
     if not history:
         return
 
     st.markdown("---")
-    
+
     col_title, col_reset = st.columns([4, 1])
     col_title.header("📊 Сводный дашборд по базам")
-    if col_reset.button("✖️ Сбросить результаты", key="btn_reset_dash", use_container_width=True):
+    if col_reset.button(
+        "✖️ Сбросить результаты",
+        key="btn_reset_dash",
+        use_container_width=True
+    ):
         keys_to_del = ["audit", "audit_history", "dashboard_df"]
         i = 0
         while i < len(keys_to_del):
             st.session_state.pop(keys_to_del[i], None)
             i += 1
         st.rerun()
-        
+
     st.caption(
         "Мастер-вид: кликните по строке базы, чтобы увидеть ошибки по счетам "
         "этой базы в панели ниже."
@@ -270,9 +318,14 @@ def _render_dashboard(history: list[dict]) -> None:
     row_idx = rows_selected[0]
     selected_base = str(dash.iloc[row_idx]["База"])
 
-    result = find_result(history, selected_base)
+    # Пытаемся извлечь период, если колонка есть в дэшбоарде
+    selected_period = None
+    if "Период" in dash.columns:
+        selected_period = str(dash.iloc[row_idx]["Период"])
+
+    result = find_result_safe(history, selected_base, selected_period)
     if result is None:
-        st.info("Для выбранной базы нет детального результата аудита.")
+        st.info("Для выбранной базы нет детального результата аудита")
         return
 
     auditor = result.get("auditor")
@@ -322,15 +375,25 @@ def _render_dashboard(history: list[dict]) -> None:
 
     st.markdown("---")
     st.subheader("📄 Детализация по счетам")
-    accounts = accounts_list(details)
+    # Счета берутся из accounts_with_errors (разбивает составные ячейки «60.01,
+    # 60.02»), а не из сырых значений колонки «Счет».
+    accounts = (
+        auditor.accounts_with_errors()
+        if auditor is not None
+        else accounts_list(details)
+    )
     if not accounts:
         st.info("По этой базе нет строк нарушений по счетам.")
         return
 
-    idx = 0
+    idx: int = 0
     while idx < len(accounts):
         acc = accounts[idx]
-        acc_rows = details[details["Счет"].astype(str) == acc]
+        acc_rows = (
+            auditor.account_report_df(acc)
+            if auditor is not None
+            else details[details["Счет"].astype(str) == acc]
+        )
         subconto = auditor.account_subconto(acc) if auditor is not None else []
         acc_dups = (
             auditor.account_subconto_duplicates(acc)
@@ -459,8 +522,8 @@ with st.sidebar.expander("🤖 ML-проверки"):
     )
 
 # ============ Загрузка ============
-balances: Optional[pd.DataFrame] = None
-documents: Optional[pd.DataFrame] = None
+balances: pd.DataFrame | None = None
+documents: pd.DataFrame | None = None
 source_info: dict = {}
 
 if fetch_api:
@@ -477,7 +540,6 @@ if fetch_api:
             "organization": "",
             "url": api_url.strip(),
             "user": api_user.strip(),
-            "password": api_pass,
             "start_s": start_s,
             "end_s": end_s,
         }
@@ -488,7 +550,6 @@ if fetch_api:
         while i < len(keys_to_del):
             st.session_state.pop(keys_to_del[i], None)
             i += 1
-            
     except (ValueError, OSError) as exc:
         st.sidebar.error(str(exc))
         st.stop()
@@ -513,7 +574,7 @@ try:
             if keys_to_del[i] in st.session_state:
                 del st.session_state[keys_to_del[i]]
             i += 1
-            
+
         balances = st.session_state["mock_data"]["balances"]
         documents = st.session_state["mock_data"]["documents"]
     elif data_source.startswith("☁️") and "api_balances" in st.session_state:

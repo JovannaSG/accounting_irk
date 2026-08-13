@@ -16,10 +16,13 @@ from __future__ import annotations
 
 import warnings
 from difflib import SequenceMatcher
-from typing import Iterable, Optional
+from typing import Iterable, Any
 
 import pandas as pd
+import numpy as np  # Импортирован для оптимизации матрицы
 
+_fuzz: Any = None
+_process: Any = None
 try:
     from rapidfuzz import fuzz as _fuzz
     from rapidfuzz import process as _process
@@ -58,9 +61,7 @@ def _require(df: pd.DataFrame, columns: list[str], what: str) -> None:
         raise ValueError(f"{what}: отсутствуют колонки: {', '.join(missing)}")
 
 
-# ========================================================================== #
-# 1. Нетипичные суммы операций по контрагенту                                #
-# ========================================================================== #
+#              ========== 1. Нетипичные суммы операций по контрагенту ==========
 def detect_amount_anomalies(
     documents_df: pd.DataFrame,
     k: float = DEFAULT_K,
@@ -74,22 +75,26 @@ def detect_amount_anomalies(
     от |Сумма|. Операция считается аномальной, если |Сумма| превышает
     max(медиана + k * MAD, 10 * медиана, min_abs).
     """
+
     _require(documents_df, ["Контрагент", "Сумма"], "detect_amount_anomalies")
 
     rows: list[dict] = []
     for name, g in documents_df.groupby("Контрагент"):
         if len(g) < min_ops:
             continue
+
         vals = g["Сумма"].abs()
         med = float(vals.median())
         mad = float((vals - med).abs().median())
         if med <= 0:
             continue
+
         limit = max(med + k * mad, 10 * med, min_abs)
         for _, r in g.iterrows():
             v = abs(float(r["Сумма"]))
             if v > limit:
-                ratio = v / med if med else 0.0
+                # Оптимизация: med гарантированно больше нуля благодаря проверке выше
+                ratio = v / med
                 rows.append({
                     "Дата": r.get("Дата", ""),
                     "Документ": r.get("Документ", ""),
@@ -107,9 +112,7 @@ def detect_amount_anomalies(
     return pd.DataFrame(rows, columns=ANOMALY_COLUMNS)
 
 
-# ========================================================================== #
-# 2. Резкие скачки оборотов между периодами                                  #
-# ========================================================================== #
+#                ========== 2. Резкие скачки оборотов между периодами ==========
 def detect_turnover_jumps(
     balances_df: pd.DataFrame,
     ratio: float = DEFAULT_JUMP_RATIO,
@@ -120,14 +123,22 @@ def detect_turnover_jumps(
     по счету/аналитике. Требуются данные минимум за 2 периода; при одном
     периоде проверка просто не находит ничего.
     """
-    _require(balances_df, ["Период", "Счет", "Субконто",
-                           "ОборотДебет", "ОборотКредит"], "detect_turnover_jumps")
+
+    _require(
+        balances_df,
+        [
+            "Период", "Счет", "Субконто",
+            "ОборотДебет", "ОборотКредит"
+        ],
+        "detect_turnover_jumps"
+    )
 
     b = balances_df.sort_values(["Счет", "Субконто", "Период"])
     rows: list[dict] = []
     for (code, sub), g in b.groupby(["Счет", "Субконто"]):
         if len(g) < 2:
             continue
+
         for i in range(1, len(g)):
             prev, cur = g.iloc[i - 1], g.iloc[i]
             for col in ("ОборотДебет", "ОборотКредит"):
@@ -138,11 +149,12 @@ def detect_turnover_jumps(
                     continue
                 if p == 0 and c != 0:
                     jump = _JUMP_FROM_ZERO
-                elif p != 0:
-                    jump = c / p
+                elif c == 0:
+                    jump = 0.0
                 else:
-                    continue
-                if p != 0 and jump < ratio:
+                    jump = c / p
+                # Скачок — и рост (>= ratio), и падение (<= 1/ratio) оборотов.
+                if 1 / ratio < jump < ratio:
                     continue
                 rows.append({
                     "Период": cur["Период"],
@@ -161,28 +173,33 @@ def detect_turnover_jumps(
     return pd.DataFrame(rows, columns=JUMP_COLUMNS)
 
 
-# ========================================================================== #
-# 3. Нечёткий поиск дублей контрагентов                                      #
-# ========================================================================== #
+#                     ========== 3. Нечёткий поиск дублей контрагентов ==========
 def _normalize_name(name: object) -> str:
-    """Приводит название к сравниваемой форме: только буквы/цифры и пробелы."""
+    """
+    Приводит название к сравниваемой форме: только буквы/цифры и пробелы
+    """
+
     s = str(name).strip().lower()
     chars = [c for c in s if c.isalnum() or c == " "]
     return " ".join("".join(chars).split())
 
 
 def _token_sort_ratio(a: str, b: str) -> float:
-    """Сходство с неважным порядком слов (фолбэк на difflib).
+    """
+    Сходство с неважным порядком слов (фолбэк на difflib).
 
     Реализует идею token_sort_ratio из rapidfuzz: слова сортируются
     по алфавиту и сравнивается итоговая последовательность.
     """
+
     if not a or not b:
         return 0.0
+
     sorted_a = " ".join(sorted(a.split()))
     sorted_b = " ".join(sorted(b.split()))
     if sorted_a == sorted_b:
         return 100.0
+
     return SequenceMatcher(None, sorted_a, sorted_b).ratio() * 100.0
 
 
@@ -191,7 +208,10 @@ def _duplicate_pairs(
     norm: list[str],
     threshold: int,
 ) -> list[tuple[str, str, float]]:
-    """Возвращает пары (имя А, имя Б, сходство) со сходством >= threshold."""
+    """
+    Возвращает пары (имя А, имя Б, сходство) со сходством >= threshold
+    """
+
     pairs: list[tuple[str, str, float]] = []
     n = len(names)
     if n < 2:
@@ -199,11 +219,13 @@ def _duplicate_pairs(
 
     if _HAVE_RAPIDFUZZ:
         matrix = _process.cdist(norm, norm, scorer=_fuzz.token_sort_ratio)
-        for i in range(n):
-            for j in range(i + 1, n):
-                score = float(matrix[i][j])
-                if score >= threshold:
-                    pairs.append((names[i], names[j], round(score, 1)))
+        # Используем numpy для векторного извлечения
+        # индексов из верхнего треугольника
+        indices = np.argwhere(np.triu(matrix >= threshold, k=1))
+
+        for i, j in indices:
+            score = float(matrix[i, j])
+            pairs.append((names[i], names[j], round(score, 1)))
     else:  # pragma: no cover - запасной путь без rapidfuzz
         for i in range(n):
             for j in range(i + 1, n):
@@ -225,12 +247,13 @@ def find_duplicate_counterparties(
     Контрагент из реестра документов). Сравнение с неважным порядком слов;
     регистр и пунктуация игнорируются.
     """
+
     seen: dict[str, str] = {}
     for name in names:
         s = str(name).strip()
         if not s or s == "-":
             continue
-        key = " ".join(_normalize_name(s))
+        key = _normalize_name(s)
         if key and key not in seen:
             seen[key] = s
 
