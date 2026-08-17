@@ -147,7 +147,7 @@ GROUP_PRESETS: dict[str, list[str]] = {
 
 DETAIL_COLUMNS: list[str] = [
     "Проверка", "Уровень", "Период", 
-    "Счет", "Субконто",
+    "Счет", "Субконто", "Договор"
     "Дебет", "Кредит",
     "Сумма", "Комментарий"
 ]
@@ -214,6 +214,11 @@ def normalize_balances(df: pd.DataFrame) -> pd.DataFrame:
         df["Субконто"].fillna("-")
         if "Субконто" in df.columns
         else pd.Series("-", index=df.index)
+    ).astype(str)
+    df["Договор"] = (
+        df["Договор"].fillna('-')
+        if "Договор" in df.columns
+        else pd.Series('-', index=df.index)
     ).astype(str)
     df["Период"] = (
         df["Период"].fillna("")
@@ -308,7 +313,10 @@ class AutoAuditor1C:
         dup_threshold: int = ml.DEFAULT_SIM_THRESHOLD,
     ) -> None:
         self.balances = normalize_balances(balances_df)
-        self.documents = normalize_documents(documents_df) if documents_df is not None else None
+        if documents_df is not None:
+            self.documents = normalize_documents(documents_df)
+        else:
+            self.documents = None
         self.closing_accounts: set[str] = {
             str(a).split(".")[0]
             for a in (closing_accounts or DEFAULT_CLOSING_ACCOUNTS)
@@ -951,6 +959,7 @@ class AutoAuditor1C:
                     "Период": r.get("Период", ""),
                     "Счет": r.get("Счет", ""),
                     "Субконто": r.get("Субконто", ""),
+                    "Договор": r.get("Договор", ""),
                     "Дебет": r.get("КонецДебет", 0.0),
                     "Кредит": r.get("КонецКредит", 0.0),
                     "Сумма": (
@@ -1336,7 +1345,7 @@ class AutoAuditor1C:
         pdf.set_font("DejaVu", size=12)
         pdf.cell(0, 8, "Детальный отчет", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_font("DejaVu", size=7)
-        det_widths = [38, 14, 18, 12, 22, 13, 13, 13, 47]
+        det_widths: list[int] = [32, 12, 16, 10, 18, 18, 13, 13, 13, 45]
         self._pdf_header(pdf, list(details.columns), det_widths)
         for _, r in details.iterrows():
             self._pdf_row(pdf, [
@@ -1345,6 +1354,7 @@ class AutoAuditor1C:
                 str(r["Период"])[:12],
                 str(r["Счет"])[:8],
                 str(r["Субконто"])[:14],
+                str(r["Договор"])[:14],
                 f"{r['Дебет']:,.0f}",
                 f"{r['Кредит']:,.0f}",
                 f"{r['Сумма']:,.0f}",

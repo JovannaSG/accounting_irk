@@ -1,3 +1,8 @@
+"""
+TODO: Раскомментируй, когда добавишь SQLite
+строки 866, 876
+"""
+
 import os
 import sys
 import traceback
@@ -38,9 +43,9 @@ st.markdown(
 
 
 def _filter_documents_by_period(
-    documents: pd.DataFrame,
+    documents: pd.DataFrame | None,
     selected_periods: list[str]
-) -> pd.DataFrame:
+) -> pd.DataFrame | None:
     """
     Оставляет операции не позднее конца последнего выбранного периода
     """
@@ -77,12 +82,12 @@ def _run_audit_local(
     """
 
     filtered_balances = balances.copy()
+    
+    # Фильтрация по периодам
     if options.get("periods") is not None:
         filtered_balances = filtered_balances[
             filtered_balances["Период"].isin(options["periods"])
         ]
-    if filtered_balances.empty:
-        raise ValueError("Выбранные периоды не содержат данных.")
 
     doc_filtered: pd.DataFrame | None = None
     if documents is not None:
@@ -91,6 +96,24 @@ def _run_audit_local(
             documents.copy(),
             opts_periods
         )
+
+    # Фильтрация по режиму аудита (По счетам / По контрагенту)
+    audit_mode = options.get("audit_mode", "Полный")
+    if audit_mode == "По счетам" and options.get("target_accounts"):
+        filtered_balances = filtered_balances[
+            filtered_balances["Счет"].astype(str).isin(options["target_accounts"])
+        ]
+    elif audit_mode == "По контрагенту" and options.get("target_subcontos"):
+        filtered_balances = filtered_balances[
+            filtered_balances["Субконто"].astype(str).isin(options["target_subcontos"])
+        ]
+        if doc_filtered is not None and "Контрагент" in doc_filtered.columns:
+            doc_filtered = doc_filtered[
+                doc_filtered["Контрагент"].astype(str).isin(options["target_subcontos"])
+            ]
+
+    if filtered_balances.empty:
+        raise ValueError("После применения фильтров (период/счета/контрагенты) не осталось данных для проверки.")
 
     meta: dict = {"organization": options.get("organization") or ""}
 
@@ -125,7 +148,7 @@ def _run_audit_local(
     report = auditor.report()
 
     errors_list: list = []
-    i: int = 0
+    i = 0
     while i < len(auditor.errors):
         err = auditor.errors[i]
         errors_list.append({
@@ -424,7 +447,7 @@ data_source = st.sidebar.radio(
 )
 use_mock = st.sidebar.button("Использовать тестовые данные", key="btn_mock")
 
-osv_file = None
+osv_files: list = []
 fetch_api = False
 api_url = ""
 api_user = ""
@@ -433,12 +456,21 @@ api_start = date.today()
 api_end = date.today()
 
 if data_source.startswith("📁"):
-    osv_file = st.sidebar.file_uploader(
+    osv_files = st.sidebar.file_uploader(
         "ОСВ (CSV / XLS / XLSX / HTML)",
         type=["csv", "xls", "xlsx", "html", "htm"],
+        accept_multiple_files=True,
         key="osv",
     )
+    merge_mode = st.sidebar.radio(
+        "Режим нескольких файлов",
+        ["Объединить в одну базу (один аудит)", "Проверить каждый отдельно"],
+        help="Объединить: если загружаете разные месяцы одной компании." \
+            "Отдельно: если это разные базы/организации."
+    )
 else:
+    # Заглушка для 1С
+    merge_mode = "Объединить в одну базу"
     with st.sidebar.expander("🔑 Доступ к 1С:Фреш", expanded=True):
         api_url = st.text_input(
             "URL базы",
@@ -495,7 +527,7 @@ with st.sidebar.expander("⚙️ Настройки проверок"):
         help="Дополнительные типы счетов для определения красного сальдо. Формат: Код:Тип, через запятую.",
     )
 
-with st.sidebar.expander("🤖 ML-проверки"):
+with st.sidebar.expander("ML-проверки"):
     ml_enabled = st.checkbox("Включить ML-проверки", value=True)
     ml_amount_anomalies = st.checkbox(
         "Нетипичные суммы операций",
@@ -525,6 +557,9 @@ with st.sidebar.expander("🤖 ML-проверки"):
 balances: pd.DataFrame | None = None
 documents: pd.DataFrame | None = None
 source_info: dict = {}
+
+# Список баз для аудита: [{"name": str, "df": pd.DataFrame, "info": dict}]
+datasets_to_process = []
 
 if fetch_api:
     try:
@@ -577,28 +612,81 @@ try:
 
         balances = st.session_state["mock_data"]["balances"]
         documents = st.session_state["mock_data"]["documents"]
+        datasets_to_process.append(
+            {
+                "name": "Тестовая база",
+                "df": balances,
+                "info": {}
+            }
+        )
+
     elif data_source.startswith("☁️") and "api_balances" in st.session_state:
         balances = st.session_state["api_balances"]
         documents = None
         source_info = st.session_state.get("api_meta", {})
-    elif data_source.startswith("📁") and osv_file is not None:
-        balances, source_info = load_osv_file(
-            osv_file.name,
-            osv_file.getvalue(),
-            plan_override=plan_input
+        db_name = st.session_state.get("api_db_name", api_url.strip())
+        datasets_to_process.append(
+            {
+                "name": db_name,
+                "df": balances,
+                "info": source_info
+            }
         )
+
+    elif data_source.startswith("📁") and osv_files is not None:
+        if merge_mode == "Объединить в одну базу":
+            all_b: list = []
+            for f in osv_files:
+                d_df, info = load_osv_file(
+                    f.name,
+                    f.getvalue(),
+                    plan_override=plan_input
+                )
+                if not source_info:
+                    source_info = info
+
+            balances = pd.concat(all_b, ignore_index=True).drop_duplicates()
+            db_name = " + ".join([f.name for f in osv_files])
+            datasets_to_process.append(
+                {
+                    "name": db_name,
+                    "df": balances,
+                    "info": source_info
+                }
+            )
+        else: # Режим каждый отдельно
+            for f in osv_files:
+                b_df, info = load_osv_file(
+                    f.name,
+                    f.getvalue(),
+                    plan_override=plan_input
+                )
+                datasets_to_process.append(
+                    {
+                        "name": f.name,
+                        "df": b_df,
+                        "info": info
+                    }
+                )
+
+            if datasets_to_process:
+                # Для предпросмотра на экране берем первый файл
+                balances = datasets_to_process[0]["df"]
+                source_info = datasets_to_process[0]["info"]
+
     elif "mock_data" in st.session_state:
         balances = st.session_state["mock_data"]["balances"]
         documents = st.session_state["mock_data"]["documents"]
+
 except (ValueError, OSError) as exc:
     st.sidebar.error(str(exc))
     st.stop()
 
-if balances is None:
+if not datasets_to_process:
     if data_source.startswith("☁️"):
         st.info("👈 Введите доступ к 1С:Фреш и нажмите «📡 Загрузить ОСВ из 1С» в панели слева.")
     else:
-        st.info("👈 Загрузите файл ОСВ (CSV/XLS/XLSX/HTML) или нажмите «Использовать тестовые данные» в панели слева.")
+        st.info("👈 Загрузите файл(ы) ОСВ (CSV/XLS/XLSX/HTML) или нажмите «Использовать тестовые данные» в панели слева.")
     st.stop()
 
 if source_info.get("title") or source_info.get("organization"):
@@ -607,6 +695,7 @@ if source_info.get("title") or source_info.get("organization"):
         f"{(' | Орг.: ' + source_info['organization']) if source_info.get('organization') else ''}"
     )
 
+# Подготовка списков для фильтров
 unique_periods = balances["Период"].dropna().unique().tolist()
 periods = []
 i = 0
@@ -625,10 +714,56 @@ selected_periods = st.sidebar.multiselect(
 )
 
 period_mode = st.sidebar.radio(
-    "Режим периода", 
+    "Группировка периодов", 
     ["🗓 За период в целом", "📅 По месяцам"], 
     key="period_mode"
 )
+
+st.sidebar.markdown("---")
+
+# ============ Режим аудита ============
+audit_mode = st.sidebar.radio(
+    "Режим аудита",
+    ["Полный", "По счетам", "По контрагенту"],
+    key="audit_mode"
+)
+
+# Собираем уникальные счета для селектора
+unique_accs_raw = balances["Счет"].dropna().unique().tolist()
+unique_accs = []
+i = 0
+while i < len(unique_accs_raw):
+    val = str(unique_accs_raw[i]).strip()
+    if val:
+        unique_accs.append(val)
+    i += 1
+unique_accs = sorted(unique_accs)
+
+# Собираем уникальные субконто для селектора
+unique_subs = []
+if "Субконто" in balances.columns:
+    unique_subs_raw = balances["Субконто"].dropna().unique().tolist()
+    i = 0
+    while i < len(unique_subs_raw):
+        val = str(unique_subs_raw[i]).strip()
+        if val and val != "-":
+            unique_subs.append(val)
+        i += 1
+    unique_subs = sorted(unique_subs)
+
+target_accounts = []
+target_subcontos = []
+
+if audit_mode == "По счетам":
+    target_accounts = st.sidebar.multiselect("Выберите счета", options=unique_accs)
+    if not target_accounts:
+        st.sidebar.warning("⚠️ Выберите хотя бы один счет")
+elif audit_mode == "По контрагенту":
+    target_subcontos = st.sidebar.multiselect("Выберите контрагентов", options=unique_subs)
+    if not target_subcontos:
+        st.sidebar.warning("⚠️ Выберите хотя бы одного контрагента")
+st.sidebar.markdown("---")
+# =================================================
 
 closing_parts = closing_input.split(",")
 closing_accounts = []
@@ -657,28 +792,31 @@ while i < len(checks_data):
 st.subheader("📊 Исходные данные (Оборотно-сальдовая ведомость)")
 mask = balances["Период"].isin(selected_periods)
 filtered = balances[mask]
+
+# Отображаем в UI предпросмотр уже с учетом выбранного режима аудита
+if audit_mode == "По счетам" and target_accounts:
+    filtered = filtered[filtered["Счет"].astype(str).isin(target_accounts)]
+elif audit_mode == "По контрагенту" and target_subcontos:
+    filtered = filtered[filtered["Субконто"].astype(str).isin(target_subcontos)]
+
 st.dataframe(filtered, width="stretch", hide_index=True)
 
 if filtered.empty:
-    st.warning("Выбранные периоды не содержат данных. Отмените фильтр по периодам.")
+    st.warning("Выбранные фильтры не содержат данных.")
     st.stop()
 
 if documents is not None:
     doc_filtered = _filter_documents_by_period(documents, selected_periods)
+    if doc_filtered is not None and audit_mode == "По контрагенту" and target_subcontos:
+        doc_filtered = doc_filtered[doc_filtered["Контрагент"].astype(str).isin(target_subcontos)]
+        
+    doc_len = len(doc_filtered) if doc_filtered is not None else 0
     st.caption(
         f"📄 Загружен реестр документов: {len(documents)} операций "
-        f"(использовано {len(doc_filtered)} за выбранные периоды)"
+        f"(после фильтрации осталось {doc_len})"
     )
 else:
     doc_filtered = None
-
-# ============ Запуск проверки ============
-if data_source.startswith("☁️"):
-    db_name = st.session_state.get("api_db_name", api_url.strip())
-elif osv_file is not None:
-    db_name = osv_file.name
-else:
-    db_name = "Тестовая база"
 
 if st.button("🚀 Запустить Аудит", type="primary", key="btn_audit"):
     options = {
@@ -695,28 +833,46 @@ if st.button("🚀 Запустить Аудит", type="primary", key="btn_audi
         "ml_duplicates": ml_duplicates,
         "dup_threshold": dup_threshold,
         "anomaly_min_abs": anomaly_min_abs,
+        "audit_mode": audit_mode,
+        "target_accounts": target_accounts,
+        "target_subcontos": target_subcontos,
     }
     
     try:
         with st.spinner("Анализируем данные..."):
             history = st.session_state.setdefault("audit_history", [])
-            
-            if period_mode == "📅 По месяцам" and selected_periods:
-                i = 0
-                while i < len(selected_periods):
-                    p = selected_periods[i]
-                    opt_copy = dict(options)
-                    opt_copy["periods"] = [p] if p else []
-                    
-                    res = _run_audit_local(balances, doc_filtered, opt_copy, db_name, source_info)
-                    res["period"] = p
+
+            for ds in datasets_to_process:
+                current_balances = ds["df"]
+                current_db_name = ds["name"]
+                current_info = ds["info"]
+
+                if period_mode == "📅 По месяцам" and selected_periods:
+                    i = 0
+                    while i < len(selected_periods):
+                        p = selected_periods[i]
+                        opt_copy = dict(options)
+                        opt_copy["periods"] = [p] if p else []
+
+                        res = _run_audit_local(
+                            current_balances, doc_filtered,
+                            opt_copy, current_db_name,
+                            current_info
+                        )
+                        res["period"] = p
+                        history.append(res)
+                        # save_audit_log(res)
+                        st.session_state["audit"] = res
+                        i += 1
+                else:
+                    res = _run_audit_local(
+                        current_balances, doc_filtered,
+                        options, current_db_name,
+                        current_info
+                    )
                     history.append(res)
+                    # save_audit_log(res)
                     st.session_state["audit"] = res
-                    i += 1
-            else:
-                res = _run_audit_local(balances, doc_filtered, options, db_name, source_info)
-                history.append(res)
-                st.session_state["audit"] = res
 
     except Exception as exc:
         st.error(f"Ошибка при выполнении проверки: {exc}")
