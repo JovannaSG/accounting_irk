@@ -237,7 +237,7 @@ def _render_dashboard_exports(result: dict) -> None:
             key="dash_btn_download_excel",
         )
     except Exception as exc:
-        c_excel.caption(f"Excel экспорт недоступен: {exc}")
+        c_excel.error(f"Excel экспорт недоступен: {exc}")
     try:
         pdf_data = auditor.to_pdf()
         c_pdf.download_button(
@@ -248,7 +248,7 @@ def _render_dashboard_exports(result: dict) -> None:
             key="dash_btn_download_pdf",
         )
     except Exception as exc:
-        c_pdf.caption(f"PDF недоступен: {exc}")
+        c_pdf.error(f"PDF недоступен: {exc}")
 
 
 def find_result_safe(
@@ -642,6 +642,7 @@ try:
                     f.getvalue(),
                     plan_override=plan_input
                 )
+                all_b.append(d_df)
                 if not source_info:
                     source_info = info
 
@@ -847,12 +848,13 @@ if st.button("🚀 Запустить Аудит", type="primary", key="btn_audi
                 current_db_name = ds["name"]
                 current_info = ds["info"]
 
-                if period_mode == "📅 По месяцам" and selected_periods:
+                real_periods = [p for p in selected_periods if p]
+                if period_mode == "📅 По месяцам" and real_periods:
                     i = 0
-                    while i < len(selected_periods):
-                        p = selected_periods[i]
+                    while i < len(real_periods):
+                        p = real_periods[i]
                         opt_copy = dict(options)
-                        opt_copy["periods"] = [p] if p else []
+                        opt_copy["periods"] = [p]
 
                         res = _run_audit_local(
                             current_balances, doc_filtered,

@@ -251,7 +251,7 @@ class OneCClient:
                 with self._cache_lock:
                     self._account_capabilities[account_code] = 2
             except Exception as exc1:
-                logger.info(f"Счет {account_code} не поддерживает 2 субконто. Переход на уровень 1.")
+                logger.warning(f"Счет {account_code} не поддерживает 2 субконто ($expand отклонён). Понижаем уровень до 1.")
                 capability = 1
 
         if capability == 1:
@@ -267,7 +267,7 @@ class OneCClient:
                 with self._cache_lock:
                     self._account_capabilities[account_code] = 1
             except Exception as exc2:
-                logger.info(f"Счет {account_code} не поддерживает субконто. Переход на общие итоги.")
+                logger.warning(f"Счет {account_code} не поддерживает субконто ($expand отклонён). Работаем без аналитики.")
                 capability = 0
 
         if capability == 0:
@@ -317,7 +317,6 @@ class OneCClient:
         """
         СВЕРХБЫСТРАЯ МНОГОПОТОЧНАЯ ЗАГРУЗКА ОСВ
         """
-        _DETAILED_ACCOUNTS = ("60", "62", "76", "71", "73", "58", "66", "67")
         frames: list[pd.DataFrame] = []
         month_ranges = list(self._month_ranges(period_start, period_end))
         
@@ -341,6 +340,9 @@ class OneCClient:
                     agg_dfs_by_month[m_range] = pd.DataFrame(columns=OSV_COLUMNS)
 
         # ШАГ 2: Подготавливаем пул точечных задач (детализация счетов)
+        # Запрашиваем аналитику по ВСЕМ активным счетам — кэш возможностей
+        # (self._account_capabilities) предотвращает повторные пробы для счетов,
+        # которые не поддерживают $expand.
         detailed_tasks = []
         
         for m_range in month_ranges:
@@ -351,23 +353,17 @@ class OneCClient:
             active_accounts = agg_df["Счет"].dropna().unique().tolist()
             for acc in active_accounts:
                 acc_str = str(acc)
-                needs_detail = False
                 
                 if target_accounts:
-                    if any(acc_str.startswith(t) for t in target_accounts):
-                        needs_detail = True
-                else:
-                    if acc_str.startswith(_DETAILED_ACCOUNTS):
-                        needs_detail = True
-                        
-                if needs_detail:
-                    detailed_tasks.append({
-                        "m_range": m_range,
-                        "acc_str": acc_str,
-                        "agg_df": agg_df
-                    })
-                else:
-                    frames.append(agg_df[agg_df["Счет"] == acc_str])
+                    if not any(acc_str.startswith(t) for t in target_accounts):
+                        frames.append(agg_df[agg_df["Счет"] == acc_str])
+                        continue
+                
+                detailed_tasks.append({
+                    "m_range": m_range,
+                    "acc_str": acc_str,
+                    "agg_df": agg_df
+                })
 
         # ШАГ 3: Выполняем точечные запросы аналитики В НЕСКОЛЬКО ПОТОКОВ
         if detailed_tasks:
