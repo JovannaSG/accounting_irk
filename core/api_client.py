@@ -10,7 +10,6 @@ from requests.auth import HTTPBasicAuth
 from requests.adapters import HTTPAdapter
 import pandas as pd
 
-# разрешаем запуск как скрипта: python core/api_client.py
 if __package__ in (None, ""):
     sys.path.insert(
         0,
@@ -44,18 +43,17 @@ class OneCClient:
         self.session.auth = HTTPBasicAuth(username, password)
         self.session.headers.update({'Accept': 'application/json'})
         
-        # Расширяем пул соединений для поддержки многопоточности
         adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
         
         self._code_by_key: dict[str, str] = {}
         
-        # Кэш "уровня детализации" для счетов (2 = Контрагент+Договор, 1 = Контрагент, 0 = Без аналитики)
-        self._account_capabilities: dict[str, int] = {}
+        # НОВЫЙ КЭШ: Локальная база для перевода GUID -> Название
+        self._guid_to_name: dict[str, str] = {}
+        self._catalogs_loaded = False
         self._cache_lock = threading.Lock()
 
-    # ================= Общие методы =================
     def _paginate(self, endpoint: str, params: dict[str, Any]) -> list[dict]:
         all_records: list[dict] = []
         while True:
@@ -89,23 +87,51 @@ class OneCClient:
             url = error.response.url
 
         if status == 401:
-            return "OData вернул 401 Unauthorized. Проверьте логин/пароль."
+            return "OData вернул 401 Unauthorized."
         if status in (400, 404) and "BalanceAndTurnovers" in url:
             return "OData не нашел виртуальную таблицу регистра бухгалтерии."
         return f"OData-запрос завершился ошибкой {status}: {url}"
 
-    # ================= ОСВ и Справочники =================
+    # ================= ЗАГРУЗКА СПРАВОЧНИКОВ (CLIENT-SIDE JOIN) =================
+    def _prefetch_catalogs(self) -> None:
+        if self._catalogs_loaded:
+            return
+            
+        catalogs = [
+            "Catalog_Контрагенты",
+            "Catalog_ДоговорыКонтрагентов",
+            "Catalog_ФизическиеЛица"
+        ]
+        
+        logger.info("Предзагрузка справочников (Контрагенты, Договоры, Физлица) для аналитики...")
+        
+        def load_cat(cat_name: str):
+            endpoint = f"{self.base_url}/odata/standard.odata/{cat_name}"
+            params = {"$format": "json", "$select": "Ref_Key,Description", "$top": 2000}
+            try:
+                recs = self._paginate(endpoint, params)
+                with self._cache_lock:
+                    for r in recs:
+                        k = r.get("Ref_Key")
+                        d = r.get("Description")
+                        if k and d:
+                            self._guid_to_name[str(k)] = str(d)
+            except Exception as e:
+                logger.debug(f"Пропуск справочника {cat_name}: {e}")
+
+        # Грузим 3 справочника параллельно
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            list(executor.map(load_cat, catalogs))
+            
+        self._catalogs_loaded = True
+        logger.info(f"Справочники загружены. В кэше {len(self._guid_to_name)} записей.")
+
     def fetch_chart_of_accounts(self) -> dict[str, str]:
         if self._code_by_key:
             return self._code_by_key
 
         endpoint = f"{self.base_url}/odata/standard.odata/ChartOfAccounts_Хозрасчетный"
-        params: dict[str, Any] = {
-            "$format": "json",
-            "$select": "Ref_Key,Code",
-            "$top": 1000,
-            "$skip": 0
-        }
+        params = {"$format": "json", "$select": "Ref_Key,Code", "$top": 1000, "$skip": 0}
         records = self._paginate(endpoint, params)
 
         with self._cache_lock:
@@ -132,27 +158,31 @@ class OneCClient:
             code = acct.get("Code") or acct.get("Код")
             if code:
                 return str(code)
-
         key = rec.get("Account_Key") or rec.get("Счет_Key")
         if key and str(key) in code_by_key:
             return code_by_key[str(key)]
         return None
 
+    # НОВАЯ ЛОГИКА: Расшифровка GUID по локальному кэшу
     def _record_subconto(self, rec: dict) -> str:
         val = rec.get("ExtDimension1")
+        if not val:
+            return "-"
         if isinstance(val, dict):
-            return val.get("Description") or val.get("Наименование") or val.get("Name") or val.get("Code") or str(val)
-        if val:
-            return str(val)
-        return "-"
+            return val.get("Description") or str(val)
+            
+        val_str = str(val)
+        return self._guid_to_name.get(val_str, val_str)
 
     def _record_contract(self, rec: dict) -> str:
         val = rec.get("ExtDimension2")
+        if not val:
+            return "-"
         if isinstance(val, dict):
-            return val.get("Description") or val.get("Наименование") or val.get("Name") or val.get("Code") or str(val)
-        if val:
-            return str(val)
-        return "-"
+            return val.get("Description") or str(val)
+            
+        val_str = str(val)
+        return self._guid_to_name.get(val_str, val_str)
 
     def _records_to_osv(self, records: list[dict], period_end: str, account_code: str | None = None) -> pd.DataFrame:
         if not records:
@@ -228,58 +258,23 @@ class OneCClient:
 
         endpoint: str = f"{self.base_url}/odata/standard.odata/{register}/{method}"
 
-        base_select: list[str] = ["Account_Key"]
+        # Запрашиваем голые GUID-ы субконто, без $expand (Это спасает 1С от падения)
+        base_select: list[str] = ["Account_Key", "ExtDimension1", "ExtDimension2"]
         for candidates in _OSV_FIELDS.values():
             base_select.append(candidates[0])
 
-        records: list[dict] = []
+        params = {
+            "$format": "json",
+            "$select": ",".join(base_select),
+            "$top": 1000,
+            "$skip": 0,
+        }
         
-        # Читаем кэш возможностей счета (начинаем с 2 по умолчанию)
-        with self._cache_lock:
-            capability = self._account_capabilities.get(account_code, 2)
-
-        if capability == 2:
-            try:
-                params: dict = {
-                    "$format": "json",
-                    "$select": ",".join(base_select + ["ExtDimension1", "ExtDimension2"]),
-                    "$expand": "ExtDimension1,ExtDimension2",
-                    "$top": 1000,
-                    "$skip": 0,
-                }
-                records = self._paginate(endpoint, params)
-                with self._cache_lock:
-                    self._account_capabilities[account_code] = 2
-            except Exception as exc1:
-                logger.warning(f"Счет {account_code} не поддерживает 2 субконто ($expand отклонён). Понижаем уровень до 1.")
-                capability = 1
-
-        if capability == 1:
-            try:
-                params = {
-                    "$format": "json",
-                    "$select": ",".join(base_select + ["ExtDimension1"]),
-                    "$expand": "ExtDimension1",
-                    "$top": 1000,
-                    "$skip": 0,
-                }
-                records = self._paginate(endpoint, params)
-                with self._cache_lock:
-                    self._account_capabilities[account_code] = 1
-            except Exception as exc2:
-                logger.warning(f"Счет {account_code} не поддерживает субконто ($expand отклонён). Работаем без аналитики.")
-                capability = 0
-
-        if capability == 0:
-            params = {
-                "$format": "json",
-                "$select": ",".join(base_select),
-                "$top": 1000,
-                "$skip": 0,
-            }
+        try:
             records = self._paginate(endpoint, params)
-            with self._cache_lock:
-                self._account_capabilities[account_code] = 0
+        except Exception as e:
+            logger.error(f"Ошибка загрузки счета {account_code}: {e}")
+            records = []
 
         if not records:
             return pd.DataFrame(columns=OSV_COLUMNS)
@@ -314,21 +309,21 @@ class OneCClient:
         period_end: str, 
         target_accounts: list[str] | None = None
     ) -> pd.DataFrame:
-        """
-        СВЕРХБЫСТРАЯ МНОГОПОТОЧНАЯ ЗАГРУЗКА ОСВ
-        """
+        
+        _DETAILED_ACCOUNTS = ("60", "62", "76", "71", "73", "58", "66", "67")
         if pd.to_datetime(period_start) > pd.to_datetime(period_end):
-            raise ValueError("Некорректный диапазон дат: начало позже конца.")
+            raise ValueError("Некорректный диапазон дат.")
+            
         frames: list[pd.DataFrame] = []
         month_ranges = list(self._month_ranges(period_start, period_end))
         
-        # Предварительный разогрев кэша счетов, чтобы избежать гонки потоков
+        # Разогрев кэша (План счетов + Справочники контрагентов и договоров)
         self.fetch_chart_of_accounts()
+        self._prefetch_catalogs()
 
-        # ШАГ 1: Загружаем общие итоги по всем месяцам (параллельно)
         agg_dfs_by_month = {}
         logger.info(f"Сборка сводной базы за {len(month_ranges)} мес...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             future_to_month = {
                 executor.submit(self.fetch_osv, m_start, m_end): (m_start, m_end)
                 for m_start, m_end in month_ranges
@@ -338,15 +333,9 @@ class OneCClient:
                 try:
                     agg_dfs_by_month[m_range] = future.result()
                 except Exception as e:
-                    logger.error(f"Ошибка загрузки сводной ОСВ за {m_range}: {e}")
                     agg_dfs_by_month[m_range] = pd.DataFrame(columns=OSV_COLUMNS)
 
-        # ШАГ 2: Подготавливаем пул точечных задач (детализация счетов)
-        # Запрашиваем аналитику по ВСЕМ активным счетам — кэш возможностей
-        # (self._account_capabilities) предотвращает повторные пробы для счетов,
-        # которые не поддерживают $expand.
         detailed_tasks = []
-        
         for m_range in month_ranges:
             agg_df = agg_dfs_by_month[m_range]
             if agg_df.empty:
@@ -355,22 +344,27 @@ class OneCClient:
             active_accounts = agg_df["Счет"].dropna().unique().tolist()
             for acc in active_accounts:
                 acc_str = str(acc)
+                needs_detail = False
                 
                 if target_accounts:
-                    if not any(acc_str.startswith(t) for t in target_accounts):
-                        frames.append(agg_df[agg_df["Счет"] == acc_str])
-                        continue
-                
-                detailed_tasks.append({
-                    "m_range": m_range,
-                    "acc_str": acc_str,
-                    "agg_df": agg_df
-                })
+                    if any(acc_str.startswith(t) for t in target_accounts):
+                        needs_detail = True
+                else:
+                    if acc_str.startswith(_DETAILED_ACCOUNTS):
+                        needs_detail = True
+                        
+                if needs_detail:
+                    detailed_tasks.append({
+                        "m_range": m_range,
+                        "acc_str": acc_str,
+                        "agg_df": agg_df
+                    })
+                else:
+                    frames.append(agg_df[agg_df["Счет"] == acc_str])
 
-        # ШАГ 3: Выполняем точечные запросы аналитики В НЕСКОЛЬКО ПОТОКОВ
         if detailed_tasks:
-            logger.info(f"Запуск {len(detailed_tasks)} точечных запросов аналитики в потоках...")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            logger.info(f"Точечные запросы аналитики ({len(detailed_tasks)} шт.)...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
                 future_to_task = {
                     executor.submit(
                         self.fetch_osv_account_subconto, 
@@ -395,8 +389,7 @@ class OneCClient:
                             frames.append(det_df)
                         else:
                             frames.append(agg_df[agg_df["Счет"] == acc_str])
-                    except Exception as e:
-                        logger.error(f"Ошибка загрузки деталей счета {acc_str}: {e}")
+                    except Exception:
                         frames.append(agg_df[agg_df["Счет"] == acc_str])
 
         if not frames:
