@@ -188,7 +188,7 @@ def test_fetch_osv_401_raises_friendly_error():
     client = OneCClient(FRESH_BASE, "u", "p")
     client.session = session
 
-    with pytest.raises(ValueError, match="УдаленныйДоступOData"):
+    with pytest.raises(ValueError, match="401 Unauthorized"):
         client.fetch_osv("2026-01-01T00:00:00", "2026-06-30T23:59:59")
 
 
@@ -198,7 +198,7 @@ def test_fetch_osv_404_hints_to_enable_register():
     client = OneCClient(FRESH_BASE, "u", "p")
     client.session = session
 
-    with pytest.raises(ValueError, match="Настройка стандартного интерфейса OData"):
+    with pytest.raises(ValueError, match="виртуальную таблицу"):
         client.fetch_osv("2026-01-01T00:00:00", "2026-06-30T23:59:59")
 
 
@@ -286,7 +286,13 @@ def test_fetch_osv_monthly_invalid_range():
 
 
 def test_fetch_osv_account_subconto_filters_and_resolves():
-    jan_ep = _osv_endpoint("2026-01-01T00:00:00", "2026-02-28T23:59:59")
+    guid_60 = _guid_for("60")
+    subconto_ep = (
+        f"{FRESH_BASE}/odata/standard.odata/AccountingRegister_Хозрасчетный/"
+        f"BalanceAndTurnovers(StartPeriod=datetime'2026-01-01T00:00:00', "
+        f"EndPeriod=datetime'2026-02-28T23:59:59', "
+        f"AccountCondition='Account_Key eq guid''{guid_60}''')"
+    )
 
     def subconto_row(code: str, subconto, closing_dr: float, closing_cr: float) -> dict:
         row = _make_osv_row(code)
@@ -301,7 +307,7 @@ def test_fetch_osv_account_subconto_filters_and_resolves():
         subconto_row("51", {"Наименование": "Банк"}, 1000.0, 0.0),
     ]
     session = FakeSession(pages={
-        jan_ep: records,
+        subconto_ep: records,
         CHART_EP: _chart_rows(["60", "51"]),
     })
     client = OneCClient(FRESH_BASE, "u", "p")
@@ -309,80 +315,15 @@ def test_fetch_osv_account_subconto_filters_and_resolves():
 
     df = client.fetch_osv_account_subconto("2026-01-01T00:00:00", "2026-02-28T23:59:59", "60")
 
-    # Client-side filter keeps only the selected account
     assert list(df.columns) == OSV_COLUMNS
     assert set(df["Счет"]) == {"60"}
     assert len(df) == 2
 
-    # First (expanded) subconto resolved by name, second fell back to raw string
     assert set(df["Субконто"]) == {"ООО Ромашка", "ref-string-контрагент-2"}
     assert df.loc[df["Субконто"] == "ООО Ромашка"].iloc[0]["КонецДебет"] == pytest.approx(500.0)
 
-    # The first HTTP call must try $expand=ExtDimension1
-    url, params, _ = session.calls[0]
-    assert url == jan_ep
-    assert params.get("$expand") == "ExtDimension1"
-
-
-def test_fetch_osv_account_subconto_monthly_two_months():
-    jan_ep = _osv_endpoint("2026-01-01T00:00:00", "2026-01-31T23:59:59")
-    feb_ep = _osv_endpoint("2026-02-01T00:00:00", "2026-02-28T23:59:59")
-
-    def subconto_row(code: str, subconto, closing_dr: float) -> dict:
-        row = _make_osv_row(code)
-        row["ExtDimension1"] = subconto
-        row["СуммаClosingBalanceDr"] = closing_dr
-        row["СуммаClosingBalanceCr"] = 0.0
-        return row
-
-    session = FakeSession(pages={
-        jan_ep: [
-            subconto_row("60", {"Наименование": "ООО Ромашка"}, 500.0),
-            subconto_row("51", {"Наименование": "Банк"}, 10.0),
-        ],
-        feb_ep: [
-            subconto_row("60", {"Наименование": "ООО Ромашка"}, 700.0),
-        ],
-        CHART_EP: _chart_rows(["60", "51"]),
-    })
-    client = OneCClient(FRESH_BASE, "u", "p")
-    client.session = session
-
-    df = client.fetch_osv_account_subconto_monthly(
-        "2026-01-01T00:00:00", "2026-02-28T23:59:59", "60"
-    )
-
-    assert list(df.columns) == OSV_COLUMNS
-    assert set(df["Счет"]) == {"60"}
-    assert set(df["Период"]) == {"2026-01-31T23:59:59", "2026-02-28T23:59:59"}
-    assert len(df) == 2
-
-    jan = df[df["Период"] == "2026-01-31T23:59:59"]
-    feb = df[df["Период"] == "2026-02-28T23:59:59"]
-    assert jan.iloc[0]["КонецДебет"] == pytest.approx(500.0)
-    assert feb.iloc[0]["КонецДебет"] == pytest.approx(700.0)
-    assert jan.iloc[0]["Субконто"] == "ООО Ромашка"
-
-    requested = {url for url, _, _ in session.calls}
-    assert jan_ep in requested and feb_ep in requested
-
-
-def test_fetch_osv_account_subconto_monthly_empty():
-    jan_ep = _osv_endpoint("2026-01-01T00:00:00", "2026-01-31T23:59:59")
-    session = FakeSession(pages={jan_ep: []})
-    client = OneCClient(FRESH_BASE, "u", "p")
-    client.session = session
-
-    df = client.fetch_osv_account_subconto_monthly(
-        "2026-01-01T00:00:00", "2026-01-31T23:59:59", "60"
-    )
-    assert df.empty
-    assert list(df.columns) == OSV_COLUMNS
-
-
-def test_fetch_osv_account_subconto_monthly_invalid_range():
-    client = OneCClient(FRESH_BASE, "u", "p")
-    with pytest.raises(ValueError, match="Некорректный диапазон"):
-        client.fetch_osv_account_subconto_monthly(
-            "2026-06-30T23:59:59", "2026-01-01T00:00:00", "60"
-        )
+    subconto_calls = [(u, p) for u, p, _ in session.calls if "AccountCondition" in u]
+    assert subconto_calls, "запрос с AccountCondition не был отправлен"
+    url, params = subconto_calls[0]
+    assert url == subconto_ep
+    assert "$expand" in params

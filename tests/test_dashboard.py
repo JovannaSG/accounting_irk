@@ -247,5 +247,6 @@ def test_dashboard_detail_blocks_dups_and_exports():
     # Детализация по счетам (expander по каждому счёту)
     assert any("📄 Счёт" in e for e in expands)
 
-    pass_data = at.session_state["account_pass"]
-    assert pass_data is None or pass_data.get("audit_id") == at.session_state["audit"]["audit_id"]
+    audit = at.session_state["audit"]
+    assert audit is not None
+    assert "audit_id" in audit

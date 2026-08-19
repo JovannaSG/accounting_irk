@@ -317,6 +317,8 @@ class OneCClient:
         """
         СВЕРХБЫСТРАЯ МНОГОПОТОЧНАЯ ЗАГРУЗКА ОСВ
         """
+        if pd.to_datetime(period_start) > pd.to_datetime(period_end):
+            raise ValueError("Некорректный диапазон дат: начало позже конца.")
         frames: list[pd.DataFrame] = []
         month_ranges = list(self._month_ranges(period_start, period_end))
         

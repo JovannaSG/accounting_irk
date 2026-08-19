@@ -633,7 +633,7 @@ try:
             }
         )
 
-    elif data_source.startswith("📁") and osv_files is not None:
+    elif data_source.startswith("📁") and osv_files:
         if merge_mode == "Объединить в одну базу":
             all_b: list = []
             for f in osv_files:
@@ -678,6 +678,14 @@ try:
     elif "mock_data" in st.session_state:
         balances = st.session_state["mock_data"]["balances"]
         documents = st.session_state["mock_data"]["documents"]
+        if not datasets_to_process:
+            datasets_to_process.append(
+                {
+                    "name": "Тестовая база",
+                    "df": balances,
+                    "info": {}
+                }
+            )
 
 except (ValueError, OSError) as exc:
     st.sidebar.error(str(exc))
