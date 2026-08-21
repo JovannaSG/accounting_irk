@@ -104,7 +104,6 @@ def test_fetch_osv_endpoint_and_schema():
 
     url, params, _ = session.calls[0]
     assert url == REGISTER_EP
-    assert "$expand" not in params
     assert params["$format"] == "json"
 
 
@@ -326,4 +325,6 @@ def test_fetch_osv_account_subconto_filters_and_resolves():
     assert subconto_calls, "запрос с AccountCondition не был отправлен"
     url, params = subconto_calls[0]
     assert url == subconto_ep
-    assert "$expand" in params
+    assert "$select" in params, "В запросе отсутствует обязательный параметр $select"
+    assert "ExtDimension1" in params["$select"], "В $select не запрошено первое субконто (ExtDimension1)"
+    assert "ExtDimension2" in params["$select"], "В $select не запрошено второе субконто (ExtDimension2)"

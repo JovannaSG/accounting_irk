@@ -19,7 +19,6 @@ _DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
 import streamlit as st
 
 from core.api_client import OneCClient
-from core.dashboard import accounts_list, block_dfs, build_dashboard_df
 from core.auditor import (
     AutoAuditor1C,
     DEFAULT_CLOSING_ACCOUNTS,
@@ -27,6 +26,9 @@ from core.auditor import (
     normalize_balances,
     normalize_documents,
 )
+from core.db import save_audit_log, load_audit_history
+from core.comparator import compare_audits
+from core.dashboard import accounts_list, block_dfs, build_dashboard_df
 from core.loaders import load_osv_file
 
 st.set_page_config(page_title="ИИ-Аудитор 1С", layout="wide")
@@ -849,7 +851,11 @@ if st.button("🚀 Запустить Аудит", type="primary", key="btn_audi
     
     try:
         with st.spinner("Анализируем данные..."):
-            history = st.session_state.setdefault("audit_history", [])
+            # Инициализируем историю, если она еще не загружена из БД
+            history = st.session_state.setdefault(
+                "audit_history",
+                load_audit_history()
+            )
 
             for ds in datasets_to_process:
                 current_balances = ds["df"]
@@ -871,7 +877,8 @@ if st.button("🚀 Запустить Аудит", type="primary", key="btn_audi
                         )
                         res["period"] = p
                         history.append(res)
-                        # save_audit_log(res)
+                        # Сохраняем в БД
+                        save_audit_log(res)
                         st.session_state["audit"] = res
                         i += 1
                 else:
@@ -881,11 +888,77 @@ if st.button("🚀 Запустить Аудит", type="primary", key="btn_audi
                         current_info
                     )
                     history.append(res)
-                    # save_audit_log(res)
+                    # Сохраняем в БД
+                    save_audit_log(res)
                     st.session_state["audit"] = res
 
     except Exception as exc:
         st.error(f"Ошибка при выполнении проверки: {exc}")
         st.code(traceback.format_exc(), language="python")
 
-_render_dashboard(st.session_state.get("audit_history") or [])
+#                           ========== ВЫВОД РЕЗУЛЬТАТОВ И СРАВНЕНИЕ ==========
+# При старте приложения подтягиваем историю из БД
+if "audit_history" not in st.session_state:
+    st.session_state["audit_history"] = load_audit_history()
+
+history = st.session_state.get("audit_history", [])
+if history:
+    tab_dash, tab_compare = st.tabs([
+        "Результаты проверок",
+        "Динамика (Сравнение)"
+    ])
+
+    with tab_dash:
+        _render_dashboard(history)
+
+    with tab_compare:
+        st.subheader("Сравнение двух проверков")
+
+        if len(history) < 2:
+            st.info(
+                "Для сравнения проведите как минимум 2 аудита, " \
+                "например загрузите базу до исправлений и после)"
+            )
+        else:
+            audit_options: dict = {}
+            for idx, h in enumerate(history):
+                name = h.get("db_name", f"База {idx+1}")
+                flags = h.get("total_flags", 0)
+                date_str = h.get("viewed_at", "")
+                label = f"{idx+1}. {name} (Ошибок: {flags}) - {date_str}"
+                audit_options[label] = h
+
+            c1, c2 = st.columns(2)
+            with c1:
+                old_label = st.selectbox(
+                    "Базовая проверка (Было):",
+                    list(audit_options.keys()),
+                    index=0
+                )
+            with c2:
+                new_label = st.selectbox(
+                    "Новая проверка (Стало):",
+                    list(audit_options.keys()),
+                    index=len(audit_options)-1
+                )
+
+            if st.button("Сравнить базы", type="primary"):
+                old_audit = audit_options[old_label]
+                new_audit = audit_options[new_label]
+
+                old_df = old_audit.get("details", pd.DataFrame())
+                new_df = new_audit.get("details", pd.DataFrame())
+
+                res = compare_audits(old_df, new_df)
+
+                st.success(f"**Исправлено ошибок:** {len(res['resolved'])}")
+                if not res["resolved"].empty:
+                    st.dataframe(res["resolved"], width=True)
+
+                st.error(f"⚠️ **Новые ошибки (появились):** {len(res['new'])}")
+                if not res["new"].empty:
+                    st.dataframe(res["new"], width=True)
+
+                st.warning(f"⏳ **Остались без изменений:** {len(res['pending'])}")
+                if not res["pending"].empty:
+                    st.dataframe(res["pending"], width=True)

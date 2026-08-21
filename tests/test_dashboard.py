@@ -10,6 +10,7 @@ from core.dashboard import (
     build_master_row,
     find_result,
 )
+import core.db
 
 APP = "app/ui.py"
 
@@ -27,6 +28,13 @@ def result(db="База 1", accountant="Иванова И.И.", rows=None):
         "viewed_at": "12.08.2026 10:00",
         "details": details(rows or []),
     }
+
+
+@pytest.fixture(autouse=True)
+def isolated_db(tmp_path, monkeypatch):
+    """Изолирует БД для каждого UI теста"""
+    test_db = tmp_path / "test_dashboard_history.db"
+    monkeypatch.setattr(core.db, "_DB_PATH", str(test_db))
 
 
 def test_master_row_red_balance():
@@ -215,7 +223,12 @@ def test_dashboard_renders_master_and_detail():
     assert any("База: Тестовая база" in m for m in (m.value for m in at.markdown))
 
 
-def test_dashboard_detail_blocks_dups_and_exports():
+def test_dashboard_detail_blocks_dups_and_exports(tmp_path, monkeypatch):
+    # 1. Изолируем БД от других тестов, чтобы история была кристально чистой
+    test_db = tmp_path / "test_dashboard_history.db"
+    monkeypatch.setenv("AUDIT_DB_PATH", str(test_db))
+
+    # 2. Запускаем приложение
     at = AppTest.from_file(APP, default_timeout=30)
     at.run()
     at.sidebar.button(key="btn_mock").click()
@@ -224,29 +237,37 @@ def test_dashboard_detail_blocks_dups_and_exports():
     at.run()
     assert not at.exception
 
-    at.session_state["dashboard_df"] = {"selection": {"rows": [0]}}
+    # 3. Имитируем клик по ПЕРВОЙ строке в таблице (индекс 0)
+    at.session_state["dashboard_df"] = {
+        "selection": {"rows": [0], "columns": []}
+    }
     at.run()
     assert not at.exception
 
-    # Заголовок выбранной базы
-    md_texts = [m.value for m in at.markdown]
-    assert any("🗄️ База: Тестовая база" in m for m in md_texts)
+    # 4. Проверяем заголовок базы
+    # Используем any() и in, чтобы тест не упал из-за лишних пробелов в Markdown
+    markdowns = [m.value for m in at.markdown]
+    assert any("### 🗄️ База: Тестовая база" in m for m in markdowns)
 
-    # Кнопки выгрузки Excel/PDF
-    excel_btns = [b for b in at.get("download_button") if b.key == "dash_btn_download_excel"]
-    pdf_btns = [b for b in at.get("download_button") if b.key == "dash_btn_download_pdf"]
-    assert excel_btns and pdf_btns
+    # 5. Кнопки выгрузки Excel/PDF (Правильное API AppTest)
+    # AppTest позволяет искать элементы по key напрямую!
+    excel_btn = at.download_button(key="dash_btn_download_excel")
+    assert excel_btn, "Кнопка Excel не найдена"
+    pdf_btn = at.download_button(key="dash_btn_download_pdf")
+    assert pdf_btn, "Кнопка PDF не найдена"
 
-    # Три блока
+    # 6. Проверяем блоки (expander)
     expands = [e.label for e in at.expander]
     assert any("Блок 1. Красное сальдо" in e for e in expands)
     assert any("Блок 2. Незакрытые счета" in e for e in expands)
     assert any("Блок 3. Развёрнутое сальдо" in e for e in expands)
     assert any("ML-дубли контрагентов" in e for e in expands)
 
-    # Детализация по счетам (expander по каждому счёту)
+    # 7. Детализация по счетам (expander по каждому счёту)
     assert any("📄 Счёт" in e for e in expands)
 
+    # 8. Проверка State
+    assert "audit" in at.session_state
     audit = at.session_state["audit"]
     assert audit is not None
     assert "audit_id" in audit

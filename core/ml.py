@@ -23,13 +23,8 @@ import numpy as np  # Импортирован для оптимизации м�
 
 _fuzz: Any = None
 _process: Any = None
-try:
-    from rapidfuzz import fuzz as _fuzz
-    from rapidfuzz import process as _process
-
-    _HAVE_RAPIDFUZZ = True
-except ImportError:  # pragma: no cover - запасной путь без зависимостей
-    _HAVE_RAPIDFUZZ = False
+from rapidfuzz import fuzz as _fuzz
+from rapidfuzz import process as _process
 
 # Параметры по умолчанию (переопределяются в конструкторе AutoAuditor1C / UI)
 DEFAULT_K: float = 8.0               # множитель MAD для аномалий сумм
@@ -217,21 +212,15 @@ def _duplicate_pairs(
     if n < 2:
         return pairs
 
-    if _HAVE_RAPIDFUZZ:
-        matrix = _process.cdist(norm, norm, scorer=_fuzz.token_sort_ratio)
-        # Используем numpy для векторного извлечения
-        # индексов из верхнего треугольника
-        indices = np.argwhere(np.triu(matrix >= threshold, k=1))
+    matrix = _process.cdist(norm, norm, scorer=_fuzz.token_sort_ratio)
+    # Используем numpy для векторного извлечения
+    # индексов из верхнего треугольника
+    indices = np.argwhere(np.triu(matrix >= threshold, k=1))
 
-        for i, j in indices:
-            score = float(matrix[i, j])
-            pairs.append((names[i], names[j], round(score, 1)))
-    else:  # pragma: no cover - запасной путь без rapidfuzz
-        for i in range(n):
-            for j in range(i + 1, n):
-                score = _token_sort_ratio(norm[i], norm[j])
-                if score >= threshold:
-                    pairs.append((names[i], names[j], round(score, 1)))
+    for i, j in indices:
+        score = float(matrix[i, j])
+        pairs.append((names[i], names[j], round(score, 1)))
+
     return pairs
 
 

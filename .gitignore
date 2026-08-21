@@ -8,6 +8,7 @@ login_data.txt
 scratch/
 data/examples/
 .app.lock
+audit_history.db
 
 /*.xls
 /*.xlsx

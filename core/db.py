@@ -1,89 +1,110 @@
 import sqlite3
-import os
-
 import pandas as pd
+from datetime import datetime
+import os
+import io
 
-# База данных будет лежать в корне проекта
-DB_PATH: str = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)),
-    "audit_history.db"
+# Позволяем тестам использовать временный файл через переменную окружения
+_DB_PATH = os.environ.get(
+    "AUDIT_DB_PATH", 
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "audit_history.db"
+    )
 )
 
 
-def init_db() -> None:
+def init_db():
     """
-    Создает таблицу для журнала аудита, если ее еще нет.
-    """
-
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXIST audit_logs (
-                audit_id TEXT PRIMARY KEY,
-                crated_at TEXT,
-                db_name TEXT,
-                period TEXT,
-                accountant TEXT,
-                status TEXT,
-                total_flags INTEGER,
-                total_amount REAL
-            )
-        """)
-        conn.commit()
-
-
-def save_audit_log(audit_result: dict) -> None:
-    """
-    Сохраняет метаданные проверки в базу данных
+    Создает таблицу, если её нет
     """
 
-    audit_id = audit_result.get("audit_id")
-    created_at = audit_result.get("viewed_at")
-    db_name = audit_result.get("db_name")
-    accountant = audit_result.get("accountant")
-    status = audit_result.get("status_label")
-    total_flags = audit_result.get("total_flags", 0)
-
-    # Извлекаем период
-    period = audit_result.get("period", "")
-    if not period and audit_result.get("auditor"):
-        period = audit_result.get("auditor").meta.get("period", "")
-
-    # Считаем общую сумму ошибок, если есть
-    details: pd.DataFrame = audit_result.get("details")
-    total_amount: float = 0.0
-    if (
-        details is not None
-        and not getattr(details, "empty", True)
-        and "Сумма" in details.columns
-    ):
-        total_amount = float(details["Сумма"].sum())
-
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-                INSERT OR REPLACE INTO audit_logs
-                (audit_id, created_at, db_name, period, accountant, status, total_flags, total_amount)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                audit_id, created_at,
-                db_name, accountant,
-                status, total_flags,
-                total_amount
-            )
+    conn = sqlite3.connect(_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS audits (
+            audit_id TEXT PRIMARY KEY,
+            db_name TEXT,
+            accountant TEXT,
+            viewed_at TEXT,
+            status TEXT,
+            status_label TEXT,
+            total_flags INTEGER,
+            details_json TEXT
         )
-        conn.commit()
+    ''')
+    conn.commit()
+    conn.close()
 
 
-def get_audit_logs() -> list[dict]:
+def save_audit_log(result: dict) -> None:
     """
-    Возвращает все записи из журнала, отсортированные от новых к старым
+    Сохраняет результат аудита в БД
     """
 
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM audit_logs ORDER BY created_at DESC")
-        return [dict(row) for row in cursor.fetchall()]
+    init_db()
+    conn = sqlite3.connect(_DB_PATH)
+    cursor = conn.cursor()
+    
+    details_df = result.get("details", pd.DataFrame())
+    details_json = details_df.to_json(orient="records", date_format="iso")
+
+    cursor.execute('''
+        INSERT OR REPLACE INTO audits 
+        (audit_id, db_name, accountant, viewed_at, status, status_label, total_flags, details_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        result.get("audit_id", ""),
+        result.get("db_name", "Неизвестная база"),
+        result.get("accountant", ""),
+        result.get("viewed_at", datetime.now().strftime("%d.%m.%Y %H:%M")),
+        result.get("status", ""),
+        result.get("status_label", ""),
+        result.get("total_flags", 0),
+        details_json
+    ))
+    conn.commit()
+    conn.close()
+
+
+def load_audit_history() -> list[dict]:
+    """
+    Загружает историю с жестко заданным порядком колонок
+    """
+
+    init_db()
+    conn = sqlite3.connect(_DB_PATH)
+    cursor = conn.cursor()
+
+    # Явно указываем колонки, чтобы row[7] всегда был details_json!
+    cursor.execute("""
+        SELECT audit_id, db_name, accountant, viewed_at, 
+               status, status_label, total_flags, details_json 
+        FROM audits 
+        ORDER BY viewed_at ASC
+    """)
+    rows = cursor.fetchall()
+
+    history = []
+    for row in rows:
+        details_df = pd.DataFrame()
+        if row[7]:
+            try:
+                # StringIO защищает от FutureWarnings в новых версиях pandas
+                details_df = pd.read_json(io.StringIO(row[7]), orient="records")
+            except Exception:
+                pass
+
+        history.append({
+            "audit_id": row[0],
+            "db_name": row[1],
+            "accountant": row[2],
+            "viewed_at": row[3],
+            "status": row[4],
+            "status_label": row[5],
+            "total_flags": row[6],
+            "details": details_df
+        })
+
+    conn.close()
+    return history

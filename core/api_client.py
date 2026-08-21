@@ -163,14 +163,17 @@ class OneCClient:
             return code_by_key[str(key)]
         return None
 
-    # НОВАЯ ЛОГИКА: Расшифровка GUID по локальному кэшу
+    # Расшифровка GUID по локальному кэшу
     def _record_subconto(self, rec: dict) -> str:
         val = rec.get("ExtDimension1")
         if not val:
             return "-"
         if isinstance(val, dict):
-            return val.get("Description") or str(val)
-            
+            return val.get("Description") \
+                or val.get("Наименование") \
+                or val.get("Name") \
+                or str(val)
+
         val_str = str(val)
         return self._guid_to_name.get(val_str, val_str)
 
@@ -179,12 +182,20 @@ class OneCClient:
         if not val:
             return "-"
         if isinstance(val, dict):
-            return val.get("Description") or str(val)
+            return val.get("Description") \
+                or val.get("Наименование") \
+                or val.get("Name") \
+                or str(val)
             
         val_str = str(val)
         return self._guid_to_name.get(val_str, val_str)
 
-    def _records_to_osv(self, records: list[dict], period_end: str, account_code: str | None = None) -> pd.DataFrame:
+    def _records_to_osv(
+        self,
+        records: list[dict],
+        period_end: str,
+        account_code: str | None = None
+    ) -> pd.DataFrame:
         if not records:
             return pd.DataFrame(columns=OSV_COLUMNS)
 
