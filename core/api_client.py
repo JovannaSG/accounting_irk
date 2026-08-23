@@ -42,13 +42,13 @@ class OneCClient:
         self.session = requests.Session()
         self.session.auth = HTTPBasicAuth(username, password)
         self.session.headers.update({'Accept': 'application/json'})
-        
+
         adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
-        
+
         self._code_by_key: dict[str, str] = {}
-        
+
         # НОВЫЙ КЭШ: Локальная база для перевода GUID -> Название
         self._guid_to_name: dict[str, str] = {}
         self._catalogs_loaded = False
@@ -96,15 +96,15 @@ class OneCClient:
     def _prefetch_catalogs(self) -> None:
         if self._catalogs_loaded:
             return
-            
+
         catalogs = [
             "Catalog_Контрагенты",
             "Catalog_ДоговорыКонтрагентов",
             "Catalog_ФизическиеЛица"
         ]
-        
+
         logger.info("Предзагрузка справочников (Контрагенты, Договоры, Физлица) для аналитики...")
-        
+
         def load_cat(cat_name: str):
             endpoint = f"{self.base_url}/odata/standard.odata/{cat_name}"
             params = {"$format": "json", "$select": "Ref_Key,Description", "$top": 2000}
@@ -122,7 +122,7 @@ class OneCClient:
         # Грузим 3 справочника параллельно
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             list(executor.map(load_cat, catalogs))
-            
+
         self._catalogs_loaded = True
         logger.info(f"Справочники загружены. В кэше {len(self._guid_to_name)} записей.")
 
@@ -145,7 +145,7 @@ class OneCClient:
     def _get_account_guid(self, target_code: str) -> str | None:
         if not self._code_by_key:
             self.fetch_chart_of_accounts()
-            
+
         for guid, code in self._code_by_key.items():
             if str(code).strip() == str(target_code).strip():
                 return guid
@@ -186,7 +186,7 @@ class OneCClient:
                 or val.get("Наименование") \
                 or val.get("Name") \
                 or str(val)
-            
+
         val_str = str(val)
         return self._guid_to_name.get(val_str, val_str)
 
@@ -257,7 +257,7 @@ class OneCClient:
     def fetch_osv_account_subconto(self, period_start: str, period_end: str, account_code: str) -> pd.DataFrame:
         register: str = "AccountingRegister_Хозрасчетный"
         guid = self._get_account_guid(account_code)
-        
+
         if guid:
             method = (
                 f"BalanceAndTurnovers(StartPeriod=datetime'{period_start}', "
@@ -280,7 +280,7 @@ class OneCClient:
             "$top": 1000,
             "$skip": 0,
         }
-        
+
         try:
             records = self._paginate(endpoint, params)
         except Exception as e:
@@ -297,7 +297,7 @@ class OneCClient:
         import calendar
         start = pd.to_datetime(period_start, errors="coerce")
         end = pd.to_datetime(period_end, errors="coerce")
-        
+
         cursor = start.normalize().replace(day=1, hour=0, minute=0, second=0)
         while cursor <= end:
             month_end = cursor.replace(
@@ -315,19 +315,19 @@ class OneCClient:
                 cursor = cursor.replace(month=cursor.month + 1)
 
     def fetch_osv_monthly(
-        self, 
-        period_start: str, 
-        period_end: str, 
+        self,
+        period_start: str,
+        period_end: str,
         target_accounts: list[str] | None = None
     ) -> pd.DataFrame:
-        
+
         _DETAILED_ACCOUNTS = ("60", "62", "76", "71", "73", "58", "66", "67")
         if pd.to_datetime(period_start) > pd.to_datetime(period_end):
             raise ValueError("Некорректный диапазон дат.")
-            
+
         frames: list[pd.DataFrame] = []
         month_ranges = list(self._month_ranges(period_start, period_end))
-        
+
         # Разогрев кэша (План счетов + Справочники контрагентов и договоров)
         self.fetch_chart_of_accounts()
         self._prefetch_catalogs()
@@ -343,7 +343,7 @@ class OneCClient:
                 m_range = future_to_month[future]
                 try:
                     agg_dfs_by_month[m_range] = future.result()
-                except Exception as e:
+                except Exception:
                     agg_dfs_by_month[m_range] = pd.DataFrame(columns=OSV_COLUMNS)
 
         detailed_tasks = []
@@ -351,19 +351,19 @@ class OneCClient:
             agg_df = agg_dfs_by_month[m_range]
             if agg_df.empty:
                 continue
-                
+
             active_accounts = agg_df["Счет"].dropna().unique().tolist()
             for acc in active_accounts:
                 acc_str = str(acc)
                 needs_detail = False
-                
+
                 if target_accounts:
                     if any(acc_str.startswith(t) for t in target_accounts):
                         needs_detail = True
                 else:
                     if acc_str.startswith(_DETAILED_ACCOUNTS):
                         needs_detail = True
-                        
+
                 if needs_detail:
                     detailed_tasks.append({
                         "m_range": m_range,
@@ -378,19 +378,19 @@ class OneCClient:
             with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
                 future_to_task = {
                     executor.submit(
-                        self.fetch_osv_account_subconto, 
-                        task["m_range"][0], 
-                        task["m_range"][1], 
+                        self.fetch_osv_account_subconto,
+                        task["m_range"][0],
+                        task["m_range"][1],
                         task["acc_str"]
                     ): task
                     for task in detailed_tasks
                 }
-                
+
                 for future in concurrent.futures.as_completed(future_to_task):
                     task = future_to_task[future]
                     acc_str = task["acc_str"]
                     agg_df = task["agg_df"]
-                    
+
                     try:
                         det_df = future.result()
                         if not det_df.empty:
@@ -405,6 +405,6 @@ class OneCClient:
 
         if not frames:
             return pd.DataFrame(columns=OSV_COLUMNS)
-            
+
         df = pd.concat(frames, ignore_index=True)
         return df.reindex(columns=OSV_COLUMNS)

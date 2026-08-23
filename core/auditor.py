@@ -1,5 +1,4 @@
 """
-TODO: needs review
 Ядро автоаудита бухгалтерских баз 1С:Бухгалтерия (без 1С-интеграции).
 
 Реализует 5 контрольных точек из ТЗ:
@@ -146,7 +145,7 @@ GROUP_PRESETS: dict[str, list[str]] = {
 }
 
 DETAIL_COLUMNS: list[str] = [
-    "Проверка", "Уровень", "Период", 
+    "Проверка", "Уровень", "Период",
     "Счет", "Субконто", "Договор",
     "Дебет", "Кредит",
     "Сумма", "Комментарий"
@@ -1137,7 +1136,6 @@ class AutoAuditor1C:
             — добавляет лист «Проход по счетам».
         """
 
-#        import openpyxl
         from openpyxl.styles import Alignment, Font, PatternFill
 
         summary = self.summary_df()

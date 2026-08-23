@@ -64,7 +64,7 @@ def _worst_level(details: pd.DataFrame) -> str:
     if details is None or details.empty:
         return "ok"
 
-    levels = set(str(l) for l in details["Уровень"].dropna())
+    levels = set(str(v) for v in details["Уровень"].dropna())
     if "error" in levels:
         return "error"
     if "warning" in levels:

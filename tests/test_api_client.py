@@ -1,7 +1,6 @@
 import uuid
 from typing import Any, Optional
 
-import pandas as pd
 import pytest
 import requests
 

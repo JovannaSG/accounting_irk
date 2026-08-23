@@ -6,7 +6,7 @@ import io
 
 # Позволяем тестам использовать временный файл через переменную окружения
 _DB_PATH = os.environ.get(
-    "AUDIT_DB_PATH", 
+    "AUDIT_DB_PATH",
     os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "audit_history.db"
@@ -45,12 +45,12 @@ def save_audit_log(result: dict) -> None:
     init_db()
     conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
-    
+
     details_df = result.get("details", pd.DataFrame())
     details_json = details_df.to_json(orient="records", date_format="iso")
 
     cursor.execute('''
-        INSERT OR REPLACE INTO audits 
+        INSERT OR REPLACE INTO audits
         (audit_id, db_name, accountant, viewed_at, status, status_label, total_flags, details_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
@@ -78,9 +78,9 @@ def load_audit_history() -> list[dict]:
 
     # Явно указываем колонки, чтобы row[7] всегда был details_json!
     cursor.execute("""
-        SELECT audit_id, db_name, accountant, viewed_at, 
-               status, status_label, total_flags, details_json 
-        FROM audits 
+        SELECT audit_id, db_name, accountant, viewed_at,
+               status, status_label, total_flags, details_json
+        FROM audits
         ORDER BY viewed_at ASC
     """)
     rows = cursor.fetchall()

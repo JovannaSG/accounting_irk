@@ -1,8 +1,3 @@
-"""
-TODO: Раскомментируй, когда добавишь SQLite
-строки 866, 876
-"""
-
 import os
 import sys
 import traceback
@@ -22,7 +17,6 @@ from core.api_client import OneCClient
 from core.auditor import (
     AutoAuditor1C,
     DEFAULT_CLOSING_ACCOUNTS,
-#    RECOMMENDATIONS,
     normalize_balances,
     normalize_documents,
 )
@@ -30,6 +24,11 @@ from core.db import save_audit_log, load_audit_history
 from core.comparator import compare_audits
 from core.dashboard import accounts_list, block_dfs, build_dashboard_df
 from core.loaders import load_osv_file
+
+# Значения по умолчанию для подключения к 1С:Фреш (публичная демо-база).
+# Переопределяются переменными окружения ONEC_URL / ONEC_USER / ONEC_PASS.
+DEFAULT_ONEC_URL = os.environ.get("ONEC_URL", "https://msk1.1cfresh.com/a/ea/3418453")
+DEFAULT_ONEC_USER = os.environ.get("ONEC_USER", "odata.user")
 
 st.set_page_config(page_title="ИИ-Аудитор 1С", layout="wide")
 
@@ -84,7 +83,7 @@ def _run_audit_local(
     """
 
     filtered_balances = balances.copy()
-    
+
     # Фильтрация по периодам
     if options.get("periods") is not None:
         filtered_balances = filtered_balances[
@@ -267,24 +266,24 @@ def find_result_safe(
 
     while i < length:
         res = history[i]
-        
+
         # Проверяем совпадение по имени базы
         if res.get("db_name") == target_base:
-            
+
             # Если период передан и он не пустой/прочерк,
             # проверяем точное совпадение
             if target_period is not None and target_period != "—":
                 res_period = str(res.get("period", ""))
-                
+
                 if res_period == target_period:
                     return res
             else:
                 # Если период не важен (режим "За период в целом"),
                 # возвращаем первое совпадение по базе
                 return res
-                
+
         i += 1
-        
+
     return None
 
 
@@ -471,17 +470,17 @@ if data_source.startswith("📁"):
             "Отдельно: если это разные базы/организации."
     )
 else:
-    # Заглушка для 1С
+    # Источник 1С:Фреш всегда один аудит — режим нескольких файлов не применяется
     merge_mode = "Объединить в одну базу"
     with st.sidebar.expander("🔑 Доступ к 1С:Фреш", expanded=True):
         api_url = st.text_input(
             "URL базы",
-            value=os.environ.get("ONEC_URL", "https://msk1.1cfresh.com/a/ea/3418453"),
+            value=DEFAULT_ONEC_URL,
             key="api_url",
         )
         api_user = st.text_input(
             "Пользователь",
-            value=os.environ.get("ONEC_USER", "odata.user"),
+            value=DEFAULT_ONEC_USER,
             key="api_user",
         )
         api_pass = st.text_input(
@@ -581,7 +580,7 @@ if fetch_api:
             "end_s": end_s,
         }
         st.session_state["api_db_name"] = api_url.strip()
-        
+
         keys_to_del = ["osv", "docs", "audit", "mock_data"]
         i = 0
         while i < len(keys_to_del):
@@ -725,8 +724,8 @@ selected_periods = st.sidebar.multiselect(
 )
 
 period_mode = st.sidebar.radio(
-    "Группировка периодов", 
-    ["🗓 За период в целом", "📅 По месяцам"], 
+    "Группировка периодов",
+    ["🗓 За период в целом", "📅 По месяцам"],
     key="period_mode"
 )
 
@@ -820,7 +819,7 @@ if documents is not None:
     doc_filtered = _filter_documents_by_period(documents, selected_periods)
     if doc_filtered is not None and audit_mode == "По контрагенту" and target_subcontos:
         doc_filtered = doc_filtered[doc_filtered["Контрагент"].astype(str).isin(target_subcontos)]
-        
+
     doc_len = len(doc_filtered) if doc_filtered is not None else 0
     st.caption(
         f"📄 Загружен реестр документов: {len(documents)} операций "
@@ -848,7 +847,7 @@ if st.button("🚀 Запустить Аудит", type="primary", key="btn_audi
         "target_accounts": target_accounts,
         "target_subcontos": target_subcontos,
     }
-    
+
     try:
         with st.spinner("Анализируем данные..."):
             # Инициализируем историю, если она еще не загружена из БД

@@ -5,8 +5,7 @@ ML-проверки: статистический поиск аномалий и
 
   - нетипичные суммы операций по контрагенту (медиана + MAD);
   - резкие скачки оборотов между периодами по счету/аналитике;
-  - нечёткий поиск дублей контрагентов (rapidfuzz; при отсутствии
-    библиотеки — фолбэк на difflib из стандартной библиотеки).
+  - нечёткий поиск дублей контрагентов (rapidfuzz).
 
 Все функции возвращают pandas.DataFrame находок (пустой при отсутствии),
 чтобы вызывающий код мог единообразно встроить их в отчёт.
@@ -15,14 +14,11 @@ ML-проверки: статистический поиск аномалий и
 from __future__ import annotations
 
 import warnings
-from difflib import SequenceMatcher
-from typing import Iterable, Any
+from typing import Iterable
 
 import pandas as pd
 import numpy as np  # Импортирован для оптимизации матрицы
 
-_fuzz: Any = None
-_process: Any = None
 from rapidfuzz import fuzz as _fuzz
 from rapidfuzz import process as _process
 
@@ -177,25 +173,6 @@ def _normalize_name(name: object) -> str:
     s = str(name).strip().lower()
     chars = [c for c in s if c.isalnum() or c == " "]
     return " ".join("".join(chars).split())
-
-
-def _token_sort_ratio(a: str, b: str) -> float:
-    """
-    Сходство с неважным порядком слов (фолбэк на difflib).
-
-    Реализует идею token_sort_ratio из rapidfuzz: слова сортируются
-    по алфавиту и сравнивается итоговая последовательность.
-    """
-
-    if not a or not b:
-        return 0.0
-
-    sorted_a = " ".join(sorted(a.split()))
-    sorted_b = " ".join(sorted(b.split()))
-    if sorted_a == sorted_b:
-        return 100.0
-
-    return SequenceMatcher(None, sorted_a, sorted_b).ratio() * 100.0
 
 
 def _duplicate_pairs(

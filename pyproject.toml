@@ -1,3 +1,17 @@
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501", # длинные строки не правим перед сдачей
+]
+
+[tool.ruff.lint.per-file-ignores]
+# app/ui.py настраивает sys.path до импорта core (запуск как скрипт Streamlit)
+"app/ui.py" = ["E402"]
