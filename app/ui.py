@@ -142,6 +142,7 @@ def _run_audit_local(
         ml_amount_anomalies=options["ml_amount_anomalies"],
         ml_turnover_jumps=options["ml_turnover_jumps"],
         ml_duplicates=options["ml_duplicates"],
+        nlp_enabled=options.get("nlp_enabled", True),
         dup_threshold=options["dup_threshold"],
         anomaly_min_abs=options["anomaly_min_abs"],
     )
@@ -449,6 +450,7 @@ data_source = st.sidebar.radio(
 use_mock = st.sidebar.button("Использовать тестовые данные", key="btn_mock")
 
 osv_files: list = []
+docs_file = None
 fetch_api = False
 api_url = ""
 api_user = ""
@@ -468,6 +470,15 @@ if data_source.startswith("📁"):
         ["Объединить в одну базу (один аудит)", "Проверить каждый отдельно"],
         help="Объединить: если загружаете разные месяцы одной компании." \
             "Отдельно: если это разные базы/организации."
+    )
+    docs_file = st.sidebar.file_uploader(
+        "Реестр документов (CSV, опционально)",
+        type=["csv"],
+        key="docs",
+        help=(
+            "Движения по контрагентам (отгрузки/оплаты/авансы) для проверки 4.5. "
+            "Колонка «Назначение» включает NLP-проверку формулировок платежей (115-ФЗ)."
+        ),
     )
 else:
     # Источник 1С:Фреш всегда один аудит — режим нескольких файлов не применяется
@@ -544,6 +555,14 @@ with st.sidebar.expander("ML-проверки"):
         "Дубли контрагентов",
         value=True,
         help="Нечеткий поиск похожих названий: «ООО Ромашка» vs «Ромашка, ООО».",
+    )
+    nlp_enabled = st.checkbox(
+        "NLP: назначения платежей (115-ФЗ)",
+        value=True,
+        help=(
+            "Поиск рискованных формулировок в колонке «Назначение» реестра "
+            "документов (обнал, займы без договора, расплывчатые основания)."
+        ),
     )
     dup_threshold = st.slider(
         "Порог сходства дублей, %",
@@ -675,6 +694,9 @@ try:
                 # Для предпросмотра на экране берем первый файл
                 balances = datasets_to_process[0]["df"]
                 source_info = datasets_to_process[0]["info"]
+
+        if docs_file is not None:
+            documents = normalize_documents(pd.read_csv(docs_file, dtype=str))
 
     elif "mock_data" in st.session_state:
         balances = st.session_state["mock_data"]["balances"]
@@ -841,6 +863,7 @@ if st.button("🚀 Запустить Аудит", type="primary", key="btn_audi
         "ml_amount_anomalies": ml_amount_anomalies,
         "ml_turnover_jumps": ml_turnover_jumps,
         "ml_duplicates": ml_duplicates,
+        "nlp_enabled": nlp_enabled,
         "dup_threshold": dup_threshold,
         "anomaly_min_abs": anomaly_min_abs,
         "audit_mode": audit_mode,

@@ -23,6 +23,7 @@ from typing import Any, Sequence
 import pandas as pd
 
 from core import ml
+from core import nlp
 
 COLUMN_ALIASES: dict[str, list[str]] = {
     "Счет": ["Счет", "Счёт", "account", "schet"],
@@ -44,6 +45,9 @@ DOCUMENT_ALIASES: dict[str, list[str]] = {
     "Счет": ["Счет", "Счёт", "account"],
     "Вид": ["Вид", "type", "ВидОперации"],
     "Сумма": ["Сумма", "amount", "sum"],
+    "Назначение": [
+        "Назначение", "Назначение платежа", "НазначениеПлатежа", "purpose",
+    ],
 }
 
 REQUIRED_OSV: list[str] = ["Счет", "Тип", "КонецДебет", "КонецКредит"]
@@ -127,6 +131,11 @@ RECOMMENDATIONS: dict[str, str] = {
     "ML: возможные дубли контрагентов": (
         "Обнаружены похожие названия контрагентов. Рекомендуется объединить "
         "дубли в справочнике, чтобы не дробить расчеты."
+    ),
+    "NLP: подозрительные назначения платежей (115-ФЗ)": (
+        "Назначение платежа содержит формулировки с повышенным риском "
+        "(обнал, нетиповые переводы, займы без договора, расплывчатые "
+        "основания). Проверьте операцию и первичные документы."
     ),
     "Контроль групп счетов: незакрытые остатки": (
         "Группа счетов (авансы, товары, денежные средства и т.п.) не закрыта "
@@ -265,6 +274,9 @@ def normalize_documents(df: pd.DataFrame) -> pd.DataFrame:
     df["Вид"] = df["Вид"].astype(str).str.strip().str.lower()
     df["Сумма"] = pd.to_numeric(df["Сумма"], errors="coerce")
 
+    if "Назначение" in df.columns:
+        df["Назначение"] = df["Назначение"].fillna("").astype(str).str.strip()
+
     if df["Сумма"].isna().any():
         raise ValueError("Колонка 'Сумма' в документах содержит нечисловые значения")
 
@@ -301,6 +313,7 @@ class AutoAuditor1C:
         meta: dict | None = None,
         balance_group_checks: bool = False,
         ml_enabled: bool = False,
+        nlp_enabled: bool = True,
         ml_amount_anomalies: bool = True,
         ml_turnover_jumps: bool = True,
         ml_duplicates: bool = True,
@@ -324,6 +337,7 @@ class AutoAuditor1C:
         self.ml_amount_anomalies = ml_amount_anomalies
         self.ml_turnover_jumps = ml_turnover_jumps
         self.ml_duplicates = ml_duplicates
+        self.nlp_enabled = nlp_enabled
         self.anomaly_k = anomaly_k
         self.anomaly_min_abs = anomaly_min_abs
         self.anomaly_min_ops = anomaly_min_ops
@@ -916,6 +930,17 @@ class AutoAuditor1C:
         if self.ml_duplicates:
             self.check_duplicate_counterparties()
 
+    # ============ NLP-проверки (назначения платежей) ============
+    def check_payment_purpose_risks(self) -> None:
+        """
+        NLP: рискованные формулировки в назначениях платежей (115-ФЗ)
+        """
+
+        if self.documents is None:
+            return
+        found = nlp.detect_payment_risks(self.documents)
+        self._add("warning", "NLP: подозрительные назначения платежей (115-ФЗ)", found)
+
     # ============ Запуск и отчеты ============
     def run_audit(self) -> list[Finding]:
         self.errors = []
@@ -931,6 +956,8 @@ class AutoAuditor1C:
         if self._check_enabled("settlements"):
             self.check_unclosed_settlements()
         self.run_ml_checks()
+        if self.nlp_enabled:
+            self.check_payment_purpose_risks()
         return self.errors
 
     def summary_df(self) -> pd.DataFrame:
