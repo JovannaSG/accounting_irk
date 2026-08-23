@@ -1,3 +1,8 @@
+# Явное имя проекта: docker compose не может вывести его из имени папки
+# с кириллицей (например «Тестовое_бухучет») и падает с ошибкой
+# "project name must not be empty".
+name: accounting-irk
+
 services:
   app:
     build: .
