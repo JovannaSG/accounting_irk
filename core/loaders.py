@@ -17,7 +17,6 @@ import numbers
 import re
 import warnings
 from html.parser import HTMLParser
-from typing import Optional
 
 import pandas as pd
 
@@ -51,14 +50,19 @@ PLAN_OF_ACCOUNTS: dict = {
 
 
 def detect_format(filename: str, data: bytes) -> str:
-    """Определяет формат файла по расширению и содержимому."""
-    ext = (filename or "").lower().rsplit(".", 1)[-1]
-    head = data[:1024]
+    """
+    Определяет формат файла по расширению и содержимому
+    """
+
+    ext: str = (filename or "").lower().rsplit(".", 1)[-1]
+    head: bytes = data[:1024]
 
     def looks_html() -> bool:
         s = head.lstrip().lower()
-        return (s.startswith(b"<html") or s.startswith(b"<!doctype")
-                or b"<table" in s.lower() or s.startswith(b"<?xml"))
+        return (
+            s.startswith(b"<html") or s.startswith(b"<!doctype")
+            or b"<table" in s.lower() or s.startswith(b"<?xml")
+        )
 
     if ext == "mxl":
         return "mxl"
@@ -78,9 +82,11 @@ def detect_format(filename: str, data: bytes) -> str:
 def _cell(row, i: int) -> str:
     if i >= len(row):
         return ""
+
     v = row[i]
     if v is None:
         return ""
+
     if isinstance(v, float):
         if pd.isna(v):
             return ""
@@ -91,11 +97,19 @@ def _cell(row, i: int) -> str:
 
 
 def _to_number(v) -> float:
-    """Преобразует значение ячейки в число, устойчиво к разделителям разрядов."""
+    """
+    Преобразует значение ячейки в число, устойчиво к разделителям разрядов
+    """
+
     if v is None:
         return 0.0
+
     if isinstance(v, numbers.Number) and not isinstance(v, bool):
-        return 0.0 if pd.isna(v) else float(v)
+        if pd.isna(v):
+            return 0.0
+        else:
+            return float(v)
+
     s = str(v).strip().replace("\u00a0", "").replace(" ", "")
     if not s or s in ("-", "—", "–", "−"):
         return 0.0
@@ -120,11 +134,15 @@ def _to_number(v) -> float:
         return 0.0
 
 
-def _parse_plan(text: Optional[str]) -> dict:
-    """Разбор пользовательского плана счетов вида '51:A, 60.01:AP'."""
+def _parse_plan(text: str | None) -> dict:
+    """
+    Разбор пользовательского плана счетов вида '51:A, 60.01:AP'
+    """
+
     if not text:
         return {}
-    plan = {}
+
+    plan: dict = {}
     for chunk in re.split(r"[,;\n]", text):
         chunk = chunk.strip()
         if not chunk:
@@ -148,7 +166,7 @@ def _read_excel_grid(data: bytes, engine: str) -> pd.DataFrame:
 
 
 def _decode_html(data: bytes) -> str:
-    for enc in ("utf-8-sig", "cp1251", "windows-1251"):
+    for enc in ("utf-8-sig", "cp1251", "utf-8"):
         try:
             return data.decode(enc)
         except UnicodeDecodeError:
@@ -157,7 +175,9 @@ def _decode_html(data: bytes) -> str:
 
 
 class _TableGridParser(HTMLParser):
-    """Извлекает первую (самую большую) таблицу в виде сетки сырого текста ячеек."""
+    """
+    Извлекает первую (самую большую) таблицу в виде сетки сырого текста ячеек
+    """
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -218,12 +238,15 @@ class _TableGridParser(HTMLParser):
 
 
 def _expand_spans(raw: list[list[object]]) -> list[list[object]]:
-    """Разворачивает colspan/rowspan в прямоугольную сетку."""
-    expanded = []
-    pending = {}
+    """
+    Разворачивает colspan/rowspan в прямоугольную сетку
+    """
+
+    expanded: list = []
+    pending: dict = {}
     for raw_row in raw:
-        out = []
-        col = 0
+        out: list = []
+        col: int = 0
         cells = list(raw_row)
         while cells or any(p_col >= col for p_col in pending):
             if col in pending and pending[col][0] > 0:
@@ -266,11 +289,13 @@ def _looks_like_account(v) -> bool:
 
 
 def _has_indicator_column(rows: list, start: int) -> bool:
-    """Определяет, выведена ли ОСВ с колонкой «Показатели» (БУ/НУ/БУ-НУ).
+    """
+    Определяет, выведена ли ОСВ с колонкой «Показатели» (БУ/НУ/БУ-НУ).
 
     Такая ведомость на одну колонку шире обычной (данные начинаются с 3-й
     колонки). Детекция по заголовку «Показатели» или по значениям строк.
     """
+
     for row in rows[:start + 1]:
         if str(_cell(row, 0)).strip().lower() == "счет":
             if str(_cell(row, 2)).strip() == "Показатели":
@@ -282,12 +307,17 @@ def _has_indicator_column(rows: list, start: int) -> bool:
     return False
 
 
-def extract_osv(grid: pd.DataFrame,
-                plan_override: Optional[str] = None,
-                period_hint: str = "") -> tuple[pd.DataFrame, dict]:
-    """Извлекает каноническую ОСВ из «сырой» таблицы 1С (многострочный заголовок)."""
-    rows = grid.values.tolist()
-    plan = {**PLAN_OF_ACCOUNTS, **_parse_plan(plan_override)}
+def extract_osv(
+    grid: pd.DataFrame,
+    plan_override: str | None = None,
+    period_hint: str = ""
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Извлекает каноническую ОСВ из «сырой» таблицы 1С (многострочный заголовок)
+    """
+
+    rows: list = grid.values.tolist()
+    plan: dict = {**PLAN_OF_ACCOUNTS, **_parse_plan(plan_override)}
 
     title, period, organization = "", period_hint or "", ""
     for row in rows[:6]:
@@ -310,7 +340,7 @@ def extract_osv(grid: pd.DataFrame,
     indicator_mode = _has_indicator_column(rows, start)
     num_range = range(3, 9) if indicator_mode else range(2, 8)
 
-    recs = []
+    recs: list = []
     current_code = None
     for row in rows[start:]:
         c0, c1 = _cell(row, 0), _cell(row, 1)
@@ -330,7 +360,7 @@ def extract_osv(grid: pd.DataFrame,
             if current_code is None:
                 continue
             subconto = c0
-        nums = [_to_number(row[c]) for c in num_range]
+        nums = [_to_number(_cell(row, c)) for c in num_range]
         recs.append({
             "Период": period,
             "Счет": current_code,
@@ -372,9 +402,15 @@ def _infer_type(code: str, plan: dict, recs: list[dict]) -> str:
     return "AP"
 
 
-def load_osv_file(filename: str, data: bytes,
-                  plan_override: Optional[str] = None) -> tuple[pd.DataFrame, dict]:
-    """Загружает ОСВ из файла любого поддерживаемого формата."""
+def load_osv_file(
+    filename: str,
+    data: bytes,
+    plan_override: str | None = None
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Загружает ОСВ из файла любого поддерживаемого формата
+    """
+
     fmt = detect_format(filename, data)
 
     if fmt == "mxl":
@@ -385,7 +421,10 @@ def load_osv_file(filename: str, data: bytes,
 
     if fmt in ("csv",):
         csv = _decode_csv(data)
-        return normalize_balances(csv), {"title": "", "period": "", "organization": ""}
+        return (
+            normalize_balances(csv),
+            {"title": "", "period": "", "organization": ""}
+        )
 
     if fmt in ("xls", "xlsx"):
         engine = "xlrd" if fmt == "xls" else "openpyxl"
@@ -396,10 +435,15 @@ def load_osv_file(filename: str, data: bytes,
         period_hint = _period_from_html(html)
     else:
         raise ValueError(
-            "Не удалось распознать формат файла. Поддерживаются: CSV, XLS, XLSX, HTML."
+            "Не удалось распознать формат файла. \
+            Поддерживаются: CSV, XLS, XLSX, HTML."
         )
 
-    df, info = extract_osv(grid, plan_override=plan_override, period_hint=period_hint)
+    df, info = extract_osv(
+        grid,
+        plan_override=plan_override,
+        period_hint=period_hint
+    )
     return normalize_balances(df), info
 
 
@@ -413,5 +457,8 @@ def _decode_csv(data: bytes) -> pd.DataFrame:
 
 
 def _period_from_html(html: str) -> str:
-    m = re.search(r"Оборотно-сальдовая[^<\n]*?(?:за|За)\s+([^<\n]+)", html)
+    m = re.search(
+        r"Оборотно-сальдовая[^<\n]*?(?:за|За)\s+([^<\n]+)",
+        html
+    )
     return m.group(1).strip() if m else ""

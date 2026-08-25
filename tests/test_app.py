@@ -176,4 +176,53 @@ def test_no_data_message_when_source_empty():
     assert "audit" not in at.session_state
 
 
+# ── Ограничение доступа (ТЗ §11): гейт активен только при AUDIT_USERS ──
+
+def test_login_gate_blocks_wrong_password(monkeypatch):
+    from core import auth as auth_mod
+
+    stored = auth_mod.hash_password("pw123")
+    monkeypatch.setenv(auth_mod.AUDIT_USERS_ENV, f"tester:{stored}")
+
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.run()
+    assert not at.exception
+    # Основной интерфейс не отрисован до входа
+    assert not [b for b in at.button if b.key == "btn_audit"]
+
+    at.text_input(key="login_user").set_value("tester")
+    at.text_input(key="login_pass").set_value("wrong")
+    at.button(key="btn_login").click()
+    at.run()
+    assert any("Неверный логин или пароль" in e.value for e in at.error)
+    assert "user" not in at.session_state
+
+
+def test_login_gate_passes_then_audits_with_user(monkeypatch):
+    from core import auth as auth_mod
+
+    stored = auth_mod.hash_password("pw123")
+    monkeypatch.setenv(auth_mod.AUDIT_USERS_ENV, f"tester:{stored}")
+
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.run()
+    at.text_input(key="login_user").set_value("Tester")
+    at.text_input(key="login_pass").set_value("pw123")
+    at.button(key="btn_login").click()
+    at.run()
+    assert not at.exception
+    assert at.session_state["user"] == "Tester"
+
+    at.sidebar.button(key="btn_mock").click()
+    at.run()
+    at.button(key="btn_audit").click()
+    at.run()
+    assert not at.exception
+    audit = at.session_state["audit"]
+    assert audit["user"] == "Tester"
+    # Версия логики проверок пишется в meta каждого прогона
+    assert audit["meta"]["audit_logic_version"]
+    assert audit["meta"]["organization"] == ""
+
+
 

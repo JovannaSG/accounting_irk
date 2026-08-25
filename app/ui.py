@@ -11,15 +11,25 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 _DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
 
+from core.appenv import load_project_env
+
+# .env из корня проекта — до первых чтений переменных окружения
+# (ONEC_*, AUDIT_DB_PATH, AUDIT_USERS) и до импорта core-модулей
+load_project_env()
+
 import streamlit as st
 
 from core.api_client import OneCClient
+from core.auth import auth_enabled
+from core.auth import verify as verify_credentials
 from core.auditor import (
+    AUDIT_LOGIC_VERSION,
     AutoAuditor1C,
     DEFAULT_CLOSING_ACCOUNTS,
     normalize_balances,
     normalize_documents,
 )
+from core import db
 from core.db import save_audit_log, load_audit_history
 from core.comparator import compare_audits
 from core.dashboard import accounts_list, block_dfs, build_dashboard_df
@@ -41,6 +51,39 @@ st.markdown(
     "MXL не поддерживается — сохраните отчет в 1С как Excel или HTML. Опционально "
     "загружается реестр документов для проверки расчетов с контрагентами."
 )
+
+
+def _render_login_form() -> None:
+    """
+    Форма входа (ТЗ §11). При успехе логин пишется в session_state["user"]
+    и попадает в журнал аудитов.
+    """
+
+    st.subheader("🔐 Вход в приложение")
+    st.caption(
+        "Доступ ограничен. Учетные записи задает администратор "
+        "в переменной окружения AUDIT_USERS."
+    )
+    with st.form("login_form"):
+        login_input = st.text_input("Логин", key="login_user")
+        password_input = st.text_input("Пароль", type="password", key="login_pass")
+        submitted = st.form_submit_button("Войти", type="primary", key="btn_login")
+
+    if submitted:
+        if not login_input.strip() or not password_input:
+            st.error("Введите логин и пароль.")
+        elif verify_credentials(login_input, password_input):
+            st.session_state["user"] = login_input.strip()
+            st.rerun()
+        else:
+            st.error("Неверный логин или пароль.")
+
+
+# Аутентификация включается только переменной окружения AUDIT_USERS
+# («логин:хэш,...»); если она не задана, приложение работает как раньше.
+if auth_enabled() and not st.session_state.get("user"):
+    _render_login_form()
+    st.stop()
 
 
 def _filter_documents_by_period(
@@ -117,6 +160,8 @@ def _run_audit_local(
         raise ValueError("После применения фильтров (период/счета/контрагенты) не осталось данных для проверки.")
 
     meta: dict = {"organization": options.get("organization") or ""}
+    # Версия логики проверок — для распознавания устаревших записей истории
+    meta["audit_logic_version"] = AUDIT_LOGIC_VERSION
 
     real_periods: list = []
     i: int = 0
@@ -138,6 +183,7 @@ def _run_audit_local(
         checks=set(options["checks"]),
         meta=meta,
         balance_group_checks=options["balance_group_checks"],
+        stuck_balance_checks=options.get("stuck_balance_checks", False),
         ml_enabled=options["ml_enabled"],
         ml_amount_anomalies=options["ml_amount_anomalies"],
         ml_turnover_jumps=options["ml_turnover_jumps"],
@@ -166,10 +212,12 @@ def _run_audit_local(
         "db_name": db_name,
         "accountant": options.get("accountant") or "",
         "viewed_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
+        "user": st.session_state.get("user", ""),
         "status": report["status"],
         "status_label": report["status_label"],
         "total_flags": report["total_flags"],
         "details": report["details"],
+        "meta": meta,
         "errors": errors_list,
         "auditor": auditor,
         "balances_df": filtered_balances,
@@ -224,8 +272,32 @@ def _render_dashboard_exports(result: dict) -> None:
     Кнопки выгрузки Excel/PDF для выбранной базы
     """
 
-    auditor = result.get("auditor")
+    # Запись создана другой (или неизвестной) версией логики проверок —
+    # находки могли вычисляться по другим правилам.
+    entry_meta = result.get("meta") or {}
+    saved_version = str(entry_meta.get("audit_logic_version") or "")
+    if saved_version != AUDIT_LOGIC_VERSION:
+        st.warning(
+            "Запись истории создана "
+            + (
+                f"логикой аудита v{saved_version} (текущая — v{AUDIT_LOGIC_VERSION})"
+                if saved_version
+                else "устаревшей логикой аудита"
+            )
+            + ": находки могут отличаться от текущих правил. "
+            "Для актуального результата запустите проверку заново."
+        )
+
+    try:
+        auditor = db.rebuild_auditor(result)
+    except Exception as exc:
+        st.warning(f"Не удалось подготовить данные для экспорта: {exc}")
+        return
     if auditor is None:
+        st.warning(
+            "Экспорт недоступен: в этой записи истории нет сохраненных "
+            "находок. Запустите проверку заново."
+        )
         return
 
     c_excel, c_pdf = st.columns(2)
@@ -360,10 +432,11 @@ def _render_dashboard(history: list[dict]) -> None:
         return
 
     st.markdown(f"### 🗄️ База: {selected_base}")
-    m1, m2, m3 = st.columns(3)
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric("Бухгалтер", result.get("accountant") or "—")
     m2.metric("Дата просмотра", result.get("viewed_at") or "—")
     m3.metric("Красных флагов", result.get("total_flags", 0))
+    m4.metric("Пользователь", result.get("user") or "—")
 
     _render_dashboard_exports(result)
 
@@ -377,7 +450,7 @@ def _render_dashboard(history: list[dict]) -> None:
     _render_dashboard_block(
         "🟡 Блок 2. Незакрытые счета (на конец месяца)",
         "Проверки 4.3–4.4 по ТЗ: счета, не закрытые на конец месяца, "
-        "зависшее сальдо между периодами и счёт 000.",
+        "счёт 000; зависшее сальдо — опционально.",
         blocks.get("unclosed"),
     )
     _render_dashboard_block(
@@ -385,6 +458,12 @@ def _render_dashboard(history: list[dict]) -> None:
         "Проверка 4.2 по ТЗ: одновременно дебиторка и кредиторка по одной "
         "аналитике/контрагенту.",
         blocks.get("expanded"),
+    )
+    _render_dashboard_block(
+        "🟢 Блок 4. Расчеты с контрагентами",
+        "Проверки 4.5 по ТЗ: незакрытые расчеты, аванс и долг одновременно, "
+        "расхождение документов и остатков ОСВ.",
+        blocks.get("settlements"),
     )
 
     dups = _dashboard_duplicates_df(result)
@@ -517,6 +596,18 @@ with st.sidebar.expander("⚙️ Настройки проверок"):
         value=False,
         help="Авансы, РБП, товары, денежные средства, кредиты: незакрытые остатки на конец периода.",
     )
+    chk_stuck_balances = st.checkbox(
+        "Зависшее сальдо между периодами",
+        value=False,
+        help="Опционально: предупреждает, если остаток по счету не меняется "
+             "несколько периодов подряд.",
+    )
+    if chk_stuck_balances:
+        st.caption(
+            "Нужны данные за 2+ периода в одном запуске — режим "
+            "«🗓 За период в целом». В режиме «📅 По месяцам» проверка "
+            "не срабатывает."
+        )
     org_input = st.text_input(
         "Организация",
         value="",
@@ -859,6 +950,7 @@ if st.button("🚀 Запустить Аудит", type="primary", key="btn_audi
         "accountant": accountant_input.strip(),
         "periods": selected_periods,
         "balance_group_checks": chk_group_balances,
+        "stuck_balance_checks": chk_stuck_balances,
         "ml_enabled": ml_enabled,
         "ml_amount_anomalies": ml_amount_anomalies,
         "ml_turnover_jumps": ml_turnover_jumps,

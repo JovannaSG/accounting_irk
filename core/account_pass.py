@@ -47,6 +47,7 @@ def _build_auditor(
         checks=set(options.get("checks") or []),
         meta=meta or {},
         balance_group_checks=options.get("balance_group_checks", False),
+        stuck_balance_checks=options.get("stuck_balance_checks", False),
         ml_enabled=options.get("ml_enabled", False),
         ml_amount_anomalies=options.get("ml_amount_anomalies", True),
         ml_turnover_jumps=options.get("ml_turnover_jumps", True),

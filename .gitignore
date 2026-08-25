@@ -9,6 +9,7 @@ scratch/
 data/examples/
 .app.lock
 audit_history.db
+.ruff_cache
 
 /*.xls
 /*.xlsx

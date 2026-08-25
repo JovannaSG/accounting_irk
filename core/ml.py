@@ -17,6 +17,8 @@ import warnings
 from typing import Iterable
 
 import pandas as pd
+
+from core.formatting import fmt_num, fmt_rub, period_sort_series
 import numpy as np  # Импортирован для оптимизации матрицы
 
 from rapidfuzz import fuzz as _fuzz
@@ -95,8 +97,8 @@ def detect_amount_anomalies(
                     "Медиана": med,
                     "Отклонение": round(ratio, 1),
                     "Комментарий": (
-                        f"Сумма {v:,.2f} в {ratio:.1f} раз превышает "
-                        f"медиану {med:,.2f} по контрагенту"
+                        f"Сумма {fmt_rub(v)} в {fmt_num(ratio)} раз превышает "
+                        f"медиану {fmt_rub(med)} по контрагенту"
                     ),
                 })
 
@@ -124,7 +126,13 @@ def detect_turnover_jumps(
         "detect_turnover_jumps"
     )
 
-    b = balances_df.sort_values(["Счет", "Субконто", "Период"])
+    # Хронология: «Период» бывает в разных форматах, лексикографическая
+    # сортировка ломает границу годов — ключом служит распознанная дата.
+    b = balances_df.copy()
+    b["_pkey"] = period_sort_series(b["Период"])
+    b = b.sort_values(
+        ["Счет", "Субконто", "_pkey"], kind="stable", na_position="last"
+    )
     rows: list[dict] = []
     for (code, sub), g in b.groupby(["Счет", "Субконто"]):
         if len(g) < 2:
@@ -156,7 +164,7 @@ def detect_turnover_jumps(
                     "Отношение": jump,
                     "Сумма": abs(c - p),
                     "Комментарий": (
-                        f"{col} изменились с {p:,.2f} до {c:,.2f} "
+                        f"{col} изменились с {fmt_rub(p)} до {fmt_rub(c)} "
                         f"(в {jump:.1f} раз) между периодами"
                     ),
                 })

@@ -125,6 +125,34 @@ def test_pass_empty_accounts():
     assert pass_data["by_account"] == {}
 
 
+def test_pass_forwards_stuck_balance_option():
+    """Флаг «зависшее сальдо» доходит до аудитора автопрохода по счетам."""
+
+    def fetch(account):
+        if account == "76.05":
+            return osv([
+                ["2026-01-31", "76.05", "Вектор", "AP", 0, 0, 0, 0, 0, 20000],
+                ["2026-02-28", "76.05", "Вектор", "AP", 0, 20000, 0, 0, 0, 20000],
+            ])
+        return pd.DataFrame()
+
+    # Зависшее сальдо вычисляется внутри проверки 4.3, поэтому в проходе
+    # должен быть включен и сам чек незакрытого месяца
+    options = dict(OPTIONS)
+    options["checks"] = OPTIONS["checks"] + ["unclosed_month_end"]
+    options["stuck_balance_checks"] = True
+
+    pass_data = run_account_pass(["76.05"], fetch, options)
+    details = pass_data["details_df"]
+    assert any("Зависшее сальдо" in t for t in details["Проверка"])
+
+    # Без флага той же проверки не возникает
+    options["stuck_balance_checks"] = False
+    pass_data = run_account_pass(["76.05"], fetch, options)
+    details = pass_data["details_df"]
+    assert not any("Зависшее сальдо" in t for t in details["Проверка"])
+
+
 def test_to_excel_contains_pass_sheet():
     pass_data = _make_pass()
     df = osv([["2026-01-31", "50", "-", "A", 0, 0, 0, 0, 0, 5000]])
@@ -144,16 +172,19 @@ def test_to_excel_contains_pass_sheet():
 
 def test_to_pdf_contains_pass_section():
     pytest.importorskip("fpdf")
+    pytest.importorskip("pypdf")
+    import io as _io
+
+    from pypdf import PdfReader
+
     pass_data = _make_pass()
     df = osv([["2026-01-31", "50", "-", "A", 0, 0, 0, 0, 0, 5000]])
     auditor = AutoAuditor1C(df)
     auditor.run_audit()
 
-    data = auditor.to_pdf(account_pass=pass_data)
-    assert data.startswith(b"%PDF")
-    import re
-
-    pages = re.search(rb"/Count (\d+)\n/Kids", data)
-    assert pages, "Не найден узел /Pages в PDF"
-    # 1 общий отчёт + 1 «Отчет по счетам» + 1 «Автопроход по счетам»
-    assert int(pages.group(1)) == 3
+    reader = PdfReader(_io.BytesIO(auditor.to_pdf(account_pass=pass_data)))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    assert "Автопроход по счетам" in text
+    # Дублирующий раздел «Отчет по счетам» удален из печатного отчета
+    assert "Отчет по счетам" not in text
+    assert "Стр." in text  # нумерация страниц
