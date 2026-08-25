@@ -7,6 +7,8 @@ services:
   app:
     build: .
     image: accounting_irk:latest
+    env_file:
+      - .env
     container_name: accounting_irk
     ports:
       - "8501:8501"
