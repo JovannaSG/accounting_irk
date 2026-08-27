@@ -57,10 +57,6 @@ def _json_default(value):
 
     if isinstance(value, (datetime, date)):
         return value.isoformat()
-    if isinstance(value, pd.Timestamp):
-        return value.isoformat()
-    if isinstance(value, (pd.Series, dict)):
-        return str(value)
     return str(value)
 
 

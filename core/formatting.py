@@ -32,7 +32,7 @@ def fmt_num(value: Any) -> str:
         f = float(value)
     except (TypeError, ValueError):
         return "" if value is None else str(value)
-    if f == int(f):
+    if f.is_integer():
         return str(int(f))
     return f"{f:.1f}".replace(".", ",")
 
@@ -68,7 +68,7 @@ def period_sort_series(values: Any) -> pd.Series:
     """
 
     parsed = pd.to_datetime(
-        pd.Series(list(values), dtype=object),
+        pd.Series(values, dtype=object),
         errors="coerce",
         format="mixed",
         # Российские даты «дд.мм.гггг»: дни ≤ 12 иначе читались бы как месяцы

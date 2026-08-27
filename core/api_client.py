@@ -30,11 +30,6 @@ _OSV_FIELDS: dict[str, list[str]] = {
     "КонецКредит": ["СуммаClosingBalanceCr", "ОстатокКтКонеч", "СКК", "КонецКредит"],
 }
 
-_OSV_SELECT: str = ",".join(
-    ["Account_Key"]
-    + [candidates[0] for candidates in _OSV_FIELDS.values()]
-)
-
 
 class OneCClient:
     def __init__(self, base_url: str, username: str, password: str) -> None:
@@ -74,7 +69,7 @@ class OneCClient:
 
             if len(chunk) < params.get("$top", 1000):
                 break
-            params["$skip"] = params.get("$skip", 0) + params["$top"]
+            params["$skip"] = params.get("$skip", 0) + params.get("$top", 1000)
 
         return all_records
 
@@ -100,7 +95,8 @@ class OneCClient:
         catalogs = [
             "Catalog_Контрагенты",
             "Catalog_ДоговорыКонтрагентов",
-            "Catalog_ФизическиеЛица"
+            "Catalog_ФизическиеЛица",
+            "Catalog_Организации"
         ]
 
         logger.info("Предзагрузка справочников (Контрагенты, Договоры, Физлица) для аналитики...")
@@ -130,8 +126,12 @@ class OneCClient:
         if self._code_by_key:
             return self._code_by_key
 
-        endpoint = f"{self.base_url}/odata/standard.odata/ChartOfAccounts_Хозрасчетный"
-        params = {"$format": "json", "$select": "Ref_Key,Code", "$top": 1000, "$skip": 0}
+        endpoint: str = f"{self.base_url}/odata/standard.odata/ChartOfAccounts_Хозрасчетный"
+        params: dict = {
+            "$format": "json",
+            "$select": "Ref_Key,Code"
+        }
+
         records = self._paginate(endpoint, params)
 
         with self._cache_lock:
@@ -163,6 +163,12 @@ class OneCClient:
             return code_by_key[str(key)]
         return None
 
+    @staticmethod
+    def extract_organizations(df: pd.DataFrame) -> list[str]:
+        if "Организация" not in df.columns:
+            return []
+        return sorted(df["Организация"].dropna().unique().tolist())
+
     # Расшифровка GUID по локальному кэшу
     def _record_subconto(self, rec: dict) -> str:
         val = rec.get("ExtDimension1")
@@ -181,6 +187,19 @@ class OneCClient:
         val = rec.get("ExtDimension2")
         if not val:
             return "-"
+        if isinstance(val, dict):
+            return val.get("Description") \
+                or val.get("Наименование") \
+                or val.get("Name") \
+                or str(val)
+
+        val_str = str(val)
+        return self._guid_to_name.get(val_str, val_str)
+
+    def _record_organization(self, rec: dict) -> str:
+        val = rec.get("Organization_Key") or rec.get("Организация_Key")
+        if not val:
+            return ""
         if isinstance(val, dict):
             return val.get("Description") \
                 or val.get("Наименование") \
@@ -209,10 +228,11 @@ class OneCClient:
             if account_code is not None and acc_code != account_code:
                 continue
             row: dict[str, Any] = {
-                "Период": period_end,
+                "Период": str(period_end).split("T")[0],
                 "Счет": acc_code,
                 "Субконто": self._record_subconto(rec),
                 "Договор": self._record_contract(rec),
+                "Организация": self._record_organization(rec),
             }
             for target, candidates in _OSV_FIELDS.items():
                 value = None
@@ -238,23 +258,40 @@ class OneCClient:
 
         return pd.DataFrame(rows, columns=OSV_COLUMNS)
 
-    def fetch_osv(self, period_start: str, period_end: str) -> pd.DataFrame:
+    def fetch_osv(self, period_start: str, period_end: str, with_org: bool = True) -> pd.DataFrame:
         register: str = "AccountingRegister_Хозрасчетный"
         method: str = f"BalanceAndTurnovers(StartPeriod=datetime'{period_start}', EndPeriod=datetime'{period_end}')"
         endpoint: str = f"{self.base_url}/odata/standard.odata/{register}/{method}"
 
+        # Динамически собираем $select, учитывая Организацию
+        select_fields = ["Account_Key"]
+        if with_org:
+            select_fields.append("Организация_Key")
+        select_fields.extend([candidates[0] for candidates in _OSV_FIELDS.values()])
+
         params: dict[str, Any] = {
             "$format": "json",
-            "$select": _OSV_SELECT,
+            "$select": ",".join(select_fields),
             "$top": 1000,
             "$skip": 0,
         }
-        records = self._paginate(endpoint, params)
+        try:
+            records = self._paginate(endpoint, params)
+        except ValueError as e:
+            # Если поле Организации недоступно, 1С вернет 400 Bad Request.
+            # Мягко откатываемся к запросу без Организации.
+            if with_org and ("400" in str(e) or "404" in str(e)):
+                logger.warning("Поле Организация_Key недоступно, повторяем без него...")
+                return self.fetch_osv(period_start, period_end, with_org=False)
+            raise
+
         if not records:
             return pd.DataFrame(columns=OSV_COLUMNS)
         return self._records_to_osv(records, period_end)
 
-    def fetch_osv_account_subconto(self, period_start: str, period_end: str, account_code: str) -> pd.DataFrame:
+    def fetch_osv_account_subconto(
+        self, period_start: str, period_end: str, account_code: str, with_org: bool = True
+    ) -> pd.DataFrame:
         register: str = "AccountingRegister_Хозрасчетный"
         guid = self._get_account_guid(account_code)
 
@@ -269,8 +306,9 @@ class OneCClient:
 
         endpoint: str = f"{self.base_url}/odata/standard.odata/{register}/{method}"
 
-        # Запрашиваем голые GUID-ы субконто, без $expand (Это спасает 1С от падения)
         base_select: list[str] = ["Account_Key", "ExtDimension1", "ExtDimension2"]
+        if with_org:
+            base_select.append("Организация_Key")
         for candidates in _OSV_FIELDS.values():
             base_select.append(candidates[0])
 
@@ -283,6 +321,11 @@ class OneCClient:
 
         try:
             records = self._paginate(endpoint, params)
+        except ValueError as e:
+            if with_org and ("400" in str(e) or "404" in str(e)):
+                return self.fetch_osv_account_subconto(period_start, period_end, account_code, with_org=False)
+            logger.error(f"Ошибка загрузки счета {account_code}: {e}")
+            records = []
         except Exception as e:
             logger.error(f"Ошибка загрузки счета {account_code}: {e}")
             records = []
@@ -297,6 +340,11 @@ class OneCClient:
         import calendar
         start = pd.to_datetime(period_start, errors="coerce")
         end = pd.to_datetime(period_end, errors="coerce")
+
+        if pd.isna(start) or pd.isna(end):
+            raise ValueError(
+                f"Не удалось распознать даты: start={period_start!r}, end={period_end!r}"
+            )
 
         cursor = start.normalize().replace(day=1, hour=0, minute=0, second=0)
         while cursor <= end:
@@ -396,7 +444,7 @@ class OneCClient:
                         if not det_df.empty:
                             mask = agg_df["Счет"] == acc_str
                             if mask.any():
-                                det_df["Тип"] = agg_df[mask]["Тип"].tolist()[0]
+                                det_df["Тип"] = agg_df.loc[mask, "Тип"].iat[0]
                             frames.append(det_df)
                         else:
                             frames.append(agg_df[agg_df["Счет"] == acc_str])

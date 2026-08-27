@@ -93,7 +93,7 @@ def test_fetch_osv_endpoint_and_schema():
     assert row["Счет"] == "60"
     assert row["Тип"] == "AP"
     assert row["Субконто"] == "-"
-    assert row["Период"] == "2026-06-30T23:59:59"
+    assert row["Период"] == "2026-06-30"
     assert row["НачалоДебет"] == pytest.approx(0.0)
     assert row["НачалоКредит"] == pytest.approx(1000.0)
     assert row["ОборотДебет"] == pytest.approx(500.0)
@@ -244,7 +244,7 @@ def test_fetch_osv_monthly_two_months():
 
     assert list(df.columns) == OSV_COLUMNS
     assert len(df) == 2
-    assert set(df["Период"]) == {"2026-01-31T23:59:59", "2026-02-28T23:59:59"}
+    assert set(df["Период"]) == {"2026-01-31", "2026-02-28"}
     assert set(df["Счет"]) == {"60", "51"}
     assert any(jan_ep in url for url, _, _ in session.calls)
 
@@ -262,7 +262,7 @@ def test_fetch_osv_monthly_partial_last_month():
     df = client.fetch_osv_monthly("2026-03-01T00:00:00", "2026-03-15T23:59:59")
 
     assert len(df) == 1
-    assert df.iloc[0]["Период"] == "2026-03-15T23:59:59"
+    assert df.iloc[0]["Период"] == "2026-03-15"
 
 
 def test_fetch_osv_monthly_empty_range():

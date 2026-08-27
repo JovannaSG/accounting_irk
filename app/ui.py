@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import traceback
@@ -331,31 +332,26 @@ def find_result_safe(
     target_period: str | None = None
 ) -> dict | None:
     """
-    Безопасный поиск результата аудита по Базе и Периоду без использования for
+    Безопасный поиск результата аудита по Базе и Периоду без использования for.
+    Возвращает последнее (свежее) совпадение (LIFO).
     """
 
-    i: int = 0
-    length: int = len(history)
+    i: int = len(history) - 1
 
-    while i < length:
+    while i >= 0:
         res = history[i]
 
-        # Проверяем совпадение по имени базы
         if res.get("db_name") == target_base:
 
-            # Если период передан и он не пустой/прочерк,
-            # проверяем точное совпадение
             if target_period is not None and target_period != "—":
                 res_period = str(res.get("period", ""))
 
                 if res_period == target_period:
                     return res
             else:
-                # Если период не важен (режим "За период в целом"),
-                # возвращаем первое совпадение по базе
                 return res
 
-        i += 1
+        i -= 1
 
     return None
 
@@ -377,7 +373,9 @@ def _render_dashboard(history: list[dict]) -> None:
         key="btn_reset_dash",
         use_container_width=True
     ):
-        keys_to_del = ["audit", "audit_history", "dashboard_df"]
+        st.session_state["audit_history"] = []
+
+        keys_to_del = ["audit", "dashboard_df"]
         i = 0
         while i < len(keys_to_del):
             st.session_state.pop(keys_to_del[i], None)
@@ -523,7 +521,7 @@ def _render_dashboard(history: list[dict]) -> None:
 st.sidebar.header("📥 Загрузка данных")
 data_source = st.sidebar.radio(
     "Источник данных",
-    ["📁 Файл (CSV/XLS/XLSX/HTML)", "☁️ 1С:Фреш (OData)"],
+    ["📁 Файл (CSV/XLS/XLSX/HTML)", "☁️ 1С:Фреш (OData)", "🚀 Аудит всех баз"],
     key="data_source",
 )
 use_mock = st.sidebar.button("Использовать тестовые данные", key="btn_mock")
@@ -531,6 +529,10 @@ use_mock = st.sidebar.button("Использовать тестовые данн
 osv_files: list = []
 docs_file = None
 fetch_api = False
+fetch_batch = False
+_batch_entries: list = []
+batch_user = ""
+batch_pass = ""
 api_url = ""
 api_user = ""
 api_pass = ""
@@ -559,7 +561,7 @@ if data_source.startswith("📁"):
             "Колонка «Назначение» включает NLP-проверку формулировок платежей (115-ФЗ)."
         ),
     )
-else:
+elif data_source.startswith("☁️"):
     # Источник 1С:Фреш всегда один аудит — режим нескольких файлов не применяется
     merge_mode = "Объединить в одну базу"
     with st.sidebar.expander("🔑 Доступ к 1С:Фреш", expanded=True):
@@ -583,6 +585,45 @@ else:
     api_start = c1.date_input("Период с", value=date(date.today().year, 1, 1), key="api_start")
     api_end = c2.date_input("Период по", value=date.today(), key="api_end")
     fetch_api = st.sidebar.button("📡 Загрузить ОСВ из 1С", type="primary", key="btn_fetch")
+
+elif data_source.startswith("🚀"):
+    merge_mode = "Объединить в одну базу"
+
+    _BATCH_JSON_PATH = os.path.join(_PROJECT_ROOT, "client_databases.json")
+
+    if not os.path.exists(_BATCH_JSON_PATH):
+        st.sidebar.error(
+            "Файл client_databases.json не найден в корне проекта. "
+            "Создайте его с списком баз."
+        )
+    else:
+        try:
+            with open(_BATCH_JSON_PATH, encoding="utf-8") as _f:
+                _batch_entries = json.load(_f)
+        except (json.JSONDecodeError, OSError) as _exc:
+            st.sidebar.error(f"Ошибка чтения JSON: {_exc}")
+            _batch_entries = []
+
+        if _batch_entries:
+            st.sidebar.caption(f"Найдено баз: {len(_batch_entries)}")
+            with st.sidebar.expander("Список баз", expanded=False):
+                i = 0
+                while i < len(_batch_entries):
+                    st.write(f"{i + 1}. {_batch_entries[i].get('name', '?')}")
+                    i += 1
+
+        # МЫ УДАЛИЛИ ВВОД БАЗОВОГО ЛОГИНА И ПАРОЛЯ ОТСЮДА!
+        # Оставляем только выбор дат.
+
+        c1, c2 = st.sidebar.columns(2)
+        api_start = c1.date_input("Период с", value=date(date.today().year, 1, 1), key="api_start")
+        api_end = c2.date_input("Период по", value=date.today(), key="api_end")
+
+        fetch_batch = st.sidebar.button(
+            "📡 Загрузить все базы",
+            type="primary",
+            key="btn_fetch_batch",
+        )
 
 with st.sidebar.expander("⚙️ Настройки проверок"):
     st.markdown("**Проверки ТЗ**")
@@ -704,6 +745,86 @@ if fetch_api:
         st.code(traceback.format_exc(), language="python")
         st.stop()
 
+if fetch_batch and _batch_entries:
+    batch_loaded: list = []
+    skipped: list[str] = []
+    total = len(_batch_entries)
+    progress_bar = st.progress(0, text="Загрузка...")
+
+    start_s = api_start.strftime("%Y-%m-%dT00:00:00")
+    end_s = api_end.strftime("%Y-%m-%dT23:59:59")
+
+    i: int = 0
+    while i < total:
+        entry = _batch_entries[i]
+        name = entry.get("name", f"База {i + 1}")
+        url = (entry.get("url") or "").strip()
+
+        # БЕРЕМ ДОСТУПЫ СТРОГО ИЗ JSON
+        # (Используем get("user"), если вдруг вы назвали ключ user вместо login)
+        login = (entry.get("login") or entry.get("user") or "").strip()
+        password = (entry.get("password") or entry.get("pass") or "").strip()
+
+        progress_bar.progress(
+            i / total,
+            text=f"{i}/{total}: {name}",
+        )
+
+        if not url or not login or not password:
+            skipped.append(f"{name} (в JSON нет URL, логина или пароля)")
+            i += 1
+            continue
+
+        try:
+            client = OneCClient(url, login, password)
+            df = client.fetch_osv_monthly(start_s, end_s)
+            orgs = OneCClient.extract_organizations(df)
+            if len(orgs) > 1:
+                for org in orgs:
+                    org_df = df[df["Организация"] == org].copy()
+                    batch_loaded.append({
+                        "name": f"{name} — {org}",
+                        "df": org_df,
+                        "info": {
+                            "title": "ОСВ (1С:Фреш)",
+                            "period": f"{api_start} — {api_end}",
+                            "organization": org,
+                            "url": url,
+                            "user": login,
+                            "start_s": start_s,
+                            "end_s": end_s,
+                        },
+                    })
+            else:
+                batch_loaded.append({
+                    "name": name,
+                    "df": df,
+                    "info": {
+                        "title": "ОСВ (1С:Фреш)",
+                        "period": f"{api_start} — {api_end}",
+                        "organization": "",
+                        "url": url,
+                        "user": login,
+                        "start_s": start_s,
+                        "end_s": end_s,
+                    },
+                })
+        except Exception as exc:
+            skipped.append(f"{name}: {exc}")
+
+        i += 1
+
+    progress_bar.progress(1.0, text=f"Готово: загружено датасетов {len(batch_loaded)} (из {total} баз)")
+    st.session_state["batch_datasets"] = batch_loaded
+
+    if skipped:
+        st.warning(
+            f"Пропущены ({len(skipped)}): "
+            + ", ".join(skipped)
+        )
+    if batch_loaded:
+        st.success(f"Загружено датасетов: {len(batch_loaded)} (из {total} баз)")
+
 try:
     if use_mock:
         st.session_state["mock_data"] = {
@@ -736,16 +857,36 @@ try:
         documents = None
         source_info = st.session_state.get("api_meta", {})
         db_name = st.session_state.get("api_db_name", api_url.strip())
-        datasets_to_process.append(
-            {
-                "name": db_name,
-                "df": balances,
-                "info": source_info
-            }
+        orgs = OneCClient.extract_organizations(balances)
+        if len(orgs) > 1:
+            for org in orgs:
+                org_df = balances[balances["Организация"] == org].copy()
+                datasets_to_process.append(
+                    {
+                        "name": f"{db_name} — {org}",
+                        "df": org_df,
+                        "info": {**source_info, "organization": org},
+                    }
+                )
+        else:
+            datasets_to_process.append(
+                {
+                    "name": db_name,
+                    "df": balances,
+                    "info": source_info
+                }
+            )
+
+    elif data_source.startswith("🚀") and "batch_datasets" in st.session_state:
+        datasets_to_process = st.session_state["batch_datasets"]
+        balances = pd.concat(
+            [ds["df"] for ds in datasets_to_process], ignore_index=True
         )
+        documents = None
+        source_info = {"title": f"Массовый аудит ({len(datasets_to_process)} баз)"}
 
     elif data_source.startswith("📁") and osv_files:
-        if merge_mode == "Объединить в одну базу":
+        if merge_mode.startswith("Объединить"):
             all_b: list = []
             for f in osv_files:
                 d_df, info = load_osv_file(
@@ -808,6 +949,8 @@ except (ValueError, OSError) as exc:
 if not datasets_to_process:
     if data_source.startswith("☁️"):
         st.info("👈 Введите доступ к 1С:Фреш и нажмите «📡 Загрузить ОСВ из 1С» в панели слева.")
+    elif data_source.startswith("🚀"):
+        st.info("👈 Нажмите «📡 Загрузить все базы» в панели слева.")
     else:
         st.info("👈 Загрузите файл(ы) ОСВ (CSV/XLS/XLSX/HTML) или нажмите «Использовать тестовые данные» в панели слева.")
     st.stop()
@@ -818,22 +961,20 @@ if source_info.get("title") or source_info.get("organization"):
         f"{(' | Орг.: ' + source_info['organization']) if source_info.get('organization') else ''}"
     )
 
+if data_source.startswith("🚀"):
+    st.caption(
+        "⚠️ В массовом режиме реестр документов (проверка 4.5) не загружается."
+    )
+
 # Подготовка списков для фильтров
-unique_periods = balances["Период"].dropna().unique().tolist()
-periods = []
-i = 0
-while i < len(unique_periods):
-    if unique_periods[i] != "":
-        periods.append(unique_periods[i])
-    i += 1
-periods = sorted(periods)
-periods.insert(0, "")
+unique_periods = [p for p in balances["Период"].dropna().unique().tolist() if p != ""]
+periods = sorted(unique_periods)
 
 selected_periods = st.sidebar.multiselect(
     "Период проверки",
     options=periods,
     default=periods,
-    format_func=lambda p: p or "— без периода —"
+    key="selected_periods",
 )
 
 period_mode = st.sidebar.radio(
@@ -911,20 +1052,7 @@ while i < len(checks_data):
         checks.add(checks_data[i][0])
     i += 1
 
-# ============ Исходные данные ============
-st.subheader("📊 Исходные данные (Оборотно-сальдовая ведомость)")
-mask = balances["Период"].isin(selected_periods)
-filtered = balances[mask]
-
-# Отображаем в UI предпросмотр уже с учетом выбранного режима аудита
-if audit_mode == "По счетам" and target_accounts:
-    filtered = filtered[filtered["Счет"].astype(str).isin(target_accounts)]
-elif audit_mode == "По контрагенту" and target_subcontos:
-    filtered = filtered[filtered["Субконто"].astype(str).isin(target_subcontos)]
-
-st.dataframe(filtered, width="stretch", hide_index=True)
-
-if filtered.empty:
+if balances[balances["Период"].isin(selected_periods)].empty:
     st.warning("Выбранные фильтры не содержат данных.")
     st.stop()
 
@@ -963,25 +1091,37 @@ if st.button("🚀 Запустить Аудит", type="primary", key="btn_audi
         "target_subcontos": target_subcontos,
     }
 
-    try:
-        with st.spinner("Анализируем данные..."):
-            # Инициализируем историю, если она еще не загружена из БД
-            history = st.session_state.setdefault(
-                "audit_history",
-                load_audit_history()
-            )
+    with st.spinner("Анализируем данные..."):
+        # Инициализируем историю, если она еще не загружена из БД
+        history = st.session_state.setdefault(
+            "audit_history",
+            load_audit_history()
+        )
 
-            for ds in datasets_to_process:
-                current_balances = ds["df"]
-                current_db_name = ds["name"]
-                current_info = ds["info"]
+        for ds in datasets_to_process:
+            current_balances = ds["df"]
+            current_db_name = ds["name"]
+            current_info = ds["info"]
 
-                real_periods = [p for p in selected_periods if p]
+            # ПЕРЕНОСИМ TRY ВНУТРЬ ЦИКЛА
+            try:
+                # В массовом режиме selected_periods объединяет все базы;
+                # оставляем только периоды, которые реально есть в текущей базе.
+                ds_period_values = set(current_balances["Период"].values)
+                ds_selected = [p for p in selected_periods if p in ds_period_values]
+
+                iter_options = dict(options)
+                iter_options["periods"] = ds_selected
+                ds_org = current_info.get("organization")
+                if ds_org:
+                    iter_options["organization"] = ds_org
+
+                real_periods = [p for p in ds_selected if p]
                 if period_mode == "📅 По месяцам" and real_periods:
                     i = 0
                     while i < len(real_periods):
                         p = real_periods[i]
-                        opt_copy = dict(options)
+                        opt_copy = dict(iter_options)
                         opt_copy["periods"] = [p]
 
                         res = _run_audit_local(
@@ -998,7 +1138,7 @@ if st.button("🚀 Запустить Аудит", type="primary", key="btn_audi
                 else:
                     res = _run_audit_local(
                         current_balances, doc_filtered,
-                        options, current_db_name,
+                        iter_options, current_db_name,
                         current_info
                     )
                     history.append(res)
@@ -1006,9 +1146,11 @@ if st.button("🚀 Запустить Аудит", type="primary", key="btn_audi
                     save_audit_log(res)
                     st.session_state["audit"] = res
 
-    except Exception as exc:
-        st.error(f"Ошибка при выполнении проверки: {exc}")
-        st.code(traceback.format_exc(), language="python")
+            except Exception as exc:
+                # Если база пустая или сломалась, просто выводим предупреждение
+                # и продолжаем цикл (переходим к следующей базе)
+                st.warning(f"⚠️ Пропущена база '{current_db_name}': {exc}")
+                continue
 
 #                           ========== ВЫВОД РЕЗУЛЬТАТОВ И СРАВНЕНИЕ ==========
 # При старте приложения подтягиваем историю из БД
@@ -1067,12 +1209,12 @@ if history:
 
                 st.success(f"**Исправлено ошибок:** {len(res['resolved'])}")
                 if not res["resolved"].empty:
-                    st.dataframe(res["resolved"], width=True)
+                    st.dataframe(res["resolved"], width="stretch")
 
                 st.error(f"⚠️ **Новые ошибки (появились):** {len(res['new'])}")
                 if not res["new"].empty:
-                    st.dataframe(res["new"], width=True)
+                    st.dataframe(res["new"], width="stretch")
 
                 st.warning(f"⏳ **Остались без изменений:** {len(res['pending'])}")
                 if not res["pending"].empty:
-                    st.dataframe(res["pending"], width=True)
+                    st.dataframe(res["pending"], width="stretch")
