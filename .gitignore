@@ -10,6 +10,7 @@ data/examples/
 .app.lock
 audit_history.db
 .ruff_cache
+client_databases.json
 
 /*.xls
 /*.xlsx

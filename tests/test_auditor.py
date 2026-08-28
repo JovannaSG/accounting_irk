@@ -977,3 +977,104 @@ def test_collapse_ml_keeps_raw_subaccount():
     jump = [e for e in errors if "ML: резкий скачок оборотов" in e["title"]]
     assert jump
     assert any(str(c).startswith("51.01") for c in jump[0]["data"]["Счет"])
+
+
+def test_unclosed_month_end_nets_parent_subaccounts():
+    """Закрываемые счета проверяются по родителю: субсчета 90.01/90.02, дающие
+    в сумме ноль, не считаются ошибкой. Реально незакрытый родитель — находится."""
+    # 90.01 и 90.02 уравновешивают друг друга → родитель 90 закрыт, ошибки нет
+    df = osv([
+        ["2026-02-28", "90.01", "Выручка", "P", 0, 0, 0, 0, 0, 45000],
+        ["2026-02-28", "90.02", "Себестоимость", "A", 0, 0, 0, 0, 45000, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    errors = auditor.run_audit()
+    assert not [e for e in errors if "закрываемые счета" in e["title"]]
+
+    # Только 90.01 → родитель 90 реально не закрыт, и это ошибка
+    df2 = osv([
+        ["2026-01-31", "90.01", "Выручка", "P", 0, 0, 0, 0, 0, 45000],
+        ["2026-02-28", "90.01", "Выручка", "P", 0, 0, 0, 0, 0, 45000],
+    ])
+    auditor2 = AutoAuditor1C(df2)
+    errors2 = auditor2.run_audit()
+    unclosed = [e for e in errors2 if "закрываемые счета" in e["title"]]
+    assert len(unclosed) == 1
+    assert list(unclosed[0]["data"]["Счет"]) == ["90"]
+    assert unclosed[0]["amount"] == pytest.approx(45000)
+    assert "остаток с 31.01.2026" in unclosed[0]["data"].iloc[0]["Комментарий"]
+
+
+def test_settlement_split_only_same_contract():
+    """Аванс и долг по одному контрагенту, но на РАЗНЫХ договорах — не ошибка.
+    Ошибка — только если они висят на одном договоре."""
+    cols = ["Период", "Счет", "Субконто", "Тип", "НачалоДебет", "НачалоКредит",
+            "ОборотДебет", "ОборотКредит", "КонецДебет", "КонецКредит", "Договор"]
+    # Разные договоры: 60.01 долг на Дог1, 60.02 аванс на Дог2 → нет warning
+    df = pd.DataFrame([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", 0, 0, 0, 0, 20065, 0, "Дог1"],
+        ["2026-02-28", "60.02", "ООО Ромашка", "AP", 0, 0, 0, 0, 0, 22378, "Дог2"],
+    ], columns=cols)
+    errors = AutoAuditor1C(df).run_audit()
+    assert not [e for e in errors if "по разным счетам" in e["title"]]
+
+    # Один договор: долг и аванс вместе → warning (сумма модулей, без сальдирования)
+    df2 = pd.DataFrame([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", 0, 0, 0, 0, 20065, 0, "Дог1"],
+        ["2026-02-28", "60.02", "ООО Ромашка", "AP", 0, 0, 0, 0, 0, 22378, "Дог1"],
+    ], columns=cols)
+    errors2 = AutoAuditor1C(df2).run_audit()
+    split = [e for e in errors2 if "по разным счетам" in e["title"]]
+    assert len(split) == 1
+    row = split[0]["data"].iloc[0]
+    assert row["Счет"] == "60"
+    assert row["Сумма"] == pytest.approx(20065 + 22378)
+    assert "по одному договору" in row["Комментарий"]
+
+
+def test_comment_injects_subaccount_before_collapse():
+    """После схлопывания субсчёта в родительский в комментарий вписывается
+    точный субсчёт (58.03), чтобы было видно, где именно ошибка."""
+    df = osv([
+        ["2026-02-28", "58.03", "Займ Иванову", "A", 0, 0, 0, 0, 0, 50000],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance"})
+    errors = auditor.run_audit()
+    red = [e for e in errors if "Красное сальдо" in e["title"]]
+    assert len(red) == 1
+    row = red[0]["data"].iloc[0]
+    assert row["Счет"] == "58"                      # субсчет схлопнут в родителя
+    assert "(на субсчете 58.03)" in row["Комментарий"]
+
+
+def test_comment_injection_skipped_when_no_subaccount():
+    """Родительский счёт без точки не получает вставки субсчёта."""
+    df = osv([
+        ["2026-02-28", "50", "Касса", "A", 0, 0, 0, 0, 0, 100],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance"})
+    errors = auditor.run_audit()
+    red = [e for e in errors if "Красное сальдо" in e["title"]]
+    row = red[0]["data"].iloc[0]
+    assert "на субсчете" not in row["Комментарий"]
+
+
+def test_comment_join_multiple_subaccounts_with_pipe():
+    """Разные субсчета одного родителя (один и тот же аналитика-субконто) с разными
+    текстами ошибок объединяются через " | ", и каждый субсчет вписан в комментарий."""
+    df = osv([
+        ["2026-02-28", "51.01", "Расчетный", "A", 0, 0, 0, 0, 0, 45000],
+        ["2026-02-28", "51.02", "Расчетный", "A", 0, 0, 0, 0, 0, 30000],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance"})
+    errors = auditor.run_audit()
+    red = [e for e in errors if "Красное сальдо" in e["title"]]
+    assert len(red) == 1
+    data = red[0]["data"]
+    assert len(data) == 1                      # один и тот же субконто -> одна строка
+    row = data.iloc[0]
+    assert row["Счет"] == "51"
+    comments = row["Комментарий"]
+    assert "(на субсчете 51.01)" in comments
+    assert "(на субсчете 51.02)" in comments
+    assert " | " in comments
