@@ -25,11 +25,12 @@ DASHBOARD_COLUMNS: list[str] = [
 
 _DASH: str = "—"  # пустая ячейка вместо пустого списка
 
-# Три блока детальной панели дашборда: маркеры заголовков проверок.
+# Четыре блока детальной панели дашборда: маркеры заголовков проверок.
 BLOCK_RULES: dict[str, list[str]] = {
     "red": ["Красное сальдо"],
     "unclosed": ["Незакрытое сальдо", "Зависшее сальдо", "Контроль групп"],
     "expanded": ["Развернутое сальдо"],
+    "settlements": ["Контрагенты"],
 }
 
 
@@ -91,6 +92,14 @@ def accounts_list(df: pd.DataFrame | None) -> list[str]:
     return sorted(seen)
 
 
+def _split_codes(cell: str) -> list[str]:
+    """
+    Разбивает составную ячейку счета («60.01, 60.02») на отдельные коды
+    """
+
+    return [p.strip() for p in str(cell).replace(";", ",").split(",") if p.strip()]
+
+
 def _collect_accounts(details: pd.DataFrame) -> dict[str, list[str]]:
     """
     Разбивает строки нарушений по типам проверок.
@@ -99,7 +108,7 @@ def _collect_accounts(details: pd.DataFrame) -> dict[str, list[str]]:
       "Сальдо красным, счет"          -> счета (красное сальдо);
       "Развернутое сальдо, счет"      -> счета (развернутое сальдо);
       "Не закрыт период, счет, период"-> "счет, период";
-      "Не закрыты документами, счет"  -> счета (расчеты не закрыты документами).
+      "Не закрыты документами, счет"  -> счета (все проверки по контрагентам).
     """
 
     result: dict[str, list[str]] = {}
@@ -120,8 +129,10 @@ def _collect_accounts(details: pd.DataFrame) -> dict[str, list[str]]:
                 result["Сальдо красным, счет"].append(acc)
             elif "Развернутое сальдо" in title:
                 result["Развернутое сальдо, счет"].append(acc)
-            elif "документами" in title or "расчеты" in title:
-                result["Не закрыты документами, счет"].append(acc)
+            elif "Контрагенты" in title:
+                # Все проверки раздела 4.5 (аванс+долг, незакрытые расчеты,
+                # расхождение документов и ОСВ); составные ячейки дробим
+                result["Не закрыты документами, счет"].extend(_split_codes(acc))
             elif (
                 "Незакрытое сальдо" in title
                 or "Зависшее сальдо" in title

@@ -78,6 +78,19 @@ def test_master_row_unclosed_documents():
     assert row["Не закрыты документами, счет"] == "60.01"
 
 
+def test_master_row_all_counterparty_checks_and_split():
+    r = result(rows=[
+        ["60.02, 62.02", "Контрагенты: аванс и долг одновременно по разным счетам (ОСВ)", "", "warning", 7.0],
+        ["60.01", "Контрагенты: расхождение документов и остатков ОСВ", "", "error", 8.0],
+        ["51", "Красное сальдо: активный счет с кредитовым остатком", "2026-01-31", "error", 1.0],
+    ])
+    row = build_master_row(r)
+    values = set(row["Не закрыты документами, счет"].split(", "))
+    assert values == {"60.01", "60.02", "62.02"}
+    # Красное сальдо не перетекает в контрагентскую колонку
+    assert row["Сальдо красным, счет"] == "51"
+
+
 def test_master_row_ignores_ml_and_000_maps_to_unclosed():
     r = result(rows=[
         ["60.01", "ML: возможные дубли контрагентов", "2026-01-31", "warning", 0.0],
@@ -143,6 +156,7 @@ def test_block_dfs_splits_by_check_type():
         ["20", "Зависшее сальдо (не меняется между периодами)", "2026-02-28", "warning", 4.0],
         ["000", "Незакрытое сальдо на счете 000", "2026-01-31", "error", 5.0],
         ["60.01", "Контрагенты: расчеты не закрыты документами", "2026-01-31", "error", 6.0],
+        ["62.01, 62.02", "Контрагенты: аванс и долг одновременно по разным счетам (ОСВ)", "", "warning", 7.0],
         ["60.01", "ML: возможные дубли контрагентов", "2026-01-31", "warning", 0.0],
     ])
     blocks = block_dfs(d)
@@ -150,26 +164,30 @@ def test_block_dfs_splits_by_check_type():
     assert set(accounts_list(blocks["red"])) == {"51"}
     assert set(accounts_list(blocks["expanded"])) == {"60.01"}
     assert set(accounts_list(blocks["unclosed"])) == {"000", "20", "90.01"}
+    # Блок 4 собирает все проверки 4.5 (составные ячейки дробит мастер-таблица)
+    assert set(accounts_list(blocks["settlements"])) == {"60.01", "62.01, 62.02"}
 
-    # 4.5 и ML-дубли в блоки не попадают
+    # ML-дубли в блоки не попадают
     all_block_rows = (
-        len(blocks["red"]) + len(blocks["expanded"]) + len(blocks["unclosed"])
+        len(blocks["red"]) + len(blocks["expanded"])
+        + len(blocks["unclosed"]) + len(blocks["settlements"])
     )
-    assert all_block_rows == 5
+    assert all_block_rows == 7
     assert len(blocks["red"]["Счет"]) == 1
     assert len(blocks["expanded"]["Счет"]) == 1
     assert len(blocks["unclosed"]["Счет"]) == 3
+    assert len(blocks["settlements"]["Счет"]) == 2
 
 
 def test_block_dfs_empty_details():
     blocks = block_dfs(pd.DataFrame(columns=["Счет", "Проверка", "Период"]))
-    for block in ("red", "unclosed", "expanded"):
+    for block in ("red", "unclosed", "expanded", "settlements"):
         assert blocks[block].empty
 
 
 def test_block_dfs_missing_column():
     blocks = block_dfs(pd.DataFrame({"a": [1]}))
-    for block in ("red", "unclosed", "expanded"):
+    for block in ("red", "unclosed", "expanded", "settlements"):
         assert blocks[block].empty
 
 

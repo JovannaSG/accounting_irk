@@ -104,7 +104,9 @@ def test_load_corrupt_json(tmp_db):
     conn = sqlite3.connect(tmp_db)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO audits VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO audits (audit_id, db_name, accountant, viewed_at, "
+        "status, status_label, total_flags, details_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         ("bad-001", "База", "", "12.08.2026", "ok", "OK", 0, "NOT_JSON{{{"),
     )
     conn.commit()
@@ -122,3 +124,113 @@ def test_db_uses_tmp_path(tmp_db):
 
     # Убеждаемся, что БД успешно создалась по переданному временному пути
     assert os.path.exists(tmp_db)
+
+
+# ── 8. Находки и реквизиты сохраняются, экспорт работает из истории ──
+
+def _errors_payload() -> list:
+    return [
+        {
+            "title": "Незакрытое сальдо на конец месяца (закрываемые счета)",
+            "level": "error",
+            "amount": 5000.0,
+            "data": [{
+                "Период": "2026-01-31", "Счет": "50", "Субконто": "-",
+                "КонецДебет": 0.0, "КонецКредит": 5000.0,
+                "Сумма": 5000.0, "Комментарий": "тест",
+            }],
+        },
+    ]
+
+
+def test_findings_roundtrip_and_export(tmp_db):
+
+    result = _sample_result()
+    result["meta"] = {"organization": "ООО Тест", "period": "Январь"}
+    result["errors"] = _errors_payload()
+    db_mod.save_audit_log(result)
+
+    history = db_mod.load_audit_history()
+    entry = history[0]
+    assert entry["errors"][0]["title"].startswith("Незакрытое сальдо")
+    assert entry["meta"]["organization"] == "ООО Тест"
+
+    auditor = db_mod.rebuild_auditor(entry)
+    assert auditor is not None
+    assert len(auditor.errors) == 1
+    # Экспорт из восстановленного аудитора
+    assert auditor.to_excel().startswith(b"PK")
+    assert auditor.to_pdf().startswith(b"%PDF")
+
+
+def test_rebuild_from_legacy_details_only(tmp_db):
+    from core.auditor import AutoAuditor1C  # noqa: F401 — проверка типа
+
+    # Старая запись: только details_json, без findings_json/meta_json
+    result = _sample_result()
+    db_mod.save_audit_log(result)
+    history = db_mod.load_audit_history()
+    entry = history[0]
+    assert "errors" not in entry
+
+    auditor = db_mod.rebuild_auditor(entry)
+    assert isinstance(auditor, AutoAuditor1C)
+    assert [e["title"] for e in auditor.errors] == ["Красное сальдо"]
+    assert auditor.errors[0]["data"].iloc[0]["КонецКредит"] == 500.0
+    assert auditor.to_pdf().startswith(b"%PDF")
+
+
+def test_rebuild_returns_none_without_data(tmp_db):
+    result = _sample_result()
+    result["details"] = pd.DataFrame()
+    result["errors"] = []
+    db_mod.save_audit_log(result)
+    entry = db_mod.load_audit_history()[0]
+    assert db_mod.rebuild_auditor(entry) is None
+
+
+# ── 9. Пользователь запуска в журнале (ТЗ §11) ──
+
+def test_save_load_user(tmp_db):
+    result = _sample_result()
+    result["user"] = "auditor"
+    db_mod.save_audit_log(result)
+    entry = db_mod.load_audit_history()[0]
+    assert entry["user"] == "auditor"
+
+
+def test_user_missing_in_old_style_record(tmp_db):
+    result = _sample_result()
+    db_mod.save_audit_log(result)
+    entry = db_mod.load_audit_history()[0]
+    assert "user" not in entry
+
+
+def test_migration_adds_user_column(tmp_db):
+    # БД старого образца: без findings_json/meta_json/user
+    conn = sqlite3.connect(tmp_db)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE audits (
+            audit_id TEXT PRIMARY KEY,
+            db_name TEXT,
+            accountant TEXT,
+            viewed_at TEXT,
+            status TEXT,
+            status_label TEXT,
+            total_flags INTEGER,
+            details_json TEXT
+        )
+    """)
+    cursor.execute(
+        "INSERT INTO audits VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("old-001", "Старая база", "", "01.08.2026", "ok", "ОК", 0, None),
+    )
+    conn.commit()
+    conn.close()
+
+    db_mod.init_db()
+    history = db_mod.load_audit_history()
+    assert len(history) == 1
+    assert history[0]["audit_id"] == "old-001"
+    assert "user" not in history[0]

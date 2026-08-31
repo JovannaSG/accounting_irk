@@ -16,3 +16,5 @@ Dockerfile
 docker-compose.yml
 login_data.txt
 audit_history.db
+.ruff_cache
+t.py

@@ -7,10 +7,6 @@
   4.3 Незакрытое сальдо на конец месяца
   4.4 Остатки на счете 000
   4.5 Незакрытые расчеты с контрагентами
-
-Входные данные (ОСВ):  Период, Счет, Субконто, Тип, НачалоДебет, НачалоКредит,
-                        ОборотДебет, ОборотКредит, КонецДебет, КонецКредит
-Опционально (документы): Дата, Документ, Контрагент, Счет, Вид, Сумма
 """
 
 from __future__ import annotations
@@ -24,12 +20,17 @@ import pandas as pd
 
 from core import ml
 from core import nlp
+from core.formatting import fmt_date as _fmt_date
+from core.formatting import fmt_num as _fmt_num
+from core.formatting import fmt_rub as _fmt_rub
+from core.formatting import period_sort_series
 
 COLUMN_ALIASES: dict[str, list[str]] = {
     "Счет": ["Счет", "Счёт", "account", "schet"],
     "Субконто": ["Субконто", "sub_account", "Аналитика"],
     "Тип": ["Тип", "type"],
     "Период": ["Период", "period"],
+    "Организация": ["Организация", "organization", "company"],
     "НачалоДебет": ["НачалоДебет", "begin_debit", "НД", "start_debit"],
     "НачалоКредит": ["НачалоКредит", "begin_credit", "НК", "start_credit"],
     "ОборотДебет": ["ОборотДебет", "debit_turnover", "ОД"],
@@ -45,9 +46,7 @@ DOCUMENT_ALIASES: dict[str, list[str]] = {
     "Счет": ["Счет", "Счёт", "account"],
     "Вид": ["Вид", "type", "ВидОперации"],
     "Сумма": ["Сумма", "amount", "sum"],
-    "Назначение": [
-        "Назначение", "Назначение платежа", "НазначениеПлатежа", "purpose",
-    ],
+    "Назначение": ["Назначение", "Назначение платежа", "НазначениеПлатежа", "purpose"],
 }
 
 REQUIRED_OSV: list[str] = ["Счет", "Тип", "КонецДебет", "КонецКредит"]
@@ -58,13 +57,10 @@ NUMERIC_OSV: list[str] = [
 ]
 VALID_TYPES: set[str] = {"A", "P", "AP"}
 
-# Порог, ниже которого сумма считается нулевой (дроби при двойной записи).
 EPS: float = 1e-6
 
-# Канонический порядок колонок ОСВ (используется и в normalize_balances,
-# и в api_client.fetch_osv, чтобы схемы не расходились).
 OSV_COLUMNS: list[str] = [
-    "Период", "Счет", "Субконто", "Тип",
+    "Период", "Счет", "Субконто", "Тип", "Организация", "Договор",
     "НачалоДебет", "НачалоКредит", "ОборотДебет", "ОборотКредит",
     "КонецДебет", "КонецКредит",
 ]
@@ -72,7 +68,6 @@ OSV_COLUMNS: list[str] = [
 DEFAULT_CLOSING_ACCOUNTS: list[str] = ["25", "26", "44", "90", "91", "99"]
 SETTLEMENT_GROUPS: list[str] = ["60", "62", "76"]
 
-# Ключи проверок ТЗ для точечного включения (checks: Optional[set[str]]).
 CHECK_KEYS: dict[str, str] = {
     "red_balance": "4.1 Красное сальдо",
     "expanded_balance": "4.2 Развернутое сальдо",
@@ -81,70 +76,24 @@ CHECK_KEYS: dict[str, str] = {
     "settlements": "4.5 Незакрытые расчеты с контрагентами",
 }
 
-# Рекомендации по каждой находке (ТЗ п.13). Ключ — точный заголовок находки.
 RECOMMENDATIONS: dict[str, str] = {
-    "Красное сальдо: активный счет с кредитовым остатком": (
-        "Проверьте проводки по счету и корректность начальных остатков. "
-        "Отрицательный остаток по активному счету — признак ошибки в учете."
-    ),
-    "Развернутое сальдо по аналитике": (
-        "У одного контрагента/договора одновременно дебетовый и кредитовый остаток. "
-        "Проверьте, не требуется ли зачет аванса или сторнирование ошибочной проводки."
-    ),
-    "Незакрытое сальдо на конец месяца (закрываемые счета)": (
-        "Выполните регламентную операцию «Закрытие месяца»: списание расходов "
-        "и финансовых результатов. Остаток должен обнулиться."
-    ),
-    "Зависшее сальдо (не меняется между периодами)": (
-        "Остаток не меняется несколько периодов. Проверьте, не «повисли» ли "
-        "расчеты/сальдо, которые должны были закрыться."
-    ),
-    "Незакрытое сальдо на счете 000": (
-        "Служебный счет 000 должен быть закрыт после переноса остатков "
-        "или ввода начальных остатков. Проверьте корректность ввода остатков."
-    ),
-    "Контрагенты: аванс и долг одновременно по разным счетам (ОСВ)": (
-        "У контрагента одновременно долг (например 60.01) и аванс (60.02). "
-        "Рекомендуется провести зачет аванса против долга."
-    ),
-    "Контрагенты: развернутое сальдо на счетах расчетов (без реестра документов)": (
-        "По контрагенту есть одновременно дебетовый и кредитовый остаток. "
-        "Загрузите реестр документов для точной проверки или проведите зачет."
-    ),
-    "Контрагенты: расчеты не закрыты документами": (
-        "По контрагенту остались незакрытые расчеты: непогашенный долг, "
-        "незачтенный аванс или переплата. Проверьте полноту документов "
-        "и при необходимости проведите взаимозачет."
-    ),
-    "Контрагенты: расхождение документов и остатков ОСВ": (
-        "Сумма документов по контрагенту не сходится с остатком ОСВ. "
-        "Проверьте полноту выгрузки документов и корректность проводок."
-    ),
-    "ML: нетипичная сумма операции": (
-        "Сумма операции сильно отклоняется от обычных сумм по контрагенту. "
-        "Проверьте обоснованность операции и первичные документы."
-    ),
-    "ML: резкий скачок оборотов между периодами": (
-        "Обороты по счету резко изменились между периодами. Проверьте, "
-        "связано ли это с разовой операцией или с ошибкой в учете."
-    ),
-    "ML: возможные дубли контрагентов": (
-        "Обнаружены похожие названия контрагентов. Рекомендуется объединить "
-        "дубли в справочнике, чтобы не дробить расчеты."
-    ),
-    "NLP: подозрительные назначения платежей (115-ФЗ)": (
-        "Назначение платежа содержит формулировки с повышенным риском "
-        "(обнал, нетиповые переводы, займы без договора, расплывчатые "
-        "основания). Проверьте операцию и первичные документы."
-    ),
-    "Контроль групп счетов: незакрытые остатки": (
-        "Группа счетов (авансы, товары, денежные средства и т.п.) не закрыта "
-        "на конец периода. Проверьте корректность учета и регламентных операций."
-    ),
+    "Красное сальдо: активный счет с кредитовым остатком": "Проверьте проводки по счету и корректность начальных остатков.",
+    "Красное сальдо: пассивный счет с дебетовым остатком": "Проверьте проводки по счету. Дебетовый остаток на пассивном счете указывает на переплату или ошибку.",
+    "Развернутое сальдо по аналитике": "У одного контрагента одновременно дебетовый и кредитовый остаток. Проверьте зачет аванса.",
+    "Незакрытое сальдо на конец месяца (закрываемые счета)": "Выполните регламентную операцию «Закрытие месяца».",
+    "Зависшее сальдо (не меняется между периодами)": "Проверьте, не «повисли» ли расчеты, которые должны были закрыться.",
+    "Незакрытое сальдо на счете 000": "Служебный счет 000 должен быть закрыт. Проверьте корректность ввода остатков.",
+    "Контрагенты: аванс и долг одновременно по разным счетам (ОСВ)": "У контрагента одновременно долг и аванс. Рекомендуется провести зачет аванса.",
+    "Контрагенты: развернутое сальдо на счетах расчетов (без реестра документов)": "По контрагенту есть дебетовый и кредитовый остаток.",
+    "Контрагенты: расчеты не закрыты документами": "По контрагенту остались незакрытые расчеты: непогашенный долг или переплата.",
+    "Контрагенты: расхождение документов и остатков ОСВ": "Сумма документов не сходится с остатком ОСВ.",
+    "ML: нетипичная сумма операции": "Сумма операции сильно отклоняется от обычных сумм по контрагенту.",
+    "ML: резкий скачок оборотов между периодами": "Обороты по счету резко изменились.",
+    "ML: возможные дубли контрагентов": "Обнаружены похожие названия контрагентов. Рекомендуется объединить дубли.",
+    "NLP: подозрительные назначения платежей (115-ФЗ)": "Назначение платежа содержит формулировки с повышенным риском.",
+    "Контроль групп счетов: незакрытые остатки": "Группа счетов не закрыта на конец периода.",
 }
 
-# Группы счетов для расширенного контроля 4.3 (включается balance_group_checks=True).
-# Код с точкой — конкретный субсчет (точное совпадение), код без точки — вся группа.
 GROUP_PRESETS: dict[str, list[str]] = {
     "Авансы выданные/полученные": ["60.02", "62.02", "76.АВ", "76.ВА"],
     "Расходы будущих периодов": ["97"],
@@ -154,24 +103,101 @@ GROUP_PRESETS: dict[str, list[str]] = {
 }
 
 DETAIL_COLUMNS: list[str] = [
-    "Проверка", "Уровень", "Период",
+    "Проверка", "Уровень", "Период", "Организация",
     "Счет", "Субконто", "Договор",
     "Дебет", "Кредит",
     "Сумма", "Комментарий"
 ]
 
+_LEVEL_ORDER: dict[str, int] = {"warning": 1, "error": 2}
+_LEVEL_RU: dict[str, str] = {"error": "Ошибка", "warning": "Предупреждение"}
+
+SECTION_SPECS: list[tuple[str, tuple[str, ...]]] = [
+    ("Закрытие месяца", (
+        "Незакрытое сальдо на конец месяца (закрываемые счета)",
+        "Зависшее сальдо (не меняется между периодами)",
+        "Незакрытое сальдо на счете 000",
+        "Контроль групп счетов: незакрытые остатки",
+    )),
+    ("Красное и развернутое сальдо", (
+        "Красное сальдо: активный счет с кредитовым остатком",
+        "Красное сальдо: пассивный счет с дебетовым остатком",
+        "Развернутое сальдо по аналитике",
+    )),
+    ("Расчеты с контрагентами", (
+        "Контрагенты: аванс и долг одновременно по разным счетам (ОСВ)",
+        "Контрагенты: развернутое сальдо на счетах расчетов (без реестра документов)",
+        "Контрагенты: расчеты не закрыты документами",
+        "Контрагенты: расхождение документов и остатков ОСВ",
+    )),
+    ("ML: нетипичные суммы операций", ("ML: нетипичная сумма операции",)),
+    ("ML: скачки оборотов между периодами", ("ML: резкий скачок оборотов между периодами",)),
+    ("ML: дубли контрагентов", ("ML: возможные дубли контрагентов",)),
+    ("NLP: подозрительные назначения платежей (115-ФЗ)", ("NLP: подозрительные назначения платежей (115-ФЗ)",)),
+]
+
+_RUB_PDF_COLUMNS: set[str] = {
+    "Дебет", "Кредит", "ОборотДебет", "ОборотКредит",
+    "Сумма", "Медиана", "НачалоДебет", "НачалоКредит",
+}
+_NUM_PDF_COLUMNS: set[str] = {"Отклонение", "Отношение", "Сходство"}
+_LEVEL_PDF_COLOR: dict[str, tuple[int, int, int]] = {
+    "error": (156, 0, 6),
+    "warning": (156, 101, 0),
+}
+
+_PDF_COL_STYLE: dict[str, tuple[float, str]] = {
+    "Проверка": (32, "LEFT"),
+    "Уровень": (14, "LEFT"),
+    "Период": (16, "LEFT"),
+    "Организация": (20, "LEFT"),
+    "Счет": (14, "LEFT"),
+    "Субконто": (26, "LEFT"),
+    "Дата": (16, "LEFT"),
+    "Документ": (20, "LEFT"),
+    "Контрагент": (24, "LEFT"),
+    "Вид": (13, "LEFT"),
+    "Дебет": (16, "RIGHT"),
+    "Кредит": (16, "RIGHT"),
+    "ОборотДебет": (17, "RIGHT"),
+    "ОборотКредит": (17, "RIGHT"),
+    "Сумма": (18, "RIGHT"),
+    "Медиана": (15, "RIGHT"),
+    "Отклонение": (15, "RIGHT"),
+    "Отношение": (15, "RIGHT"),
+    "Сходство": (15, "RIGHT"),
+    "Название А": (24, "LEFT"),
+    "Название Б": (24, "LEFT"),
+    "Комментарий": (46, "LEFT"),
+}
+
+_MONEY_COLUMNS: set[str] = {
+    "Дебет", "Кредит", "Сумма", "Медиана",
+    "НачалоДебет", "НачалоКредит",
+    "ОборотДебет", "ОборотКредит",
+}
+_EXCEL_MONEY_FORMAT = "#,##0.00"
+
+TOP_FINDINGS_LIMIT = 10
+AUDIT_LOGIC_VERSION = "1.2"
+
+_SHORT_PDF_LABELS: dict[str, str] = {
+    "Незакрытое сальдо на конец месяца (закрываемые счета)": "Сальдо не закрыто",
+    "Зависшее сальдо (не меняется между периодами)": "Зависшее сальдо",
+    "Незакрытое сальдо на счете 000": "Счет 000",
+    "Контроль групп счетов: незакрытые остатки": "Группа не закрыта",
+    "Красное сальдо: активный счет с кредитовым остатком": "Красное сальдо (А)",
+    "Красное сальдо: пассивный счет с дебетовым остатком": "Красное сальдо (П)",
+    "Развернутое сальдо по аналитике": "Развернутое сальдо",
+    "Контрагенты: аванс и долг одновременно по разным счетам (ОСВ)": "Аванс и долг",
+    "Контрагенты: развернутое сальдо на счетах расчетов (без реестра документов)": "Аванс и долг (без реестра)",
+    "Контрагенты: расчеты не закрыты документами": "Расчеты не закрыты",
+    "Контрагенты: расхождение документов и остатков ОСВ": "Расхождение с ОСВ",
+}
+
 
 @dataclass
 class Finding(Mapping):
-    """
-    Одна находка контрольной проверки.
-
-    Хранит результат проверки как пары «заголовок — таблица строк».
-    Совместим со словарным интерфейсом (e["title"], e["data"], ...),
-    который использовался изначально, но дает и атрибутный доступ
-    (finding.title) без риска опечаток в ключах.
-    """
-
     level: str
     title: str
     data: pd.DataFrame
@@ -188,11 +214,32 @@ class Finding(Mapping):
 
 
 def account_group(code: object) -> str:
+    return str(code).strip().split(".")[0]
+
+
+def _group_account_string(accounts_str: object) -> str:
     """
-    Группа счета: '60.01' -> '60'; '000' -> '000'
+    Переводит строку '60.01, 62.02' в '60, 62' (родительские счета без дублей)
     """
 
-    return str(code).strip().split(".")[0]
+    if pd.isna(accounts_str) or not str(accounts_str).strip():
+        return ""
+
+    codes: list = []
+    raw_codes = str(accounts_str).replace(";", ",").split(",")
+    for c in raw_codes:
+        stripped_c = c.strip()
+        # Только не пустые строки добавляем
+        if stripped_c:
+            codes.append(stripped_c)
+
+    unique_groups = set()
+    for c in codes:
+        parent_account = account_group(c)
+        unique_groups.add(parent_account)
+
+    grouped = sorted(unique_groups)
+    return ", ".join(grouped)
 
 
 def _rename_by_aliases(df: pd.DataFrame, aliases: dict) -> pd.DataFrame:
@@ -206,10 +253,6 @@ def _rename_by_aliases(df: pd.DataFrame, aliases: dict) -> pd.DataFrame:
 
 
 def normalize_balances(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Приводит ОСВ к канонической схеме и типам
-    """
-
     df = _rename_by_aliases(df, COLUMN_ALIASES).copy()
 
     missing = [c for c in REQUIRED_OSV if c not in df.columns]
@@ -233,17 +276,23 @@ def normalize_balances(df: pd.DataFrame) -> pd.DataFrame:
         if "Период" in df.columns
         else pd.Series("", index=df.index)
     ).astype(str).str.strip()
+    df["Организация"] = (
+        df["Организация"].fillna('-')
+        if "Организация" in df.columns
+        else pd.Series('-', index=df.index)
+    ).astype(str)
 
     bad_types = set(df["Тип"]) - VALID_TYPES
     if bad_types:
-        raise ValueError(f"Недопустимые значения Тип: {sorted(bad_types)}. Ожидаются: A, P, AP")
+        raise ValueError(f"Недопустимые значения Тип: {sorted(bad_types)}")
 
     for col in NUMERIC_OSV:
         if col in df.columns:
-            coerced = pd.to_numeric(df[col], errors="coerce")
-            invalid = df[col].notna() & coerced.isna()
+            clean_series = df[col].astype(str).str.strip().replace(["-", ""], "0")
+            coerced = pd.to_numeric(clean_series, errors="coerce")
+            invalid = clean_series.notna() & (clean_series != "nan") & coerced.isna()
             if invalid.any():
-                bad = df.loc[invalid, col].dropna().unique()[:5]
+                bad = clean_series.loc[invalid].dropna().unique()[:5]
                 raise ValueError(f"Колонка '{col}' содержит нечисловые значения: {list(bad)}")
             df[col] = coerced.fillna(0.0)
         else:
@@ -256,16 +305,9 @@ def normalize_balances(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def normalize_documents(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Приводит реестр документов к канонической схеме
-    """
-
     df = _rename_by_aliases(df, DOCUMENT_ALIASES).copy()
 
-    missing: list[str] = [
-        c
-        for c in ["Дата", "Контрагент", "Вид", "Сумма"] if c not in df.columns
-    ]
+    missing: list[str] = [c for c in ["Дата", "Контрагент", "Вид", "Сумма"] if c not in df.columns]
     if missing:
         raise ValueError(f"В файле документов отсутствуют колонки: {', '.join(missing)}")
 
@@ -278,17 +320,12 @@ def normalize_documents(df: pd.DataFrame) -> pd.DataFrame:
         df["Назначение"] = df["Назначение"].fillna("").astype(str).str.strip()
 
     if df["Сумма"].isna().any():
-        raise ValueError("Колонка 'Сумма' в документах содержит нечисловые значения")
+        raise ValueError("Колонка 'Сумма' содержит нечисловые значения")
 
     kind: dict[str, str] = {
-        "отгрузка": "отгрузка",
-        "реализация": "отгрузка",
-        "продажа": "отгрузка",
-        "оплата": "оплата",
-        "платеж": "оплата",
-        "платёж": "оплата",
-        "аванс": "аванс",
-        "предоплата": "аванс",
+        "отгрузка": "отгрузка", "реализация": "отгрузка", "продажа": "отгрузка",
+        "оплата": "оплата", "платеж": "оплата", "платёж": "оплата",
+        "аванс": "аванс", "предоплата": "аванс",
     }
     df["ВидНорм"] = df["Вид"].map(kind)
     df.loc[df["ВидНорм"].isna(), "ВидНорм"] = df.loc[df["ВидНорм"].isna(), "Вид"]
@@ -300,10 +337,6 @@ def normalize_documents(df: pd.DataFrame) -> pd.DataFrame:
 
 
 class AutoAuditor1C:
-    """
-    Выполняет контрольные проверки ОСВ по правилам из ТЗ
-    """
-
     def __init__(
         self,
         balances_df: pd.DataFrame,
@@ -312,6 +345,7 @@ class AutoAuditor1C:
         checks: set[str] | None = None,
         meta: dict | None = None,
         balance_group_checks: bool = False,
+        stuck_balance_checks: bool = False,
         ml_enabled: bool = False,
         nlp_enabled: bool = True,
         ml_amount_anomalies: bool = True,
@@ -348,46 +382,133 @@ class AutoAuditor1C:
         if checks is not None:
             unknown = set(checks) - set(CHECK_KEYS)
             if unknown:
-                raise ValueError(
-                    f"Неизвестные ключи проверок: {', '.join(sorted(unknown))}"
-                )
+                raise ValueError(f"Неизвестные ключи: {', '.join(sorted(unknown))}")
         self.balance_group_checks = balance_group_checks
+        self.stuck_balance_checks = stuck_balance_checks
         self.meta: dict = meta or {}
         self.errors: list[Finding] = []
 
-    #                          ============ Вспомогательные методы ============
     def _check_enabled(self, key: str) -> bool:
-        """
-        True, если проверка с данным ключом включена (по умолчанию все включены)
-        """
-
         if not CHECK_KEYS.get(key):
-            raise ValueError(f"Неизвестный ключ проверки: {key}")
+            raise ValueError(f"Неизвестный ключ: {key}")
         return self.checks is None or key in self.checks
 
     def _add(self, level: str, title: str, data: pd.DataFrame) -> None:
+        """
+        Перехватчик: считает модули ошибок,
+        переводит субсчета в счета и суммирует без сальдирования
+        """
+
         if data.empty:
             return
-        if {"КонецДебет", "КонецКредит"} <= set(data.columns):
-            amount = float((data["КонецДебет"] - data["КонецКредит"]).abs().sum())
-        elif "Сумма" in data.columns:
+
+        data = data.copy()
+
+        # СНАЧАЛА считаем сумму ошибки для каждой отдельной строки (до группировки).
+        # Это гарантирует, что ошибки не "съедят" друг друга (60.01 Д 45к + 60.02 К 30к = 75к, а не 15к).
+        if "Сумма" not in data.columns:
+            if {"КонецДебет", "КонецКредит"} <= set(data.columns):
+                if "Развернутое" in title:
+                    data["Сумма"] = data["КонецДебет"] + data["КонецКредит"]
+                else:
+                    data["Сумма"] = (data["КонецДебет"] - data["КонецКредит"]).abs()
+            else:
+                data["Сумма"] = 0.0
+
+        # Убираем прошлые месяцы и переводим субсчета в родительские (60.01 -> 60).
+        # Только для OSV/балансовых проверок. ML/NLP-проверки в этот набор не входят:
+        # их находки — отдельные события, субсчета не схлопываем.
+        balance_checks = {
+            "Красное сальдо: активный счет с кредитовым остатком",
+            "Красное сальдо: пассивный счет с дебетовым остатком",
+            "Развернутое сальдо по аналитике",
+            "Незакрытое сальдо на конец месяца (закрываемые счета)",
+            "Зависшее сальдо (не меняется между периодами)",
+            "Незакрытое сальдо на счете 000",
+            "Контроль групп счетов: незакрытые остатки",
+            "Контрагенты: аванс и долг одновременно по разным счетам (ОСВ)",
+            "Контрагенты: развернутое сальдо на счетах расчетов (без реестра документов)",
+            "Контрагенты: расчеты не закрыты документами",
+            "Контрагенты: расхождение документов и остатков ОСВ",
+        }
+
+        if title in balance_checks:
+            # Убираем прошлые месяцы ПО ИСХОДНЫМ субсчетам (до схлопывания).
+            # Сортируем по хронологии (Период может быть в разных форматах: 31.01.2026 / 2026-01-31 / Январь),
+            # иначе лексикографическая сортировка ломает границу годов.
+            if "Период" in data.columns:
+                data["_pkey"] = period_sort_series(data["Период"])
+                data = data.sort_values("_pkey", kind="stable", na_position="last")
+                dedup_cols = [c for c in ["Организация", "Счет", "Субконто", "Договор"] if c in data.columns]
+                data = data.drop_duplicates(subset=dedup_cols, keep="last")
+                data = data.drop(columns="_pkey")
+
+            # Добавляем в комментарий ТОЧНЫЙ субсчет (58.03), чтобы после схлопывания
+            # в счёт (58) бухгалтер сразу видел, где именно спрятана ошибка.
+            if "Счет" in data.columns and "Комментарий" in data.columns:
+                is_subaccount = data["Счет"].astype(str).str.contains(r"\.")
+                if is_subaccount.any():
+                    for idx in data[is_subaccount].index:
+                        sub_acc = str(data.loc[idx, "Счет"]).strip()
+                        comment = str(data.loc[idx, "Комментарий"])
+                        # Защита от дублирования: субсчет уже упомянут в тексте
+                        # (напр. «60.01 Д ...») — не вставляем повторно.
+                        if f"на субсчете {sub_acc}" not in comment and f"{sub_acc} " not in comment:
+                            data.loc[idx, "Комментарий"] = f"{comment} (на субсчете {sub_acc})"
+
+            # Заменяем субсчета на родительские (60.01 -> 60).
+            if "Счет" in data.columns:
+                data["Счет"] = data["Счет"].apply(_group_account_string)
+
+            # Группируем по родительскому счету и складываем модули сумм (Сумма).
+            group_cols = [c for c in ["Период", "Организация", "Счет", "Субконто", "Договор"] if c in data.columns]
+
+            agg_funcs: dict = {}
+            for col in data.columns:
+                if col not in group_cols:
+                    if col in {"КонецДебет", "КонецКредит", "Сумма"}:
+                        agg_funcs[col] = "sum"
+                    elif col == "Комментарий":
+                        # Разные субсчета одного родителя могут иметь разные тексты ошибок —
+                        # объединяем их через " | " (порядок сохраняем, дубли убираем).
+                        agg_funcs[col] = lambda x: " | ".join(
+                            dict.fromkeys(str(v) for v in x if pd.notna(v))
+                        )
+                    else:
+                        agg_funcs[col] = "first"
+
+            data = data.groupby(group_cols, dropna=False, as_index=False).agg(agg_funcs)
+
+        if data.empty:
+            return
+
+        # Итоговая сумма для карточки ошибки (уже корректно сложенные модули).
+        if "Сумма" in data.columns:
             amount = float(data["Сумма"].fillna(0.0).sum())
         else:
             amount = 0.0
-        self.errors.append(Finding(level=level, title=title, data=data, amount=amount))
+
+        self.errors.append(Finding(
+            level=level, title=title,
+            data=data, amount=amount
+        ))
 
     @staticmethod
-    def _first_occurrence(b: pd.DataFrame, keys: list[str], flag: pd.Series) -> dict[tuple, str]:
-        """
-        Первый период (по дате), когда flag == True, для каждой группы keys
-        """
-
+    def _first_occurrence(
+        b: pd.DataFrame,
+        keys: list[str],
+        flag: pd.Series
+    ) -> dict[tuple, str]:
         b2 = b.loc[flag, keys + ["Период"]].copy()
-        b2["_sort"] = pd.to_datetime(b2["Период"], errors="coerce", format="mixed")
+        b2["_sort"] = pd.to_datetime(
+            b2["Период"],
+            errors="coerce",
+            format="mixed"
+        )
         b2 = b2.sort_values(keys + ["_sort"])
         first = b2.groupby(keys, as_index=False)["Период"].first()
         return {
-            (row[keys[0]], row[keys[1]]): row["Период"]
+            tuple(row[k] for k in keys): row["Период"]
             for _, row in first.iterrows()
             if row["Период"]
         }
@@ -397,119 +518,172 @@ class AutoAuditor1C:
         b: pd.DataFrame,
         flag: pd.Series,
         base_comment: str,
-        since_text: str,
+        since_text: str
     ) -> pd.DataFrame:
-        """
-        Возвращает строки флага с комментарием о периоде возникновения.
-
-        Например «…; отрицательное сальдо с 2026-01-31» для 4.1.
-        """
-
         sub = b[flag].copy()
         if sub.empty:
             return sub
 
-        since = self._first_occurrence(b, ["Счет", "Субконто"], flag)
-
+        since = self._first_occurrence(
+            b,
+            ["Организация", "Счет", "Субконто"],
+            flag
+        )
         keys = pd.Series(
-            list(zip(sub["Счет"], sub["Субконто"])),
+            list(zip(sub["Организация"], sub["Счет"], sub["Субконто"])),
             index=sub.index
         )
         periods = keys.map(since)
 
-        # Массовый просмотр комментариев
         sub["Комментарий"] = base_comment
         mask_has_period = periods.notna()
         if mask_has_period.any():
             sub.loc[mask_has_period, "Комментарий"] = (
-                base_comment
-                + "; "
-                + since_text
-                + ' '
-                + periods[mask_has_period].astype(str)
+                base_comment + "; "
+                + since_text + ' '
+                + periods[mask_has_period].map(_fmt_date)
             )
         return sub
 
-    #                          ============ 4.1 Красное сальдо ============
     def check_red_balance(self) -> None:
         b = self.balances
+        if b.empty:
+            return
+
         net = b["КонецДебет"] - b["КонецКредит"]
-        # Красное сальдо — только отрицательный остаток по активному счету.
-        # Дебетовый остаток по пассивному счету ошибкой не считается.
+
+        # Активные счета с кредитовым сальдо
         active = self._annotate_since(
-            b,
-            (b["Тип"] == "A") & (net < 0),
+            b, (b["Тип"] == "A") & (net < -EPS),
             "Активный счет имеет кредитовое (отрицательное) сальдо",
-            "отрицательное сальдо с",
+            "отрицательное сальдо с"
         )
         if not active.empty:
-            self._add("error", "Красное сальдо: активный счет с кредитовым остатком", active)
+            self._add(
+                "error",
+                "Красное сальдо: активный счет с кредитовым остатком",
+                active
+            )
 
-    #                        ============ 4.2 Развернутое сальдо ============
+        # Пассивные счета с дебетовым сальдо
+        passive = self._annotate_since(
+            b, (b["Тип"] == "P") & (net > EPS),
+            "Пассивный счет имеет дебетовое (отрицательное) сальдо",
+            "отрицательное сальдо с"
+        )
+        if not passive.empty:
+            self._add(
+                "error",
+                "Красное сальдо: пассивный счет с дебетовым остатком",
+                passive
+            )
+
     def check_expanded_balance(self) -> None:
         b = self.balances
-        # Развернутое сальдо — ошибка на уровне аналитики: у одного контрагента/договора
-        # одновременно дебетовый и кредитовый остаток. У активно-пассивных счетов без
-        # аналитики одновременные Д/К-остатки нормальны (разные контрагенты).
         both = b[
             (b["Субконто"] != "-")
             & (b["КонецДебет"] > 0)
             & (b["КонецКредит"] > 0)
-        ]
-        both["Комментарий"] = "По контрагенту/аналитике одновременно дебетовое и кредитовое сальдо"
+        ].copy()
+        both["Комментарий"] = "По контрагенту/аналитике одновременно \
+            дебетовое и кредитовое сальдо"
         self._add("warning", "Развернутое сальдо по аналитике", both)
 
-    #                 ============ 4.3 Незакрытое сальдо на конец месяца ============
     def check_unclosed_month_end(self) -> None:
         b = self.balances
-        closing = self._annotate_since(
-            b,
-            (b["Счет"].map(account_group).isin(self.closing_accounts))
-            & ((b["КонецДебет"] > 0) | (b["КонецКредит"] > 0)),
-            "Остаток по закрываемому счету после закрытия месяца",
-            "остаток с",
-        )
-        if not closing.empty:
-            self._add(
-                "error",
-                "Незакрытое сальдо на конец месяца (закрываемые счета)",
-                closing
+
+        # Отбираем только строки с закрываемыми счетами.
+        closing_mask = b["Счет"].map(account_group).isin(self.closing_accounts)
+        closing_df = b[closing_mask].copy()
+
+        if not closing_df.empty:
+            # Для закрываемых счетов важен итог по РОДИТЕЛЬСКОМУ счету: субсчета
+            # (90.01 Выручка, 90.09 Прибыль/убыток) копят остаток весь год, а к нулю
+            # должны сходиться именно родители 90/91. Сворачиваем субсчета в родителя.
+            closing_df["Счет"] = closing_df["Счет"].map(account_group)
+            closing_df["Субконто"] = "-"
+            closing_df["Договор"] = "-"
+
+            grp_cols = ["Период", "Организация", "Счет", "Субконто", "Договор"]
+            parent_b = closing_df.groupby(
+                grp_cols, dropna=False,
+                as_index=False
+            )[["КонецДебет", "КонецКредит"]].sum()
+
+            # Сальдо родительского счета = |Дебет - Кредит| (по всем субсчетам разом)
+            parent_b["Сумма"] = (parent_b["КонецДебет"] - parent_b["КонецКредит"]).abs()
+
+            # Аннотируем датой первого появления (по истории периодов родителя).
+            unclosed_parents = self._annotate_since(
+                parent_b, parent_b["Сумма"] > EPS,
+                "Остаток по закрываемому счету в целом", "остаток с"
             )
 
-        # Зависшее сальдо: остаток не меняется между периодами
-        b_nonzero = b[(b["КонецДебет"] > 0) | (b["КонецКредит"] > 0)]
-        if not b_nonzero.empty:
-            # Сортируем по хронологии
-            b2 = b_nonzero.sort_values(["Счет", "Субконто", "Период"])
-
-            # Группируем по счету и аналитике, сдвигаем остатки
-            grp = b2.groupby(["Счет", "Субконто"])
-            prev_d = grp["КонецДебет"].shift(1)
-            prev_k = grp["КонецКредит"].shift(1)
-
-            # Строка считается зависшей, если текущий остаток
-            # точно равен предыдущему
-            stuck_mask = (
-                (b2["КонецДебет"] == prev_d)
-                & (b2["КонецКредит"] == prev_k)
-                & prev_d.notna()
-            )
-            stuck = b2[stuck_mask].copy()
-
-            if not stuck.empty:
-                stuck["Комментарий"] = "Сальдо не меняется между периодами (зависший остаток)"
-                self._add(
-                    "warning",
-                    "Зависшее сальдо (не меняется между периодами)",
-                    stuck
+            if not unclosed_parents.empty:
+                # Корректируем Д/К: показываем весь остаток на той стороне, где он есть.
+                unclosed_parents["КонецДебет"] = unclosed_parents.apply(
+                    lambda r: r["Сумма"] if r["КонецДебет"] > r["КонецКредит"] else 0.0, axis=1
                 )
+                unclosed_parents["КонецКредит"] = unclosed_parents.apply(
+                    lambda r: r["Сумма"] if r["КонецКредит"] > r["КонецДебет"] else 0.0, axis=1
+                )
+
+                self._add("error", "Незакрытое сальдо на конец месяца (закрываемые счета)", unclosed_parents)
+
+        # Зависшее сальдо (stuck_balance_checks) остаётся без изменений: тут важно
+        # отслеживать движение каждого отдельного субсчета.
+        if not self.stuck_balance_checks:
+            return
+        b_nonzero = b[(b["КонецДебет"] > 0) | (b["КонецКредит"] > 0)]
+        if b_nonzero.empty:
+            return
+
+        b2 = b_nonzero.copy()
+        b2["_pkey"] = period_sort_series(b2["Период"])
+
+        b2 = b2.sort_values(["Организация", "Счет", "Субконто", "_pkey"], kind="stable", na_position="last")
+        grp = b2.groupby(["Организация", "Счет", "Субконто"], sort=False)
+
+        prev_d = grp["КонецДебет"].shift(1)
+        prev_k = grp["КонецКредит"].shift(1)
+
+        stuck_mask = (
+            ((b2["КонецДебет"] - prev_d).abs() < EPS)
+            & ((b2["КонецКредит"] - prev_k).abs() < EPS)
+            & prev_d.notna()
+        )
+        if not stuck_mask.any():
+            return
+
+        b2["_stuck"] = stuck_mask.to_numpy()
+        b2["_prev_period"] = b2["Период"].shift(1)
+        prev_stuck = b2["_stuck"].shift(1, fill_value=False)
+
+        same_group = (
+            (b2["Организация"] == b2["Организация"].shift(1)) &
+            (b2["Счет"] == b2["Счет"].shift(1)) &
+            (b2["Субконто"] == b2["Субконто"].shift(1))
+        )
+        streak_start = b2["_stuck"] & ~(prev_stuck & same_group)
+        b2["_streak"] = streak_start.cumsum()
+
+        rows: list[dict[str, Any]] = []
+        value_cols = [c for c in b2.columns if not c.startswith("_")]
+        for _, streak in b2[b2["_stuck"]].groupby("_streak", sort=False):
+            last = streak.iloc[-1]
+            n_periods = len(streak) + 1
+            row = {c: last[c] for c in value_cols}
+            row["Комментарий"] = f"Сальдо не меняется с {_fmt_date(streak.iloc[0]['_prev_period'])} ({n_periods} пер.)"
+            rows.append(row)
+
+        self._add(
+            "warning",
+            "Зависшее сальдо (не меняется между периодами)",
+            pd.DataFrame(rows)
+        )
 
     @staticmethod
     def _matches_group_preset(code: Any, preset: list[str]) -> bool:
-        """
-        Совпадает ли счет с кодом пресета (код с точкой — точно, без — по группе)
-        """
-
         code = str(code)
         for p in preset:
             if "." in p:
@@ -520,47 +694,28 @@ class AutoAuditor1C:
         return False
 
     def check_group_balances(self) -> None:
-        """
-        Контроль групп счетов (расширенный 4.3): незакрытые остатки групп.
-
-        Для каждой группы из GROUP_PRESETS берется остаток на конец последнего
-        периода. Строки агрегируются по родительским счетам (Субконто == "-");
-        если их нет в файле — по всем строкам группы (субконто).
-        """
-
         if not self.balance_group_checks:
             return
 
         b = self.balances
-        dates = pd.to_datetime(b["Период"], errors="coerce")
-
-        periods = sorted(set(b.loc[dates.notna(), "Период"]))
-        if not periods:
-            periods = sorted(set(b["Период"]))
+        periods = sorted(set(b["Период"]))
         if not periods:
             return
 
         last_period = periods[-1]
-
         rows: list = []
         for group_name, preset in GROUP_PRESETS.items():
-            matched = b[
-                b["Счет"].map(
-                    lambda code: self._matches_group_preset(code, preset)
-                )
-            ]
+            matched = b[b["Счет"].map(lambda code: self._matches_group_preset(code, preset))]
             if matched.empty:
                 continue
 
-            # Оставляем остатки только по родительским счетам, если они есть
-            # Если их нет (выгружены только субсчета), берем детальные строки
             parents = matched[matched["Субконто"] == "-"]
             use = parents if not parents.empty else matched
             g = use[use["Период"] == last_period]
             if g.empty:
                 continue
 
-            g_unique = g.drop_duplicates(subset=["Счет", "Субконто"])
+            g_unique = g.drop_duplicates(subset=["Организация", "Счет", "Субконто"])
             d = float(g_unique["КонецДебет"].sum())
             k = float(g_unique["КонецКредит"].sum())
 
@@ -568,54 +723,45 @@ class AutoAuditor1C:
             if abs(net) <= EPS:
                 continue
 
+            if "Организация" in g_unique.columns:
+                org = g_unique["Организация"].iloc[0]
+            else:
+                org = "-"
+
             rows.append({
                 "Период": last_period,
+                "Организация": org,
                 "Счет": ", ".join(preset),
                 "Субконто": group_name,
                 "КонецДебет": d,
                 "КонецКредит": k,
                 "Сумма": abs(net),
-                "Комментарий": (
-                    f"Группа «{group_name}» не закрыта на конец периода: остаток "
-                    f"{'Д' if net > 0 else 'К'} {abs(net):,.2f}"
-                ),
+                "Комментарий": f"Группа «{group_name}» не закрыта: остаток {'Д' if net > 0 else 'К'} {_fmt_rub(abs(net))}",
             })
         if rows:
-            res = pd.DataFrame(rows, columns=[
-                "Период", "Счет", "Субконто",
-                "КонецДебет", "КонецКредит", "Сумма", "Комментарий",
-            ])
-            self._add("warning", "Контроль групп счетов: незакрытые остатки", res)
+            self._add(
+                "warning",
+                "Контроль групп счетов: незакрытые остатки",
+                pd.DataFrame(rows)
+            )
 
-    # ============ 4.4 Счет 000 ============
     def check_account_000(self) -> None:
         acc = self.balances[
             (self.balances["Счет"].map(account_group) == "000")
             & ((self.balances["КонецДебет"] > 0) | (self.balances["КонецКредит"] > 0))
-        ]
-        acc = acc.copy()
+        ].copy()
         acc["Комментарий"] = "Незакрытый остаток на служебном счете 000"
         self._add("error", "Незакрытое сальдо на счете 000", acc)
 
-    # ============ 4.5 Незакрытые расчеты с контрагентами ============
     def _osv_settlement_balance(self) -> pd.Series:
         b = self.balances
         sett = b[b["Счет"].map(account_group).isin(SETTLEMENT_GROUPS)]
-        return (
-            sett.groupby("Субконто")["КонецДебет"].sum()
-            - sett.groupby("Субконто")["КонецКредит"].sum()
-        )
+        return sett.groupby("Субконто")["КонецДебет"].sum() - \
+            sett.groupby("Субконто")["КонецКредит"].sum()
 
     def _osv_settlement_breakdown(self, subconto: Any) -> dict[str, float]:
-        """
-        Остаток Д-К по каждому счету расчетов контрагента (например 60.01, 60.02)
-        """
-
         b = self.balances
-        sett = b[
-            (b["Счет"].map(account_group).isin(SETTLEMENT_GROUPS))
-            & (b["Субконто"] == subconto)
-        ]
+        sett = b[(b["Счет"].map(account_group).isin(SETTLEMENT_GROUPS)) & (b["Субконто"] == subconto)]
         out: dict[str, float] = {}
         for account, g in sett.groupby("Счет"):
             net = float(g["КонецДебет"].sum() - g["КонецКредит"].sum())
@@ -624,10 +770,6 @@ class AutoAuditor1C:
         return out
 
     def _reference_date(self) -> pd.Timestamp:
-        """
-        Опорная дата для aging: конец последнего периода ОСВ (или последняя операция)
-        """
-
         dates = pd.to_datetime(self.balances["Период"], errors="coerce").dropna()
         if not dates.empty:
             return dates.max()
@@ -642,11 +784,6 @@ class AutoAuditor1C:
         rows: list[tuple],
         consume: float
     ) -> pd.Timestamp | None:
-        """
-        FIFO: дата старейшей строки (дата, сумма), остаток которой не погашен.
-        Используется только для описания (aging) — не источник новых ошибок.
-        """
-
         rows = [r for r in rows if pd.notna(r[0]) and r[1] > 0]
         rows.sort(key=lambda r: r[0])
         remaining = consume
@@ -658,20 +795,10 @@ class AutoAuditor1C:
 
     @staticmethod
     def _settlement_components(
-        shipped: float, paid: float, advances: float
+        shipped: float,
+        paid: float,
+        advances: float
     ) -> tuple[float, float, float, float]:
-        """
-        Компоненты незакрытых расчетов по документам контрагента.
-
-        Возвращает (долг, незачтенный аванс, переплата, зачтено):
-          долг          = max(отгружено - оплачено - авансы, 0)
-          кредит_сторона = max(оплачено + авансы - отгружено, 0)
-          незачтенный аванс = min(авансы, кредит_сторона)
-          зачтено       = авансы - незачтенный аванс
-          переплата     = кредит_сторона - незачтенный аванс
-        Сумма компонент всегда равна |отгружено - оплачено - авансы|.
-        """
-
         open_amount = shipped - paid - advances
         debt = max(open_amount, 0.0)
         credit_side = max(-open_amount, 0.0)
@@ -681,172 +808,123 @@ class AutoAuditor1C:
         return debt, advance_left, overpaid, consumed
 
     def _check_settlement_advance_vs_debt(self) -> None:
-        """
-        Долг и аванс одновременно на разных счетах расчетов одного контрагента
-        (например 60.01 Д + 60.02 К или 62.01 Д + 62.02 К). Проверка 4.2 ловит
-        только один счет, поэтому разнёс по разным счетам выделяется здесь.
-        Ограничено группами 60 и 62: для 76 разные субсчета могут означать
-        независимые расчеты без признака ошибки.
-        """
-
         b = self.balances
-        sett = b[
-            (b["Счет"].map(account_group).isin(SETTLEMENT_GROUPS))
-            & (b["Субконто"] != "-")
-        ]
+        sett = b[(b["Счет"].map(account_group).isin(SETTLEMENT_GROUPS)) & (b["Субконто"] != "-")]
         rows: list = []
-        for subconto, g in sett.groupby("Субконто"):
+
+        # Группируем не только по Субконто (контрагенту), но и по ДОГОВОРУ:
+        # аванс по одному договору и долг по другому у одного контрагента — это норма
+        grp_cols: list[str] = ["Период", "Организация", "Субконто", "Договор"]
+
+        for keys, g in sett.groupby(grp_cols):
+            period, org, subconto, contract = keys
+
             for group in ("60", "62"):
                 gs = g[g["Счет"].map(account_group) == group]
                 if gs.empty:
                     continue
-                nets = {
-                    str(account): float(gg["КонецДебет"].sum() - gg["КонецКредит"].sum())
-                    for account, gg in gs.groupby("Счет")
-                }
-                debit_sum = sum(n for n in nets.values() if n > EPS)
-                credit_sum = sum(-n for n in nets.values() if n < -EPS)
+
+                nets: dict = {}
+                for account, gg in gs.groupby("Счет"):
+                    account_str = str(account)
+                    net_value = float(gg["КонецДебет"].sum() - gg["КонецКредит"].sum())
+                    nets[account_str] = net_value
+
+                debit_sum = 0.0
+                credit_sum = 0.0
+                for n in nets.values():
+                    if n > EPS:
+                        debit_sum += n
+                    elif n < -EPS:
+                        credit_sum += -n
+
+                # Если на одном и том же договоре есть и Дт,
+                # и Кт — ошибка (не зачтен аванс)
                 if debit_sum <= EPS or credit_sum <= EPS:
                     continue
-                parts = [f"{a} {'Д' if n > 0 else 'К'} {abs(n):,.2f}" for a, n in sorted(nets.items())]
+
+                parts: list = []
+                for a, n in sorted(nets.items()):
+                    indicator = "Д" if n > 0 else "К"
+                    formatted_rub = _fmt_rub(abs(n))
+                    parts.append(f"{a} {indicator} {formatted_rub}")
+
                 rows.append({
-                    "Период": "",
+                    "Период": period,
+                    "Организация": org,
                     "Счет": ", ".join(sorted(nets)),
                     "Субконто": subconto,
+                    "Договор": contract,
                     "КонецДебет": debit_sum,
                     "КонецКредит": credit_sum,
-                    "Сумма": abs(debit_sum - credit_sum),
-                    "Комментарий": (
-                        "По контрагенту одновременно дебетовый и кредитовый остаток на разных "
-                        f"счетах расчетов (долг и аванс): {'; '.join(parts)}"
-                    ),
+                    "Сумма": debit_sum + credit_sum,
+                    "Комментарий": f"Долг и аванс на разных счетах по одному договору: {'; '.join(parts)}",
                 })
+
         if rows:
-            res = pd.DataFrame(
-                rows,
-                columns=[
-                    "Период", "Счет", "Субконто",
-                    "КонецДебет", "КонецКредит", "Сумма",
-                    "Комментарий"
-                ],
-            )
             self._add(
                 "warning",
                 "Контрагенты: аванс и долг одновременно по разным счетам (ОСВ)",
-                res,
+                pd.DataFrame(rows)
             )
 
     def check_unclosed_settlements(self) -> None:
         self._check_settlement_advance_vs_debt()
 
         if self.documents is None:
-            sett = self.balances[
-                self.balances["Счет"].map(account_group).isin(SETTLEMENT_GROUPS)]
-            dup = sett[
-                (sett["Субконто"] != "-")
-                & (sett["КонецДебет"] > 0)
-                & (sett["КонецКредит"] > 0)
-            ]
-            dup = dup.copy()
+            sett = self.balances[self.balances["Счет"].map(account_group).isin(SETTLEMENT_GROUPS)]
+            dup = sett[(sett["Субконто"] != "-") & (sett["КонецДебет"] > 0) & (sett["КонецКредит"] > 0)].copy()
             dup["Комментарий"] = "Возможные незакрытые расчеты: аванс и долг по одному контрагенту"
-            self._add(
-                "warning",
-                "Контрагенты: развернутое сальдо на счетах расчетов (без реестра документов)",
-                dup
-            )
+            self._add("warning", "Контрагенты: развернутое сальдо на счетах расчетов (без реестра документов)", dup)
             return
 
-        ref_date = self._reference_date()
         rows: list = []
         for name, g in self.documents.groupby("Контрагент"):
             g = g.sort_values("Дата")
             shipped = float(g.loc[g["ВидНорм"] == "отгрузка", "Сумма"].sum())
             paid = float(g.loc[g["ВидНорм"] == "оплата", "Сумма"].sum())
             advances = float(g.loc[g["ВидНорм"] == "аванс", "Сумма"].sum())
-            unknown = g.loc[~g["ВидНорм"].isin(["отгрузка", "оплата", "аванс"])]
 
-            # Компоненты: долг / незачтенный аванс / переплата. Сумма компонент = |open_amount|.
-            debt, advance_left, overpaid, consumed = self._settlement_components(
-                shipped, paid, advances
-            )
+            debt, advance_left, overpaid, consumed = self._settlement_components(shipped, paid, advances)
             open_amount = debt - advance_left - overpaid
 
             issues: list[str] = []
             if debt > EPS:
-                issues.append(
-                    f"остаток долга {debt:,.2f} (отгружено {shipped:,.2f}, "
-                    f"оплачено {paid:,.2f}, аванс {advances:,.2f}, зачтено {consumed:,.2f})"
-                )
+                issues.append(f"остаток долга {_fmt_rub(debt)}")
             if advance_left > EPS:
-                issues.append(
-                    f"незачтенный аванс {advance_left:,.2f} (всего авансов {advances:,.2f}, "
-                    f"зачтено {consumed:,.2f}, отгружено {shipped:,.2f})"
-                )
+                issues.append(f"незачтенный аванс {_fmt_rub(advance_left)}")
             if overpaid > EPS:
-                issues.append(
-                    f"переплата {overpaid:,.2f} (оплачено {paid:,.2f} при отгруженных "
-                    f"{shipped:,.2f} и авансе {advances:,.2f})"
-                )
+                issues.append(f"переплата {_fmt_rub(overpaid)}")
 
-            # Старейший непогашенный документ (FIFO по датам, описательно)
-            # + ожидаемый документ: что должно прийти/пройти, чтобы закрыть остаток
             if debt > EPS:
                 oldest = self._oldest_unconsumed(
-                    list(
-                        g.loc[
-                            g["ВидНорм"] == "отгрузка",
-                            ["Дата", "Сумма"]
-                        ].itertuples(index=False, name=None)
-                    ),
+                    list(g.loc[g["ВидНорм"] == "отгрузка", ["Дата", "Сумма"]].itertuples(index=False, name=None)),
                     paid + consumed,
                 )
                 if oldest is not None:
-                    age = (ref_date - oldest).days
-                    issues.append(
-                        f"старейший непогашенный долг от {oldest.date()} (возраст {age} дн.); "
-                        f"ожидается оплата по отгрузке от {oldest.date()} на {debt:,.2f}"
-                    )
+                    issues.append(f"старейший долг от {_fmt_date(oldest)}")
             if advance_left > EPS:
                 oldest = self._oldest_unconsumed(
-                    list(
-                        g.loc[
-                            g["ВидНорм"] == "аванс",
-                            ["Дата", "Сумма"]
-                        ].itertuples(index=False, name=None)
-                    ),
+                    list(g.loc[g["ВидНорм"] == "аванс", ["Дата", "Сумма"]].itertuples(index=False, name=None)),
                     consumed,
                 )
                 if oldest is not None:
-                    age = (ref_date - oldest).days
-                    issues.append(
-                        f"старейший незачтенный аванс от {oldest.date()} (возраст {age} дн.); "
-                        f"ожидается отгрузка/зачет по авансу от {oldest.date()} на {advance_left:,.2f}"
-                    )
+                    issues.append(f"старейший незачтенный аванс от {_fmt_date(oldest)}")
 
-            # По-счетная разбивка остатков ОСВ (долг/аванс на разных счетах расчетов)
             osv_break = self._osv_settlement_breakdown(name)
             if osv_break:
                 accounts = ", ".join(sorted(osv_break))
-                issues.append(
-                    "ОСВ по счетам: "
-                    + "; ".join(
-                        f"{a} {'Д' if n > 0 else 'К'} {abs(n):,.2f}"
-                        for a, n in sorted(osv_break.items())
-                    )
-                )
             else:
                 accounts = ", ".join(sorted(set(g["Счет"].astype(str))))
 
-            comment = "; ".join(issues) if issues else "Расчеты закрыты документами"
-            if not unknown.empty:
-                comment += f"; не распознаны операции: {', '.join(sorted(set(unknown['Вид'])))}"
-
+            comment = "; ".join(issues) if issues else "Расчеты закрыты"
             osv_net = float(self._osv_settlement_balance().get(name, 0.0))
             if abs(osv_net - open_amount) > 1e-6:
-                comment += f"; расхождение с остатком ОСВ ({osv_net:,.2f})"
+                comment += f"; расхождение с ОСВ ({_fmt_rub(osv_net)})"
 
             rows.append({
                 "Период": "",
+                "Организация": "-",
                 "Счет": accounts,
                 "Субконто": name,
                 "КонецДебет": max(open_amount, 0.0),
@@ -855,59 +933,26 @@ class AutoAuditor1C:
                 "Комментарий": comment,
             })
 
-        res = pd.DataFrame(
-            rows,
-            columns=[
-                "Период", "Счет", "Субконто",
-                "КонецДебет", "КонецКредит", "Сумма",
-                "Комментарий"
-            ]
-        )
-        problems = res[res["Сумма"] > EPS]
-        self._add("error", "Контрагенты: расчеты не закрыты документами", problems.copy())
+        res = pd.DataFrame(rows)
+        if not res.empty:
+            problems = res[res["Сумма"] > EPS]
+            self._add("error", "Контрагенты: расчеты не закрыты документами", problems.copy())
+            mismatches = res[res["Комментарий"].str.contains("расхождение", na=False)]
+            self._add("warning", "Контрагенты: расхождение документов и остатков ОСВ", mismatches.copy())
 
-        mismatches = res[
-            res["Комментарий"].str.contains("расхождение", na=False)
-        ]
-        self._add(
-            "warning",
-            "Контрагенты: расхождение документов и остатков ОСВ",
-            mismatches.copy()
-        )
-
-    # ============ ML-проверки (аномалии, дубли) ============
     def check_amount_anomalies(self) -> None:
-        """
-        ML: нетипичная сумма операции по истории контрагента
-        """
-
         if self.documents is None:
             return
         found = ml.detect_amount_anomalies(
-            self.documents,
-            k=self.anomaly_k,
-            min_abs=self.anomaly_min_abs,
-            min_ops=self.anomaly_min_ops,
+            self.documents, k=self.anomaly_k, min_abs=self.anomaly_min_abs, min_ops=self.anomaly_min_ops
         )
         self._add("warning", "ML: нетипичная сумма операции", found)
 
     def check_turnover_jumps(self) -> None:
-        """
-        ML: резкий скачок оборотов между периодами
-        """
-
-        found = ml.detect_turnover_jumps(
-            self.balances,
-            ratio=self.jump_ratio,
-            min_abs=self.jump_min_abs,
-        )
+        found = ml.detect_turnover_jumps(self.balances, ratio=self.jump_ratio, min_abs=self.jump_min_abs)
         self._add("warning", "ML: резкий скачок оборотов между периодами", found)
 
     def check_duplicate_counterparties(self) -> None:
-        """
-        ML: нечёткий поиск дублей контрагентов
-        """
-
         names: list[object] = []
         if "Субконто" in self.balances.columns:
             names += list(self.balances["Субконто"].dropna())
@@ -917,10 +962,6 @@ class AutoAuditor1C:
         self._add("warning", "ML: возможные дубли контрагентов", found)
 
     def run_ml_checks(self) -> None:
-        """
-        Запускает включенные ML-проверки
-        """
-
         if not self.ml_enabled:
             return
         if self.ml_amount_anomalies:
@@ -930,18 +971,12 @@ class AutoAuditor1C:
         if self.ml_duplicates:
             self.check_duplicate_counterparties()
 
-    # ============ NLP-проверки (назначения платежей) ============
     def check_payment_purpose_risks(self) -> None:
-        """
-        NLP: рискованные формулировки в назначениях платежей (115-ФЗ)
-        """
-
         if self.documents is None:
             return
         found = nlp.detect_payment_risks(self.documents)
         self._add("warning", "NLP: подозрительные назначения платежей (115-ФЗ)", found)
 
-    # ============ Запуск и отчеты ============
     def run_audit(self) -> list[Finding]:
         self.errors = []
         if self._check_enabled("red_balance"):
@@ -960,20 +995,39 @@ class AutoAuditor1C:
             self.check_payment_purpose_risks()
         return self.errors
 
+    @classmethod
+    def from_findings(cls, errors: list[dict], meta: dict | None = None) -> "AutoAuditor1C":
+        instance = cls.__new__(cls)
+        instance.balances = pd.DataFrame(columns=OSV_COLUMNS)
+        instance.documents = None
+        instance.meta = dict(meta or {})
+        findings: list[Finding] = []
+        for e in errors or []:
+            data = e.get("data")
+            if not isinstance(data, pd.DataFrame):
+                data = pd.DataFrame(data or [])
+            findings.append(Finding(
+                level=str(e.get("level", "warning")),
+                title=str(e.get("title", "")),
+                data=data,
+                amount=float(e.get("amount") or 0.0),
+            ))
+        instance.errors = findings
+        return instance
+
     def summary_df(self) -> pd.DataFrame:
-        rows: list[dict[str, Any]] = [
-            {
-                "Проверка": e["title"],
-                "Уровень": e["level"],
-                "Строк": len(e["data"]),
-                "Сумма": e["amount"],
-                "Рекомендации": RECOMMENDATIONS.get(e["title"], ""),
-            } for e in self.errors
-        ]
-        return pd.DataFrame(
-            rows,
-            columns=["Проверка", "Уровень", "Строк", "Сумма", "Рекомендации"]
+        columns = ["Проверка", "Уровень", "Период", "Строк", "Сумма", "Рекомендации"]
+        details = self.details_df()
+        if details.empty:
+            return pd.DataFrame(columns=columns)
+        grouped = (
+            details
+            .groupby(["Проверка", "Уровень", "Период"], sort=False)
+            .agg(Строк=("Сумма", "count"), Сумма=("Сумма", "sum"))
+            .reset_index()
         )
+        grouped["Рекомендации"] = grouped["Проверка"].map(RECOMMENDATIONS).fillna("")
+        return grouped[columns]
 
     def details_df(self) -> pd.DataFrame:
         rows = []
@@ -983,134 +1037,146 @@ class AutoAuditor1C:
                     "Проверка": e["title"],
                     "Уровень": e["level"],
                     "Период": r.get("Период", ""),
-                    "Счет": r.get("Счет", ""),
+                    "Организация": str(r.get("Организация", "")),
+                    "Счет": str(r.get("Счет", "")),  # Счета уже сгруппированы в _add
                     "Субконто": r.get("Субконто", ""),
                     "Договор": r.get("Договор", ""),
                     "Дебет": r.get("КонецДебет", 0.0),
                     "Кредит": r.get("КонецКредит", 0.0),
                     "Сумма": (
-                        r["Сумма"]
+                        float(r["Сумма"])
                         if "Сумма" in r.index
-                        else abs(float(r.get("КонецДебет", 0.0) - r.get("КонецКредит", 0.0)))
+                        else abs(
+                            float(r.get("КонецДебет", 0.0) or 0.0)
+                            - float(r.get("КонецКредит", 0.0) or 0.0)
+                        )
                     ),
                     "Комментарий": r.get("Комментарий", ""),
                 })
         return pd.DataFrame(rows, columns=DETAIL_COLUMNS)
 
+    def top_findings_df(self, limit: int = 10) -> pd.DataFrame:
+        columns = ["Проверка", "Уровень", "Период", "Организация", "Счет", "Субконто", "Сумма"]
+        details = self.details_df()
+        if details.empty or limit <= 0:
+            return pd.DataFrame(columns=columns)
+        ranked = details[columns].copy()
+        ranked["_abs"] = ranked["Сумма"].abs()
+        ranked = ranked.sort_values("_abs", ascending=False).head(limit)
+        return ranked.drop(columns="_abs").reset_index(drop=True)
+
+    def _sections(self) -> list[dict[str, Any]]:
+        used: set[str] = set()
+        sections: list[dict[str, Any]] = []
+
+        specs = list(SECTION_SPECS)
+
+        details = self.details_df()
+        if details.empty:
+            return []
+
+        for sec_title, titles in specs:
+            mask = details["Проверка"].isin(titles)
+            if not mask.any():
+                continue
+
+            sec_df = details[mask].copy()
+            used.update(titles)
+
+            if len(titles) > 1:
+                sec_df["Проверка"] = sec_df["Проверка"].map(lambda x: _SHORT_PDF_LABELS.get(x, x))
+            else:
+                sec_df = sec_df.drop(columns=["Проверка"], errors="ignore")
+
+            recs = " ".join(dict.fromkeys(RECOMMENDATIONS.get(t, "") for t in titles if RECOMMENDATIONS.get(t, "")))
+            level = "error" if "error" in sec_df["Уровень"].unique() else "warning"
+            sec_df = self._drop_empty_columns(sec_df)
+
+            sections.append({
+                "title": sec_title, "level": level, "recommendation": recs, "df": sec_df,
+            })
+
+        remaining_mask = ~details["Проверка"].isin(used)
+        if remaining_mask.any():
+            rem_df = details[remaining_mask]
+            for title, group in rem_df.groupby("Проверка"):
+                grp = group.drop(columns=["Проверка"], errors="ignore")
+                level = "error" if "error" in grp["Уровень"].unique() else "warning"
+                sections.append({
+                    "title": str(title), "level": level, "recommendation": RECOMMENDATIONS.get(str(title), ""),
+                    "df": self._drop_empty_columns(grp),
+                })
+        return sections
+
+    @staticmethod
+    def _drop_empty_columns(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        keep: list[str] = []
+        for col in df.columns:
+            series = df[col]
+            non_empty = series.notna() & (
+                series.astype(str).str.strip().ne("") & series.astype(str).ne("nan")
+            )
+            if bool(non_empty.any()):
+                keep.append(col)
+        return df[keep]
+
     @staticmethod
     def _account_codes_in(cell: object) -> list[str]:
-        """
-        Разбирает значение «Счет» (возможно «51, 62.01») на отдельные коды
-        """
-
-        return [
-            c.strip()
-            for c in str(cell).replace(";", ",").split(",")
-            if c.strip()
-        ]
+        return [c.strip() for c in str(cell).replace(";", ",").split(",") if c.strip()]
 
     def accounts_with_errors(self) -> list[str]:
-        """
-        Отсортированный список счетов, по которым есть нарушения
-        """
-
         codes: set[str] = set()
         details = self.details_df()
-        if not details.empty:
+        if not details.empty and "Счет" in details.columns:
             for cell in details["Счет"].dropna():
                 codes.update(self._account_codes_in(cell))
         return sorted(codes)
 
     def account_subaccounts(self, account_code: str) -> list[str]:
-        """
-        Субсчета счета: '60' -> ['60.01', '60.02', ...], '60.01' -> ['60.01']
-        """
-
         code = str(account_code).strip()
         if "." in code:
             return [code]
+        sub: set[str] = {code}  # родительский счет сам по себе (после схлопывания 60.01 -> 60)
         if self.balances is not None and "Счет" in self.balances.columns:
             values = self.balances["Счет"].dropna()
-            codes: set[str] = set()
             idx = 0
             while idx < len(values):
                 item = str(values.iloc[idx]).strip()
                 if account_group(item) == code:
-                    codes.add(item)
+                    sub.add(item)
                 idx += 1
-            if codes:
-                return sorted(codes)
-        return [code]
+        return sorted(sub)
 
     def account_report_df(self, account_code: str) -> pd.DataFrame:
-        """
-        Все нарушения выбранного счета одним списком: для родительского
-        счета учитываются и строки его субсчетов («хождение по субсчетам»)
-        """
-
         details = self.details_df()
         if details.empty:
             return details
         subaccounts = set(self.account_subaccounts(account_code))
-        return details[
-            details["Счет"].map(
-                lambda cell: bool(set(self._account_codes_in(cell)) & subaccounts)
-            )
-        ]
+        return details[details["Счет"].map(lambda cell: bool(set(self._account_codes_in(cell)) & subaccounts))]
 
     def account_subconto(self, account_code: str) -> list[str]:
-        """
-        Субконто/контрагенты, задействованные по счету (из ОСВ и документов)
-        """
-
         names: set[str] = set()
         subaccounts = self.account_subaccounts(account_code)
         if "Счет" in self.balances.columns and "Субконто" in self.balances.columns:
             rows = self.balances[self.balances["Счет"].isin(subaccounts)]["Субконто"]
-            names.update(
-                str(n).strip() for n in rows.dropna() if str(n).strip() != "-"
-            )
-        if (
-            self.documents is not None
-            and "Счет" in self.documents.columns
-            and "Контрагент" in self.documents.columns
-        ):
+            names.update(str(n).strip() for n in rows.dropna() if str(n).strip() != "-")
+        if self.documents is not None and "Счет" in self.documents.columns and "Контрагент" in self.documents.columns:
             rows = self.documents[self.documents["Счет"].isin(subaccounts)]["Контрагент"]
-            names.update(
-                str(n).strip() for n in rows.dropna() if str(n).strip()
-            )
+            names.update(str(n).strip() for n in rows.dropna() if str(n).strip())
         return sorted(names)
 
-    def account_subconto_duplicates(
-        self,
-        account_code: str,
-        threshold: int | None = None,
-    ) -> pd.DataFrame:
-        """
-        ML-поиск возможных дублей контрагентов внутри выбранного счета
-        """
-
+    def account_subconto_duplicates(self, account_code: str, threshold: int | None = None) -> pd.DataFrame:
         names = self.account_subconto(account_code)
         if not names:
-            return pd.DataFrame(columns=[
-                "Субконто", "Название А",
-                "Название Б", "Сходство",
-                "Комментарий"
-            ])
+            return pd.DataFrame(columns=["Субконто", "Название А", "Название Б", "Сходство", "Комментарий"])
         return ml.find_duplicate_counterparties(
             names, threshold=threshold if threshold is not None else self.dup_threshold
         )
 
     def accounts_summary_df(self) -> pd.DataFrame:
-        """
-        Сводка по счетам для листа «По счетам» в экспорте Excel/PDF
-        """
-
-        columns: list[str] = [
-            "Счет", "Кол-во нарушений",
-            "Проверки", "Периоды",
-            "Сумма", "Дубли контрагентов"
-        ]
+        columns: list[str] = ["Счет", "Кол-во нарушений", "Проверки", "Периоды", "Сумма", "Дубли контрагентов"]
         details = self.details_df()
         if details.empty:
             return pd.DataFrame(columns=columns)
@@ -1119,21 +1185,22 @@ class AutoAuditor1C:
             g = self.account_report_df(account)
             checks = sorted(set(g["Проверка"].astype(str)))
             periods = sorted(p for p in set(g["Период"].astype(str)) if p)
+
+            # Мы не суммируем ошибку 12 раз! Берем только актуальную сумму
+            max_per_issue = g.groupby(["Проверка", "Организация", "Субконто"], dropna=False)["Сумма"].max()
+            total_sum = round(float(max_per_issue.sum()), 2)
+
             rows.append({
                 "Счет": account,
                 "Кол-во нарушений": len(g),
                 "Проверки": "; ".join(checks),
                 "Периоды": ", ".join(periods),
-                "Сумма": round(float(g["Сумма"].sum()), 2),
+                "Сумма": total_sum,
                 "Дубли контрагентов": len(self.account_subconto_duplicates(account)),
             })
         return pd.DataFrame(rows, columns=columns)
 
     def _meta_payload(self) -> dict:
-        """
-        Реквизиты отчета (организация/период/заголовок) из self.meta
-        """
-
         payload: dict = {}
         for key in ("title", "organization", "period"):
             value = self.meta.get(key)
@@ -1142,11 +1209,23 @@ class AutoAuditor1C:
         return payload
 
     def report(self) -> dict:
+        details = self.details_df()
+        if not details.empty:
+            total_flags = len(details)
+            total_amount = float(
+                details.groupby(
+                    ["Проверка", "Организация", "Счет", "Субконто"], dropna=False
+                )["Сумма"].max().sum()
+            )
+        else:
+            total_flags = 0
+            total_amount = 0.0
+
         result = {
-            "total_flags": sum(len(e["data"]) for e in self.errors),
-            "total_amount": sum(e["amount"] for e in self.errors),
+            "total_flags": total_flags,
+            "total_amount": total_amount,
             "summary": self.summary_df(),
-            "details": self.details_df()
+            "details": details
         }
         result.update(self._meta_payload())
         if not self.errors:
@@ -1156,18 +1235,14 @@ class AutoAuditor1C:
         return result
 
     def to_excel(self, account_pass: dict | None = None) -> bytes:
-        """
-        Сводный + детальный отчет с цветовой индикацией (ТЗ п.6, 14).
-
-        :param account_pass: результат автопрохода по счетам (см. core.account_pass)
-            — добавляет лист «Проход по счетам».
-        """
-
         from openpyxl.styles import Alignment, Font, PatternFill
 
         summary = self.summary_df()
         details = self.details_df()
+        details = details.drop(columns=["Субконто", "Договор"], errors="ignore")
         by_account = self.accounts_summary_df()
+        top_findings = self.top_findings_df(TOP_FINDINGS_LIMIT)
+        top_findings = top_findings.drop(columns=["Субконто"], errors="ignore")
 
         pass_details = pd.DataFrame()
         if account_pass is not None:
@@ -1175,16 +1250,20 @@ class AutoAuditor1C:
             if pd_ is not None and not getattr(pd_, "empty", True):
                 pass_details = pd_
 
+        n_err = sum(len(e["data"]) for e in self.errors if e["level"] == "error")
+        status_label = "Есть ошибки" if n_err else ("Есть предупреждения" if self.errors else "Успешно")
+
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            if self._meta_payload():
-                meta_rows = [
-                    {"Параметр": "Заголовок", "Значение": self.meta.get("title", "")},
-                    {"Параметр": "Организация", "Значение": self.meta.get("organization", "")},
-                    {"Параметр": "Период", "Значение": self.meta.get("period", "")},
-                    {"Параметр": "Сформировано", "Значение": pd.Timestamp.now().strftime("%d.%m.%Y %H:%M")},
-                ]
-                pd.DataFrame(meta_rows).to_excel(writer, sheet_name="Об отчете", index=False)
+            meta_payload = self._meta_payload()
+            meta_rows = [
+                {"Параметр": "Заголовок", "Значение": meta_payload.get("title", "")},
+                {"Параметр": "Организация", "Значение": meta_payload.get("organization", "")},
+                {"Параметр": "Период", "Значение": meta_payload.get("period", "")},
+                {"Параметр": "Сформировано", "Значение": pd.Timestamp.now().strftime("%d.%m.%Y %H:%M")},
+                {"Параметр": "Статус", "Значение": status_label},
+            ]
+            pd.DataFrame(meta_rows).to_excel(writer, sheet_name="Обзор", index=False)
 
             summary.to_excel(writer, sheet_name="Сводный отчет", index=False)
             details.to_excel(writer, sheet_name="Детальный отчет", index=False)
@@ -1197,54 +1276,114 @@ class AutoAuditor1C:
             header_font = Font(color="FFFFFF", bold=True)
             red_fill = PatternFill("solid", fgColor="FFC7CE")
             yellow_fill = PatternFill("solid", fgColor="FFEB9C")
+            title_font = Font(bold=True, size=12)
+            header_align = Alignment(horizontal="center", vertical="top", wrap_text=True)
 
-            # Индекс колонки «Уровень» внутри листа: у сводного и детального
-            # отчётов она вторая (1); в «По счетам» колонки «Уровень» нет вовсе.
-            sheets_to_color: list[tuple] = [
-                ("Сводный отчет", 1),
-                ("Детальный отчет", 1),
-            ]
+            def _finish_table_sheet(ws) -> None:
+                for cell in ws[1]:
+                    cell.fill = header_fill
+                    cell.font = header_font
+                    cell.alignment = header_align
+                ws.freeze_panes = "A2"
+                ws.auto_filter.ref = ws.dimensions
+                self._excel_fit_widths(ws)
+                self._excel_money_formats(ws)
+
+            overview = writer.sheets["Обзор"]
+            blocks: list[tuple[int, pd.DataFrame]] = []
+
+            def _add_block(cursor: int, title: str, frame: pd.DataFrame) -> int:
+                overview.cell(row=cursor + 1, column=1, value=title).font = title_font
+                header_row = cursor + 2
+                frame.to_excel(writer, sheet_name="Обзор", index=False, startrow=cursor + 1)
+                blocks.append((header_row, frame))
+                return cursor + 2 + len(frame) + 1
+
+            cursor = len(meta_rows) + 2
+            if not summary.empty:
+                cursor = _add_block(cursor, "Сводка по проверкам", summary)
+            if not top_findings.empty:
+                cursor = _add_block(cursor, "Крупнейшие нарушения", top_findings)
+
+            overview["A1"].fill = header_fill
+            overview["B1"].fill = header_fill
+            overview["A1"].font = header_font
+            overview["B1"].font = header_font
+            for i in range(2, len(meta_rows) + 1):
+                overview.cell(row=i, column=1).font = Font(bold=True)
+            for header_row, frame in blocks:
+                for j in range(1, len(frame.columns) + 1):
+                    cell = overview.cell(row=header_row, column=j)
+                    cell.fill = header_fill
+                    cell.font = header_font
+                    cell.alignment = header_align
+                if "Уровень" in frame.columns:
+                    lvl_j = list(frame.columns).index("Уровень") + 1
+                    for i in range(len(frame)):
+                        level = overview.cell(row=header_row + 1 + i, column=lvl_j).value
+                        fill = red_fill if level == "error" else (yellow_fill if level == "warning" else None)
+                        if fill:
+                            for j in range(1, len(frame.columns) + 1):
+                                overview.cell(row=header_row + 1 + i, column=j).fill = fill
+                for j, h in enumerate(frame.columns, start=1):
+                    if str(h) in _MONEY_COLUMNS:
+                        for row_cells in overview.iter_rows(
+                            min_row=header_row + 1, max_row=header_row + len(frame), min_col=j, max_col=j
+                        ):
+                            for cell in row_cells:
+                                cell.number_format = _EXCEL_MONEY_FORMAT
+
+            sheets_to_color = [("Сводный отчет", 1), ("Детальный отчет", 1)]
             if not pass_details.empty:
                 sheets_to_color.append(("Проход по счетам", 2))
 
             for sheet, level_col in sheets_to_color:
                 ws = wb[sheet]
-                for cell in ws[1]:
-                    cell.fill = header_fill
-                    cell.font = header_font
-                    cell.alignment = Alignment(horizontal="center")
+                _finish_table_sheet(ws)
                 for row in ws.iter_rows(min_row=2):
                     level = row[level_col].value
-                    if level == "error":
-                        fill = red_fill
-                    elif level == "warning":
-                        fill = yellow_fill
-                    else:
-                        continue
-                    for cell in row:
-                        cell.fill = fill
+                    fill = red_fill if level == "error" else (yellow_fill if level == "warning" else None)
+                    if fill:
+                        for cell in row:
+                            cell.fill = fill
+
+            _finish_table_sheet(wb["По счетам"])
 
         return buf.getvalue()
 
-    # ============ PDF-отчет (ТЗ п.6.2) ============
+    @staticmethod
+    def _excel_fit_widths(ws, cap: int = 55) -> None:
+        from openpyxl.utils import get_column_letter
+        widths: dict[int, int] = {}
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value is None:
+                    continue
+                length = len(str(cell.value))
+                if length > widths.get(cell.column, 0):
+                    widths[cell.column] = length
+        for idx, width in widths.items():
+            ws.column_dimensions[get_column_letter(idx)].width = min(cap, max(9, width + 2))
+
+    @staticmethod
+    def _excel_money_formats(ws) -> None:
+        from openpyxl.utils import get_column_letter
+        for cell in ws[1]:
+            if str(cell.value) in _MONEY_COLUMNS:
+                letter = get_column_letter(cell.column)
+                for row_cells in ws[f"{letter}2:{letter}{ws.max_row}"]:
+                    for c in row_cells:
+                        c.number_format = _EXCEL_MONEY_FORMAT
+
     @staticmethod
     def _find_pdf_font() -> str | None:
-        """
-        Ищет TTF-шрифт с кириллицей: встроенный DejaVu, затем системные (Windows/Linux).
-        """
-
         import os
-
         bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "DejaVuSans.ttf")
         candidates = [
             bundled,
-            r"C:\Windows\Fonts\arial.ttf",
-            r"C:\Windows\Fonts\segoeui.ttf",
-            r"C:\Windows\Fonts\times.ttf",
-            r"C:\Windows\Fonts\DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\segoeui.ttf", r"C:\Windows\Fonts\times.ttf",
+            r"C:\Windows\Fonts\DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         ]
         for path in candidates:
@@ -1253,238 +1392,219 @@ class AutoAuditor1C:
         return None
 
     @staticmethod
-    def _pdf_header(pdf, headers: list[str], widths: Sequence[float]) -> None:
-        pdf.set_fill_color(68, 114, 196)
-        pdf.set_text_color(255, 255, 255)
-        for w, h in zip(widths, headers):
-            pdf.cell(w, 7, h, border=1, fill=True, align="C")
-        pdf.ln()
-        pdf.set_text_color(0, 0, 0)
+    def _register_pdf_fonts(pdf, font_path: str) -> bool:
+        import os as _os
+        pdf.add_font("DejaVu", "", font_path)
+        candidates = [
+            _os.path.join(_os.path.dirname(font_path), "DejaVuSans-Bold.ttf"),
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ]
+        for path in candidates:
+            if _os.path.exists(path):
+                pdf.add_font("DejaVu", "B", path)
+                return True
+        return False
 
     @staticmethod
-    def _pdf_row(pdf, values: list[str], widths: Sequence[float]) -> None:
-        for w, v in zip(widths, values):
-            pdf.cell(w, 6, str(v), border=1)
-        pdf.ln()
+    def _pdf_table(
+        pdf,
+        headers: Sequence[str],
+        rows: Sequence[Sequence[Any]],
+        widths: Sequence[float],
+        has_bold: bool = False,
+    ) -> None:
+        from fpdf.fonts import FontFace
+        usable = pdf.w - pdf.l_margin - pdf.r_margin
+        total = float(sum(widths)) or 1.0
+        col_widths = [w / total * usable for w in widths]
+
+        aligns: list[str] = []
+        fmts: list = []
+        for h in headers:
+            if h in _RUB_PDF_COLUMNS:
+                aligns.append("RIGHT")
+                fmts.append(_fmt_rub)
+            elif h in _NUM_PDF_COLUMNS:
+                aligns.append("RIGHT")
+                fmts.append(_fmt_num)
+            elif h in ("Дата", "Период"):
+                aligns.append("LEFT")
+                fmts.append(_fmt_date)
+            else:
+                aligns.append("LEFT")
+                fmts.append(lambda v: "" if v is None else str(v))
+
+        headings_style = FontFace(fill_color=(235, 238, 242), emphasis="BOLD" if has_bold else None)
+        pdf.set_font("DejaVu", size=8)
+        with pdf.table(
+            col_widths=tuple(col_widths), text_align=tuple(aligns), line_height=4.4,
+            padding=1.2, headings_style=headings_style, cell_fill_color=(249, 250, 251),
+            cell_fill_mode="ROWS",
+        ) as table:
+            hr = table.row()
+            for h in headers:
+                hr.cell(h)
+            for row in rows:
+                tr = table.row()
+                for i, v in enumerate(row):
+                    tr.cell(fmts[i](v))
+        pdf.ln(2)
 
     def to_pdf(self, account_pass: dict | None = None) -> bytes:
-        """
-        Печатный отчет в PDF (ТЗ п.6.2): шапка с реквизитами, сводный
-        и детальный отчет, рекомендации, отчет по счетам.
-
-        :param account_pass: результат автопрохода по счетам (см. core.account_pass)
-            — добавляет раздел «Автопроход по счетам».
-
-        Требует fpdf2 и шрифт с кириллицей (встроенный fonts/DejaVuSans.ttf).
-        """
-
         try:
             from fpdf import FPDF
             from fpdf.enums import XPos, YPos
-        except ImportError as exc:  # pragma: no cover - зависит от окружения
-            raise ImportError(
-                "PDF-экспорт требует библиотеку fpdf2. Установите: pip install fpdf2"
-            ) from exc
+        except ImportError as exc:
+            raise ImportError("PDF-экспорт требует библиотеку fpdf2.") from exc
 
         font_path = self._find_pdf_font()
-        if font_path is None:  # pragma: no cover - зависит от окружения
-            raise RuntimeError(
-                "Не найден шрифт с кириллицей для PDF. Проверьте наличие "
-                "fonts/DejaVuSans.ttf рядом с auditor.py."
-            )
+        if font_path is None:
+            raise RuntimeError("Не найден шрифт с кириллицей для PDF.")
 
-        pdf = FPDF(format="A4")
+        class _AuditPdf(FPDF):
+            def footer(self) -> None:
+                self.set_y(-12)
+                self.set_font("DejaVu", size=8)
+                self.set_text_color(130, 130, 130)
+                self.cell(0, 6, f"Стр. {self.page_no()}", align="C")
+
+        pdf = _AuditPdf(format="A4")
         pdf.set_margins(10, 10, 10)
-        pdf.add_font("DejaVu", "", font_path)
+        has_bold = self._register_pdf_fonts(pdf, font_path)
+        pdf.set_auto_page_break(auto=True, margin=16)
         pdf.add_page()
 
-        pdf.set_font("DejaVu", size=14)
-        pdf.cell(
-            0, 10,
-            self.meta.get("title") or "Отчет автоматического аудита 1С",
-            new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C"
-        )
+        meta = self._meta_payload()
+        pdf.set_font("DejaVu", size=14, style="B" if has_bold else "")
+        pdf.cell(0, 8, meta.get("title", "Отчет аудита бухгалтерских баз 1С"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(2)
-
         pdf.set_font("DejaVu", size=10)
-        for label, value in (
-            ("Организация", self.meta.get("organization", "")),
-            ("Период", self.meta.get("period", "")),
-        ):
-            if value:
-                pdf.cell(
-                    0, 6,
-                    f"{label}: {value}",
-                    new_x=XPos.LMARGIN, new_y=YPos.NEXT
-                )
-        pdf.cell(
-            0, 6,
-            f"Сформировано: {pd.Timestamp.now().strftime('%d.%m.%Y %H:%M')}",
-            new_x=XPos.LMARGIN, new_y=YPos.NEXT
-        )
-        pdf.ln(3)
+        pdf.cell(0, 6, f"Организация: {meta.get('organization', '—')}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(0, 6, f"Период: {meta.get('period', '—')}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(0, 6, f"Дата отчета: {pd.Timestamp.now().strftime('%d.%m.%Y %H:%M')}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-        report = self.report()
-        pdf.set_font("DejaVu", size=12)
-        pdf.cell(
-            0, 8, f"Статус: {report['status_label']}",
-            new_x=XPos.LMARGIN, new_y=YPos.NEXT
-        )
-        pdf.set_font("DejaVu", size=10)
-        pdf.cell(
-            0, 6,
-            f"Красных флагов: {report['total_flags']}; ",
-            new_x=XPos.LMARGIN, new_y=YPos.NEXT
-        )
-        pdf.ln(3)
+        sections = self._sections()
+        n_err_rows = int(sum(len(e["data"]) for e in self.errors if e["level"] == "error"))
+        n_warn_rows = int(sum(len(e["data"]) for e in self.errors if e["level"] == "warning"))
+        counts = []
+        if n_err_rows:
+            counts.append(f"Ошибок: {n_err_rows}")
+        if n_warn_rows:
+            counts.append(f"Предупреждений: {n_warn_rows}")
+        pdf.cell(0, 6, " · ".join(counts) if counts else "Нарушений не выявлено", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
+        status = "Есть ошибки" if n_err_rows else ("Есть предупреждения" if n_warn_rows else "Успешно")
+        status_rgb = (156, 0, 6) if n_err_rows else ((156, 101, 0) if n_warn_rows else (0, 128, 0))
+        pdf.set_text_color(*status_rgb)
+        pdf.set_font("DejaVu", size=10, style="B" if has_bold else "")
+        pdf.cell(0, 6, f"Статус: {status}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_text_color(0, 0, 0)
+
+        if not sections:
+            pdf.ln(4)
+            pdf.set_text_color(0, 128, 0)
+            pdf.cell(0, 7, "Нарушений не выявлено.", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_text_color(0, 0, 0)
+            return bytes(pdf.output())
+
+        pdf.ln(4)
         summary = self.summary_df()
-        pdf.set_font("DejaVu", size=12)
-        pdf.cell(0, 8, "Сводный отчет", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_font("DejaVu", size=8)
-        sum_widths = [58, 22, 16, 38, 56]
-        self._pdf_header(pdf, list(summary.columns), sum_widths)
-        for _, r in summary.iterrows():
-            self._pdf_row(pdf, [
-                str(r["Проверка"])[:32],
-                str(r["Уровень"]),
-                str(r["Строк"]),
-                f"{r['Сумма']:,.2f}",
-                str(r["Рекомендации"])[:80],
-            ], sum_widths)
-        pdf.ln(4)
-
-        pdf.set_font("DejaVu", size=12)
-        pdf.cell(0, 8, "Рекомендации", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_font("DejaVu", size=9)
-        for _, r in summary.iterrows():
-            if not r["Рекомендации"]:
-                continue
-            pdf.multi_cell(
-                0, 5, f"{r['Проверка']}: {r['Рекомендации']}",
-                new_x=XPos.LMARGIN, new_y=YPos.NEXT
-            )
-        pdf.ln(4)
-
-        details = self.details_df()
-        pdf.set_font("DejaVu", size=12)
-        pdf.cell(0, 8, "Детальный отчет", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_font("DejaVu", size=7)
-        det_widths: list[int] = [32, 12, 16, 10, 18, 18, 13, 13, 13, 45]
-        self._pdf_header(pdf, list(details.columns), det_widths)
-        for _, r in details.iterrows():
-            self._pdf_row(pdf, [
-                str(r["Проверка"])[:20],
-                str(r["Уровень"]),
-                str(r["Период"])[:12],
-                str(r["Счет"])[:8],
-                str(r["Субконто"])[:14],
-                str(r["Договор"])[:14],
-                f"{r['Дебет']:,.0f}",
-                f"{r['Кредит']:,.0f}",
-                f"{r['Сумма']:,.0f}",
-                str(r["Комментарий"])[:45],
-            ], det_widths)
-
-        # Отчет по счетам
-        accounts = self.accounts_with_errors()
-        if accounts:
-            pdf.add_page()
-            pdf.set_font("DejaVu", size=12)
-            pdf.cell(0, 8, "Отчет по счетам", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            acc_widths = [34, 34, 18, 18, 34, 18]
-            self._pdf_header(
-                pdf,
+        if not summary.empty:
+            pdf.set_text_color(68, 114, 196)
+            pdf.set_font("DejaVu", size=11, style="B" if has_bold else "")
+            pdf.cell(0, 7, "Сводка по проверкам", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_text_color(0, 0, 0)
+            sum_rows = [
                 [
-                    "Проверка", "Период",
-                    "Субконто", "Дебет",
-                    "Кредит", "Сумма"
-                ],
-                acc_widths
-            )
-            for account in accounts:
-                acc_rep = self.account_report_df(account)
-                dups = self.account_subconto_duplicates(account)
-                pdf.set_font("DejaVu", size=10)
-                pdf.cell(
-                    0, 7,
-                    f"Счет {account} — нарушений: {len(acc_rep)}, "
-                    f"дублей контрагентов: {len(dups)}",
-                    new_x=XPos.LMARGIN, new_y=YPos.NEXT
-                )
-                pdf.set_font("DejaVu", size=7)
-                for _, r in acc_rep.iterrows():
-                    self._pdf_row(pdf, [
-                        str(r["Проверка"])[:20],
-                        str(r["Период"])[:12],
-                        str(r["Субконто"])[:12],
-                        f"{r['Дебет']:,.0f}",
-                        f"{r['Кредит']:,.0f}",
-                        f"{r['Сумма']:,.0f}",
-                    ], acc_widths)
-                if not dups.empty:
-                    pdf.set_font("DejaVu", size=7)
-                    for _, d in dups.iterrows():
-                        pdf.cell(
-                            0, 5,
-                            f"  Дубль: {d['Название А']} ≈ {d['Название Б']} "
-                            f"({d['Сходство']:.0f}%)",
-                            new_x=XPos.LMARGIN, new_y=YPos.NEXT
-                        )
+                    _SHORT_PDF_LABELS.get(str(r["Проверка"]), str(r["Проверка"])),
+                    _LEVEL_RU.get(str(r["Уровень"]), str(r["Уровень"])),
+                    int(r["Строк"]), float(r["Сумма"]),
+                ]
+                for _, r in summary.iterrows()
+            ]
+            self._pdf_table(pdf, ["Проверка", "Уровень", "Строк", "Сумма"], sum_rows, [64, 26, 14, 24], has_bold=has_bold)
+
+            top = self.top_findings_df(TOP_FINDINGS_LIMIT)
+            if not top.empty:
                 pdf.ln(2)
-
-        # Автопроход по счетам (1С:Фреш)
-        if account_pass is not None:
-            pass_details = account_pass.get("details_df")
-            if pass_details is not None and not getattr(pass_details, "empty", True):
-                pass_summary = account_pass.get("summary_df")
-                pass_dups = account_pass.get("duplicates_df")
-
-                pdf.add_page()
-                pdf.set_font("DejaVu", size=12)
-                pdf.cell(
-                    0, 8, "Автопроход по счетам (1С:Фреш)",
-                    new_x=XPos.LMARGIN, new_y=YPos.NEXT
+                pdf.set_text_color(68, 114, 196)
+                pdf.set_font("DejaVu", size=11, style="B" if has_bold else "")
+                pdf.cell(0, 7, "Крупнейшие нарушения", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                pdf.set_text_color(0, 0, 0)
+                top_rows = [
+                    [
+                        _SHORT_PDF_LABELS.get(str(r["Проверка"]), str(r["Проверка"])),
+                        r["Период"], r["Организация"], r["Счет"], r["Субконто"], float(r["Сумма"]),
+                    ]
+                    for _, r in top.iterrows()
+                ]
+                self._pdf_table(
+                    pdf, ["Проверка", "Период", "Орг.", "Счет", "Субконто", "Сумма"],
+                    top_rows, [30, 16, 18, 12, 34, 20], has_bold=has_bold,
                 )
-                if pass_summary is not None and not getattr(pass_summary, "empty", True):
-                    pdf.set_font("DejaVu", size=8)
-                    sum_widths = [40, 30, 22, 22, 34, 40]
-                    self._pdf_header(pdf, list(pass_summary.columns), sum_widths)
-                    for _, r in pass_summary.iterrows():
-                        self._pdf_row(pdf, [
-                            str(r["Счет"])[:8],
-                            str(r["Строк нарушений"]),
-                            str(r["Уровень"])[:10],
-                            str(r["Субконто"]),
-                            f"{r['Сумма']:,.0f}",
-                            str(r["Ошибка"])[:35],
-                        ], sum_widths)
-                    pdf.ln(3)
 
-                pdf.set_font("DejaVu", size=10)
-                for account in sorted(set(str(c) for c in pass_details["Счет"].dropna())):
-                    acc_rows = pass_details[pass_details["Счет"].astype(str) == account]
-                    dups_n = 0
-                    if pass_dups is not None and not pass_dups.empty:
-                        dups_n = int((pass_dups["Счет"].astype(str) == account).sum())
-                    pdf.cell(
-                        0, 7,
-                        f"Счет {account} — нарушений: {len(acc_rows)}, "
-                        f"дублей контрагентов: {dups_n}",
-                        new_x=XPos.LMARGIN, new_y=YPos.NEXT
-                    )
-                    pdf.set_font("DejaVu", size=7)
-                    for _, r in acc_rows.iterrows():
-                        self._pdf_row(pdf, [
-                            str(r.get("Проверка", ""))[:20],
-                            str(r.get("Уровень", "")),
-                            str(r.get("Период", ""))[:12],
-                            str(r.get("Субконто", ""))[:14],
-                            f"{r.get('Дебет', 0.0):,.0f}",
-                            f"{r.get('Кредит', 0.0):,.0f}",
-                            f"{r.get('Сумма', 0.0):,.0f}",
-                        ], [48, 16, 28, 30, 22, 22, 26])
-                    pdf.set_font("DejaVu", size=10)
-                    pdf.ln(2)
+        for s in sections:
+            df = s["df"]
+            if pdf.get_y() > 230:
+                pdf.add_page()
+            pdf.ln(3)
+            pdf.set_text_color(*_LEVEL_PDF_COLOR.get(s["level"], (0, 0, 0)))
+            pdf.set_font("DejaVu", size=11, style="B" if has_bold else "")
+            pdf.cell(0, 7, s["title"], new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_text_color(95, 95, 95)
+            pdf.set_font("DejaVu", size=8.5)
+            if s["recommendation"]:
+                pdf.multi_cell(0, 4.2, s["recommendation"])
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(1)
+
+            headers = list(df.columns)
+            widths = [_PDF_COL_STYLE.get(h, (20, "LEFT"))[0] for h in headers]
+            rows = [[v for v in rec] for rec in df.to_numpy()]
+            self._pdf_table(pdf, headers, rows, widths, has_bold=has_bold)
+
+        pass_details = pd.DataFrame()
+        pass_dups = pd.DataFrame()
+        if account_pass is not None:
+            details = account_pass.get("details_df")
+            dups = account_pass.get("duplicates_df")
+            if details is not None:
+                pass_details = details
+            if dups is not None:
+                pass_dups = dups
+
+        if not pass_details.empty:
+            if pdf.get_y() > 200:
+                pdf.add_page()
+            else:
+                pdf.ln(4)
+            pdf.set_text_color(68, 114, 196)
+            pdf.set_font("DejaVu", size=11, style="B" if has_bold else "")
+            pdf.cell(0, 7, "Автопроход по счетам", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_text_color(0, 0, 0)
+
+            pass_headers = ["Проверка", "Период", "Субконто", "Дебет", "Кредит", "Сумма"]
+            pass_widths = [_PDF_COL_STYLE[h][0] for h in pass_headers]
+            accounts = sorted(set(str(c) for c in pass_details["Счет"].dropna()))
+            for account in accounts:
+                acc_rows = pass_details[pass_details["Счет"].astype(str) == account]
+                dups_n = 0
+                if not pass_dups.empty and "Счет" in pass_dups.columns:
+                    dups_n = int((pass_dups["Счет"].astype(str) == account).sum())
+                note = f"Счет {account} — нарушений: {len(acc_rows)}"
+                if dups_n:
+                    note += f", дублей контрагентов: {dups_n}"
+                pdf.set_font("DejaVu", size=10, style="B" if has_bold else "")
+                pdf.cell(0, 6, note, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                table_rows = [
+                    [
+                        r.get("Проверка", ""), r.get("Период", ""), r.get("Субконто", ""),
+                        r.get("Дебет", 0.0), r.get("Кредит", 0.0), r.get("Сумма", 0.0),
+                    ]
+                    for _, r in acc_rows.iterrows()
+                ]
+                self._pdf_table(pdf, pass_headers, table_rows, pass_widths, has_bold=has_bold)
 
         return bytes(pdf.output())

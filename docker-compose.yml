@@ -7,9 +7,13 @@ services:
   app:
     build: .
     image: accounting_irk:latest
+    env_file:
+      - .env
     container_name: accounting_irk
     ports:
       - "8501:8501"
+    volumes:
+      - ./client_databases.json:/app/client_databases.json:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]

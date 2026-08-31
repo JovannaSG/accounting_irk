@@ -83,6 +83,19 @@ def test_turnover_skip_single_period():
     assert detect_turnover_jumps(df).empty
 
 
+def test_turnover_jump_chronology_across_year_boundary():
+    """Даты «дд.мм.гггг» упорядочиваются по календарю: декабрь → январь,
+    а не лексикографически («31.01…» раньше «31.12…»)."""
+
+    df = osv([
+        ["31.01.2026", "51", "Расчетный", "A", 0, 0, 10000000, 500, 0, 0],
+        ["31.12.2025", "51", "Расчетный", "A", 0, 0, 1000, 500, 0, 0],
+    ])
+    res = detect_turnover_jumps(df, min_abs=1000)
+    assert len(res) == 1
+    assert res.iloc[0]["Период"] == "31.01.2026"
+
+
 # ---------------- Дубли контрагентов ----------------
 def test_duplicate_pair_found():
     res = find_duplicate_counterparties(["ООО \"Ромашка\"", "Ромашка, ООО", "ООО Вектор"])

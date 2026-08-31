@@ -30,11 +30,6 @@ _OSV_FIELDS: dict[str, list[str]] = {
     "КонецКредит": ["СуммаClosingBalanceCr", "ОстатокКтКонеч", "СКК", "КонецКредит"],
 }
 
-_OSV_SELECT: str = ",".join(
-    ["Account_Key"]
-    + [candidates[0] for candidates in _OSV_FIELDS.values()]
-)
-
 
 class OneCClient:
     def __init__(self, base_url: str, username: str, password: str) -> None:
@@ -74,7 +69,7 @@ class OneCClient:
 
             if len(chunk) < params.get("$top", 1000):
                 break
-            params["$skip"] = params.get("$skip", 0) + params["$top"]
+            params["$skip"] = params.get("$skip", 0) + params.get("$top", 1000)
 
         return all_records
 
@@ -100,7 +95,8 @@ class OneCClient:
         catalogs = [
             "Catalog_Контрагенты",
             "Catalog_ДоговорыКонтрагентов",
-            "Catalog_ФизическиеЛица"
+            "Catalog_ФизическиеЛица",
+            "Catalog_Организации"
         ]
 
         logger.info("Предзагрузка справочников (Контрагенты, Договоры, Физлица) для аналитики...")
@@ -130,8 +126,12 @@ class OneCClient:
         if self._code_by_key:
             return self._code_by_key
 
-        endpoint = f"{self.base_url}/odata/standard.odata/ChartOfAccounts_Хозрасчетный"
-        params = {"$format": "json", "$select": "Ref_Key,Code", "$top": 1000, "$skip": 0}
+        endpoint: str = f"{self.base_url}/odata/standard.odata/ChartOfAccounts_Хозрасчетный"
+        params: dict = {
+            "$format": "json",
+            "$select": "Ref_Key,Code"
+        }
+
         records = self._paginate(endpoint, params)
 
         with self._cache_lock:
@@ -163,6 +163,12 @@ class OneCClient:
             return code_by_key[str(key)]
         return None
 
+    @staticmethod
+    def extract_organizations(df: pd.DataFrame) -> list[str]:
+        if "Организация" not in df.columns:
+            return []
+        return sorted(df["Организация"].dropna().unique().tolist())
+
     # Расшифровка GUID по локальному кэшу
     def _record_subconto(self, rec: dict) -> str:
         val = rec.get("ExtDimension1")
@@ -181,6 +187,19 @@ class OneCClient:
         val = rec.get("ExtDimension2")
         if not val:
             return "-"
+        if isinstance(val, dict):
+            return val.get("Description") \
+                or val.get("Наименование") \
+                or val.get("Name") \
+                or str(val)
+
+        val_str = str(val)
+        return self._guid_to_name.get(val_str, val_str)
+
+    def _record_organization(self, rec: dict) -> str:
+        val = rec.get("Organization_Key") or rec.get("Организация_Key")
+        if not val:
+            return ""
         if isinstance(val, dict):
             return val.get("Description") \
                 or val.get("Наименование") \
@@ -209,10 +228,11 @@ class OneCClient:
             if account_code is not None and acc_code != account_code:
                 continue
             row: dict[str, Any] = {
-                "Период": period_end,
+                "Период": str(period_end).split("T")[0],
                 "Счет": acc_code,
                 "Субконто": self._record_subconto(rec),
                 "Договор": self._record_contract(rec),
+                "Организация": self._record_organization(rec),
             }
             for target, candidates in _OSV_FIELDS.items():
                 value = None
@@ -238,39 +258,64 @@ class OneCClient:
 
         return pd.DataFrame(rows, columns=OSV_COLUMNS)
 
-    def fetch_osv(self, period_start: str, period_end: str) -> pd.DataFrame:
+    def fetch_osv(self, period_start: str, period_end: str, with_org: bool = True) -> pd.DataFrame:
         register: str = "AccountingRegister_Хозрасчетный"
-        method: str = f"BalanceAndTurnovers(StartPeriod=datetime'{period_start}', EndPeriod=datetime'{period_end}')"
+        # Жёстко приклеиваем последнюю секунду дня к границе EndPeriod: 1С иначе
+        # интерпретирует голую дату (2026-01-31) как начало дня 00:00:00 и обрезает
+        # регламентные операции (закрытие месяца 90/91), проведённые в 23:59:59.
+        period_start_safe: str = self._start_of_day(period_start)
+        period_end_safe: str = self._end_of_day(period_end)
+        method: str = f"BalanceAndTurnovers(StartPeriod=datetime'{period_start_safe}', EndPeriod=datetime'{period_end_safe}')"
         endpoint: str = f"{self.base_url}/odata/standard.odata/{register}/{method}"
+
+        # Динамически собираем $select, учитывая Организацию
+        select_fields = ["Account_Key"]
+        if with_org:
+            select_fields.append("Организация_Key")
+        select_fields.extend([candidates[0] for candidates in _OSV_FIELDS.values()])
 
         params: dict[str, Any] = {
             "$format": "json",
-            "$select": _OSV_SELECT,
+            "$select": ",".join(select_fields),
             "$top": 1000,
             "$skip": 0,
         }
-        records = self._paginate(endpoint, params)
+        try:
+            records = self._paginate(endpoint, params)
+        except ValueError as e:
+            # Если поле Организации недоступно, 1С вернет 400 Bad Request.
+            # Мягко откатываемся к запросу без Организации.
+            if with_org and ("400" in str(e) or "404" in str(e)):
+                logger.warning("Поле Организация_Key недоступно, повторяем без него...")
+                return self.fetch_osv(period_start, period_end_safe, with_org=False)
+            raise
+
         if not records:
             return pd.DataFrame(columns=OSV_COLUMNS)
         return self._records_to_osv(records, period_end)
 
-    def fetch_osv_account_subconto(self, period_start: str, period_end: str, account_code: str) -> pd.DataFrame:
+    def fetch_osv_account_subconto(
+        self, period_start: str, period_end: str, account_code: str, with_org: bool = True
+    ) -> pd.DataFrame:
         register: str = "AccountingRegister_Хозрасчетный"
         guid = self._get_account_guid(account_code)
+        period_start_safe: str = self._start_of_day(period_start)
+        period_end_safe: str = self._end_of_day(period_end)
 
         if guid:
             method = (
-                f"BalanceAndTurnovers(StartPeriod=datetime'{period_start}', "
-                f"EndPeriod=datetime'{period_end}', "
+                f"BalanceAndTurnovers(StartPeriod=datetime'{period_start_safe}', "
+                f"EndPeriod=datetime'{period_end_safe}', "
                 f"AccountCondition='Account_Key eq guid''{guid}''')"
             )
         else:
-            method = f"BalanceAndTurnovers(StartPeriod=datetime'{period_start}', EndPeriod=datetime'{period_end}')"
+            method = f"BalanceAndTurnovers(StartPeriod=datetime'{period_start_safe}', EndPeriod=datetime'{period_end_safe}')"
 
         endpoint: str = f"{self.base_url}/odata/standard.odata/{register}/{method}"
 
-        # Запрашиваем голые GUID-ы субконто, без $expand (Это спасает 1С от падения)
         base_select: list[str] = ["Account_Key", "ExtDimension1", "ExtDimension2"]
+        if with_org:
+            base_select.append("Организация_Key")
         for candidates in _OSV_FIELDS.values():
             base_select.append(candidates[0])
 
@@ -283,6 +328,11 @@ class OneCClient:
 
         try:
             records = self._paginate(endpoint, params)
+        except ValueError as e:
+            if with_org and ("400" in str(e) or "404" in str(e)):
+                return self.fetch_osv_account_subconto(period_start, period_end_safe, account_code, with_org=False)
+            logger.error(f"Ошибка загрузки счета {account_code}: {e}")
+            records = []
         except Exception as e:
             logger.error(f"Ошибка загрузки счета {account_code}: {e}")
             records = []
@@ -293,10 +343,34 @@ class OneCClient:
         return self._records_to_osv(records, period_end, account_code)
 
     @staticmethod
+    def _end_of_day(period_end: str) -> str:
+        """Возвращает границу периода с последней секундой дня (23:59:59).
+
+        1С OData интерпретирует голую дату (2026-01-31) как начало дня 00:00:00,
+        что отрезает регламентные операции, проведённые в 23:59:59. Если время уже
+        указано — возвращаем значение без изменений.
+        """
+        if "T" in period_end:
+            return period_end
+        return f"{period_end}T23:59:59"
+
+    @staticmethod
+    def _start_of_day(period_start: str) -> str:
+        """Возвращает границу периода с началом дня (00:00:00), если время не указано."""
+        if "T" in period_start:
+            return period_start
+        return f"{period_start}T00:00:00"
+
+    @staticmethod
     def _month_ranges(period_start: str, period_end: str):
         import calendar
         start = pd.to_datetime(period_start, errors="coerce")
         end = pd.to_datetime(period_end, errors="coerce")
+
+        if pd.isna(start) or pd.isna(end):
+            raise ValueError(
+                f"Не удалось распознать даты: start={period_start!r}, end={period_end!r}"
+            )
 
         cursor = start.normalize().replace(day=1, hour=0, minute=0, second=0)
         while cursor <= end:
@@ -319,7 +393,12 @@ class OneCClient:
         period_start: str,
         period_end: str,
         target_accounts: list[str] | None = None
-    ) -> pd.DataFrame:
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        """Собирает ОСВ помесячно через OData и возвращает (df, info).
+
+        Возвращаемый кортеж: (датафрейм ОСВ, служебный словарь `info` с
+        метаданными и проверками целостности `integrity`).
+        """
 
         _DETAILED_ACCOUNTS = ("60", "62", "76", "71", "73", "58", "66", "67")
         if pd.to_datetime(period_start) > pd.to_datetime(period_end):
@@ -343,7 +422,12 @@ class OneCClient:
                 m_range = future_to_month[future]
                 try:
                     agg_dfs_by_month[m_range] = future.result()
-                except Exception:
+                except Exception as e:
+                    # Логируем сбой загрузки: иначе молча вернутся 0 рублей оборота
+                    # за текущий месяц и аудит даст ложные результаты.
+                    logger.error(
+                        f"Ошибка загрузки сводной ОСВ за {m_range}: {e}", exc_info=True
+                    )
                     agg_dfs_by_month[m_range] = pd.DataFrame(columns=OSV_COLUMNS)
 
         detailed_tasks = []
@@ -396,15 +480,39 @@ class OneCClient:
                         if not det_df.empty:
                             mask = agg_df["Счет"] == acc_str
                             if mask.any():
-                                det_df["Тип"] = agg_df[mask]["Тип"].tolist()[0]
+                                det_df["Тип"] = agg_df.loc[mask, "Тип"].iat[0]
                             frames.append(det_df)
                         else:
                             frames.append(agg_df[agg_df["Счет"] == acc_str])
-                    except Exception:
+                    except Exception as e:
+                        # Логируем сбой точечного запроса аналитики.
+                        logger.error(
+                            f"Ошибка загрузки счета {acc_str} за {task['m_range']}: {e}",
+                            exc_info=True,
+                        )
                         frames.append(agg_df[agg_df["Счет"] == acc_str])
 
         if not frames:
-            return pd.DataFrame(columns=OSV_COLUMNS)
+            df = pd.DataFrame(columns=OSV_COLUMNS)
+        else:
+            df = pd.concat(frames, ignore_index=True).reindex(columns=OSV_COLUMNS)
 
-        df = pd.concat(frames, ignore_index=True)
-        return df.reindex(columns=OSV_COLUMNS)
+        # Проверки целостности данных (Вариант B): отделяем реальные математические
+        # аномалии от нейтральных примечаний; результат кладём в info["integrity"].
+        info: dict[str, Any] = {}
+        try:
+            from core.integrity import validate_osv_integrity
+
+            meta = {
+                "source_type": "odata",
+                "db_name": self.base_url,
+                "period": f"{period_start} — {period_end}",
+                "organization": (
+                    ", ".join(self.extract_organizations(df)) if not df.empty else "Не определена"
+                ),
+            }
+            info["integrity"] = validate_osv_integrity(df, meta)
+        except ImportError:
+            logger.warning("Модуль core.integrity не найден. Проверка целостности пропущена.")
+
+        return df, info

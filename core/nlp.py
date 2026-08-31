@@ -131,13 +131,13 @@ def detect_payment_risks(
 
         hits: list[tuple[str, list[str]]] = []
 
-        # 1. Проверяем стандартные паттерны
+        # Проверяем стандартные паттерны
         for category, pattern, marker in compiled:
             if pattern.search(purpose):
                 # Просто добавляем человекочитаемый маркер из RISK_PATTERNS
                 hits.append((category, [marker]))
 
-        # 2. Проверяем пользовательские слова
+        # Проверяем пользовательские слова
         for original_kw, pattern in custom:
             if pattern.search(purpose):
                 hits.append((CUSTOM_CATEGORY, [original_kw])) # Без слешей!

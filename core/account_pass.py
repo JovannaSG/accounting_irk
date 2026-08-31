@@ -40,20 +40,38 @@ def _build_auditor(
     Собирает аудитор с теми же настройками, что и общий аудит
     """
 
-    return AutoAuditor1C(
-        balances,
-        None,  # реестр документов для 1С:Фреш недоступен через OData
-        closing_accounts=options.get("closing_accounts"),
-        checks=set(options.get("checks") or []),
-        meta=meta or {},
-        balance_group_checks=options.get("balance_group_checks", False),
-        ml_enabled=options.get("ml_enabled", False),
-        ml_amount_anomalies=options.get("ml_amount_anomalies", True),
-        ml_turnover_jumps=options.get("ml_turnover_jumps", True),
-        ml_duplicates=options.get("ml_duplicates", True),
-        dup_threshold=options.get("dup_threshold", 90),
-        anomaly_min_abs=options.get("anomaly_min_abs", 1000.0),
-    )
+    # Базовые обязательные настройки
+    kwargs = {
+        "balances_df": balances,
+        "documents_df": None,  # реестр документов недоступен через OData для одного счета
+        "closing_accounts": options.get("closing_accounts"),
+        "meta": meta or {},
+        "balance_group_checks": options.get("balance_group_checks", False),
+        "stuck_balance_checks": options.get("stuck_balance_checks", False),
+        "ml_enabled": options.get("ml_enabled", False),
+        "ml_amount_anomalies": options.get("ml_amount_anomalies", True),
+        "ml_turnover_jumps": options.get("ml_turnover_jumps", True),
+        "ml_duplicates": options.get("ml_duplicates", True),
+        "nlp_enabled": options.get("nlp_enabled", True),
+    }
+
+    # Исправление 1: Если checks не передан, не создаем пустой set()
+    checks = options.get("checks")
+    if checks is not None:
+        kwargs["checks"] = set(checks)
+
+    # Исправление 2: Передаем ML-параметры ТОЛЬКО если они есть,
+    # иначе сработают дефолтные значения из самого AutoAuditor1C
+    ml_params = [
+        "anomaly_k", "anomaly_min_abs", "anomaly_min_ops",
+        "jump_ratio", "jump_min_abs", "dup_threshold"
+    ]
+    for param in ml_params:
+        val = options.get(param)
+        if val is not None:
+            kwargs[param] = val
+
+    return AutoAuditor1C(**kwargs)
 
 
 def _worst_level(details: pd.DataFrame) -> str:

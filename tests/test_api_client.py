@@ -93,7 +93,7 @@ def test_fetch_osv_endpoint_and_schema():
     assert row["Счет"] == "60"
     assert row["Тип"] == "AP"
     assert row["Субконто"] == "-"
-    assert row["Период"] == "2026-06-30T23:59:59"
+    assert row["Период"] == "2026-06-30"
     assert row["НачалоДебет"] == pytest.approx(0.0)
     assert row["НачалоКредит"] == pytest.approx(1000.0)
     assert row["ОборотДебет"] == pytest.approx(500.0)
@@ -104,6 +104,53 @@ def test_fetch_osv_endpoint_and_schema():
     url, params, _ = session.calls[0]
     assert url == REGISTER_EP
     assert params["$format"] == "json"
+
+
+def test_fetch_osv_appends_end_of_day_to_bare_dates():
+    """Голая дата (без времени) в границах периода дополняется до конца дня,
+    чтобы не обрезать регламентные операции 90/91 в 23:59:59."""
+    safe_ep = (
+        f"{FRESH_BASE}/odata/standard.odata/AccountingRegister_Хозрасчетный/"
+        f"BalanceAndTurnovers(StartPeriod=datetime'2026-06-01T00:00:00', "
+        f"EndPeriod=datetime'2026-06-30T23:59:59')"
+    )
+    session = FakeSession(pages={safe_ep: [_make_osv_row("90")], CHART_EP: _chart_rows(["90"])})
+    client = OneCClient(FRESH_BASE, "user", "pass")
+    client.session = session
+
+    df = client.fetch_osv("2026-06-01", "2026-06-30")
+
+    url, _, _ = session.calls[0]
+    assert "EndPeriod=datetime'2026-06-30T23:59:59'" in url
+    assert "StartPeriod=datetime'2026-06-01T00:00:00'" in url
+    # Колонка «Период» остаётся чистой датой (без времени)
+    assert df.iloc[0]["Период"] == "2026-06-30"
+
+
+def test_fetch_osv_account_subconto_appends_end_of_day_to_bare_date():
+    guid = _guid_for("60")
+    safe_ep = (
+        f"{FRESH_BASE}/odata/standard.odata/AccountingRegister_Хозрасчетный/"
+        f"BalanceAndTurnovers(StartPeriod=datetime'2026-02-01T00:00:00', "
+        f"EndPeriod=datetime'2026-02-28T23:59:59', "
+        f"AccountCondition='Account_Key eq guid''{guid}''')"
+    )
+    record = {
+        "Account_Key": guid,
+        "СуммаOpeningBalanceDr": 0.0, "СуммаOpeningBalanceCr": 0.0,
+        "СуммаTurnoverDr": 100.0, "СуммаTurnoverCr": 50.0,
+        "СуммаClosingBalanceDr": 60.0, "СуммаClosingBalanceCr": 0.0,
+    }
+    session = FakeSession(pages={safe_ep: [record], CHART_EP: _chart_rows(["60"])})
+    client = OneCClient(FRESH_BASE, "user", "pass")
+    client.session = session
+
+    df = client.fetch_osv_account_subconto("2026-02-01", "2026-02-28", "60")
+
+    register_url = next(url for url, _, _ in session.calls if "BalanceAndTurnovers" in url)
+    assert "EndPeriod=datetime'2026-02-28T23:59:59'" in register_url
+    assert "StartPeriod=datetime'2026-02-01T00:00:00'" in register_url
+    assert df.iloc[0]["Период"] == "2026-02-28"
 
 
 def test_fetch_osv_type_from_plan_of_accounts():
@@ -240,13 +287,32 @@ def test_fetch_osv_monthly_two_months():
     client = OneCClient(FRESH_BASE, "u", "p")
     client.session = session
 
-    df = client.fetch_osv_monthly("2026-01-01T00:00:00", "2026-02-28T23:59:59")
+    df, _ = client.fetch_osv_monthly("2026-01-01T00:00:00", "2026-02-28T23:59:59")
 
     assert list(df.columns) == OSV_COLUMNS
     assert len(df) == 2
-    assert set(df["Период"]) == {"2026-01-31T23:59:59", "2026-02-28T23:59:59"}
+    assert set(df["Период"]) == {"2026-01-31", "2026-02-28"}
     assert set(df["Счет"]) == {"60", "51"}
     assert any(jan_ep in url for url, _, _ in session.calls)
+
+
+def test_fetch_osv_monthly_attaches_integrity():
+    """fetch_osv_monthly возвращает кортеж (df, info) с отчётом о целостности."""
+    jan_ep = _osv_endpoint("2026-01-01T00:00:00", "2026-01-31T23:59:59")
+    session = FakeSession(pages={
+        jan_ep: [_make_osv_row("60")],
+        CHART_EP: _chart_rows(["60"]),
+    })
+    client = OneCClient(FRESH_BASE, "u", "p")
+    client.session = session
+
+    df, info = client.fetch_osv_monthly("2026-01-01T00:00:00", "2026-01-31T23:59:59")
+
+    assert not df.empty
+    assert isinstance(info, dict)
+    assert "integrity" in info
+    assert "provenance" in info["integrity"]
+    assert info["integrity"]["provenance"]["source_type"] == "odata"
 
 
 def test_fetch_osv_monthly_partial_last_month():
@@ -259,10 +325,10 @@ def test_fetch_osv_monthly_partial_last_month():
     client = OneCClient(FRESH_BASE, "u", "p")
     client.session = session
 
-    df = client.fetch_osv_monthly("2026-03-01T00:00:00", "2026-03-15T23:59:59")
+    df, _ = client.fetch_osv_monthly("2026-03-01T00:00:00", "2026-03-15T23:59:59")
 
     assert len(df) == 1
-    assert df.iloc[0]["Период"] == "2026-03-15T23:59:59"
+    assert df.iloc[0]["Период"] == "2026-03-15"
 
 
 def test_fetch_osv_monthly_empty_range():
@@ -271,10 +337,12 @@ def test_fetch_osv_monthly_empty_range():
     client = OneCClient(FRESH_BASE, "u", "p")
     client.session = session
 
-    df = client.fetch_osv_monthly("2026-01-01T00:00:00", "2026-01-31T23:59:59")
+    df, info = client.fetch_osv_monthly("2026-01-01T00:00:00", "2026-01-31T23:59:59")
 
     assert df.empty
     assert list(df.columns) == OSV_COLUMNS
+    # Даже при пустом диапазоне возвращается служебный словарь info.
+    assert isinstance(info, dict)
 
 
 def test_fetch_osv_monthly_invalid_range():
