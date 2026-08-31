@@ -92,7 +92,7 @@ def verify(login: str, password: str) -> bool:
 
 def auth_enabled() -> bool:
     """
-    Аутентификация включена только когда AUDIT_USERS непустой.
+    Аутентификация включена только когда AUDIT_USERS непустой
     """
 
     return bool(parse_users(os.environ.get(AUDIT_USERS_ENV)))
