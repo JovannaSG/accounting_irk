@@ -21,6 +21,7 @@ from html.parser import HTMLParser
 import pandas as pd
 
 from core.auditor import account_group, normalize_balances
+from core.integrity import validate_osv_integrity
 
 ACCOUNT_CODE_RE = re.compile(r"^[0-9]+(?:\.[A-Za-zА-Яа-я0-9]+)*$")
 TOTAL_KEYWORDS: tuple = ("total", "итого", "всего", "итог", "итого по")
@@ -421,10 +422,10 @@ def load_osv_file(
 
     if fmt in ("csv",):
         csv = _decode_csv(data)
-        return (
-            normalize_balances(csv),
-            {"title": "", "period": "", "organization": ""}
-        )
+        df = normalize_balances(csv)
+        info = {"title": "", "period": "", "organization": ""}
+        _attach_integrity(df, info, filename, source_type="file")
+        return df, info
 
     if fmt in ("xls", "xlsx"):
         engine = "xlrd" if fmt == "xls" else "openpyxl"
@@ -444,7 +445,20 @@ def load_osv_file(
         plan_override=plan_override,
         period_hint=period_hint
     )
-    return normalize_balances(df), info
+    df = normalize_balances(df)
+    _attach_integrity(df, info, filename, source_type="file")
+    return df, info
+
+
+def _attach_integrity(df: pd.DataFrame, info: dict, db_name: str, source_type: str) -> None:
+    """Добавляет отчёт о целостности данных в служебный словарь `info`."""
+    meta = {
+        "source_type": source_type,
+        "db_name": db_name,
+        "period": info.get("period", ""),
+        "organization": info.get("organization", ""),
+    }
+    info["integrity"] = validate_osv_integrity(df, meta)
 
 
 def _decode_csv(data: bytes) -> pd.DataFrame:

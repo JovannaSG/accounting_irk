@@ -260,7 +260,12 @@ class OneCClient:
 
     def fetch_osv(self, period_start: str, period_end: str, with_org: bool = True) -> pd.DataFrame:
         register: str = "AccountingRegister_Хозрасчетный"
-        method: str = f"BalanceAndTurnovers(StartPeriod=datetime'{period_start}', EndPeriod=datetime'{period_end}')"
+        # Жёстко приклеиваем последнюю секунду дня к границе EndPeriod: 1С иначе
+        # интерпретирует голую дату (2026-01-31) как начало дня 00:00:00 и обрезает
+        # регламентные операции (закрытие месяца 90/91), проведённые в 23:59:59.
+        period_start_safe: str = self._start_of_day(period_start)
+        period_end_safe: str = self._end_of_day(period_end)
+        method: str = f"BalanceAndTurnovers(StartPeriod=datetime'{period_start_safe}', EndPeriod=datetime'{period_end_safe}')"
         endpoint: str = f"{self.base_url}/odata/standard.odata/{register}/{method}"
 
         # Динамически собираем $select, учитывая Организацию
@@ -282,7 +287,7 @@ class OneCClient:
             # Мягко откатываемся к запросу без Организации.
             if with_org and ("400" in str(e) or "404" in str(e)):
                 logger.warning("Поле Организация_Key недоступно, повторяем без него...")
-                return self.fetch_osv(period_start, period_end, with_org=False)
+                return self.fetch_osv(period_start, period_end_safe, with_org=False)
             raise
 
         if not records:
@@ -294,15 +299,17 @@ class OneCClient:
     ) -> pd.DataFrame:
         register: str = "AccountingRegister_Хозрасчетный"
         guid = self._get_account_guid(account_code)
+        period_start_safe: str = self._start_of_day(period_start)
+        period_end_safe: str = self._end_of_day(period_end)
 
         if guid:
             method = (
-                f"BalanceAndTurnovers(StartPeriod=datetime'{period_start}', "
-                f"EndPeriod=datetime'{period_end}', "
+                f"BalanceAndTurnovers(StartPeriod=datetime'{period_start_safe}', "
+                f"EndPeriod=datetime'{period_end_safe}', "
                 f"AccountCondition='Account_Key eq guid''{guid}''')"
             )
         else:
-            method = f"BalanceAndTurnovers(StartPeriod=datetime'{period_start}', EndPeriod=datetime'{period_end}')"
+            method = f"BalanceAndTurnovers(StartPeriod=datetime'{period_start_safe}', EndPeriod=datetime'{period_end_safe}')"
 
         endpoint: str = f"{self.base_url}/odata/standard.odata/{register}/{method}"
 
@@ -323,7 +330,7 @@ class OneCClient:
             records = self._paginate(endpoint, params)
         except ValueError as e:
             if with_org and ("400" in str(e) or "404" in str(e)):
-                return self.fetch_osv_account_subconto(period_start, period_end, account_code, with_org=False)
+                return self.fetch_osv_account_subconto(period_start, period_end_safe, account_code, with_org=False)
             logger.error(f"Ошибка загрузки счета {account_code}: {e}")
             records = []
         except Exception as e:
@@ -334,6 +341,25 @@ class OneCClient:
             return pd.DataFrame(columns=OSV_COLUMNS)
 
         return self._records_to_osv(records, period_end, account_code)
+
+    @staticmethod
+    def _end_of_day(period_end: str) -> str:
+        """Возвращает границу периода с последней секундой дня (23:59:59).
+
+        1С OData интерпретирует голую дату (2026-01-31) как начало дня 00:00:00,
+        что отрезает регламентные операции, проведённые в 23:59:59. Если время уже
+        указано — возвращаем значение без изменений.
+        """
+        if "T" in period_end:
+            return period_end
+        return f"{period_end}T23:59:59"
+
+    @staticmethod
+    def _start_of_day(period_start: str) -> str:
+        """Возвращает границу периода с началом дня (00:00:00), если время не указано."""
+        if "T" in period_start:
+            return period_start
+        return f"{period_start}T00:00:00"
 
     @staticmethod
     def _month_ranges(period_start: str, period_end: str):
@@ -367,7 +393,12 @@ class OneCClient:
         period_start: str,
         period_end: str,
         target_accounts: list[str] | None = None
-    ) -> pd.DataFrame:
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        """Собирает ОСВ помесячно через OData и возвращает (df, info).
+
+        Возвращаемый кортеж: (датафрейм ОСВ, служебный словарь `info` с
+        метаданными и проверками целостности `integrity`).
+        """
 
         _DETAILED_ACCOUNTS = ("60", "62", "76", "71", "73", "58", "66", "67")
         if pd.to_datetime(period_start) > pd.to_datetime(period_end):
@@ -391,7 +422,12 @@ class OneCClient:
                 m_range = future_to_month[future]
                 try:
                     agg_dfs_by_month[m_range] = future.result()
-                except Exception:
+                except Exception as e:
+                    # Логируем сбой загрузки: иначе молча вернутся 0 рублей оборота
+                    # за текущий месяц и аудит даст ложные результаты.
+                    logger.error(
+                        f"Ошибка загрузки сводной ОСВ за {m_range}: {e}", exc_info=True
+                    )
                     agg_dfs_by_month[m_range] = pd.DataFrame(columns=OSV_COLUMNS)
 
         detailed_tasks = []
@@ -448,11 +484,35 @@ class OneCClient:
                             frames.append(det_df)
                         else:
                             frames.append(agg_df[agg_df["Счет"] == acc_str])
-                    except Exception:
+                    except Exception as e:
+                        # Логируем сбой точечного запроса аналитики.
+                        logger.error(
+                            f"Ошибка загрузки счета {acc_str} за {task['m_range']}: {e}",
+                            exc_info=True,
+                        )
                         frames.append(agg_df[agg_df["Счет"] == acc_str])
 
         if not frames:
-            return pd.DataFrame(columns=OSV_COLUMNS)
+            df = pd.DataFrame(columns=OSV_COLUMNS)
+        else:
+            df = pd.concat(frames, ignore_index=True).reindex(columns=OSV_COLUMNS)
 
-        df = pd.concat(frames, ignore_index=True)
-        return df.reindex(columns=OSV_COLUMNS)
+        # Проверки целостности данных (Вариант B): отделяем реальные математические
+        # аномалии от нейтральных примечаний; результат кладём в info["integrity"].
+        info: dict[str, Any] = {}
+        try:
+            from core.integrity import validate_osv_integrity
+
+            meta = {
+                "source_type": "odata",
+                "db_name": self.base_url,
+                "period": f"{period_start} — {period_end}",
+                "organization": (
+                    ", ".join(self.extract_organizations(df)) if not df.empty else "Не определена"
+                ),
+            }
+            info["integrity"] = validate_osv_integrity(df, meta)
+        except ImportError:
+            logger.warning("Модуль core.integrity не найден. Проверка целостности пропущена.")
+
+        return df, info

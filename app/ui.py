@@ -35,6 +35,19 @@ from core.db import save_audit_log, load_audit_history
 from core.comparator import compare_audits
 from core.dashboard import accounts_list, block_dfs, build_dashboard_df
 from core.loaders import load_osv_file
+from core.integrity import validate_osv_integrity
+
+
+def _attach_api_integrity(df: pd.DataFrame, info: dict, db_name: str) -> None:
+    """Добавляет отчёт о целостности OData-данных в служебный словарь `info`."""
+    meta = {
+        "source_type": "odata",
+        "db_name": db_name,
+        "period": info.get("period", ""),
+        "organization": info.get("organization", ""),
+    }
+    info["integrity"] = validate_osv_integrity(df, meta)
+
 
 # Значения по умолчанию для подключения к 1С:Фреш (публичная демо-база).
 # Переопределяются переменными окружения ONEC_URL / ONEC_USER / ONEC_PASS.
@@ -632,6 +645,10 @@ with st.sidebar.expander("⚙️ Настройки проверок"):
     chk_unclosed = st.checkbox("4.3 Незакрытое сальдо на конец месяца", value=True)
     chk_000 = st.checkbox("4.4 Счет 000", value=True)
     chk_settlements = st.checkbox("4.5 Незакрытые расчеты с контрагентами", value=True)
+    st.caption(
+        "«Незакрытые расчеты» и «Расхождение документов и остатков ОСВ» "
+        "работают только при загруженном «Реестре документов (CSV)»."
+    )
     chk_group_balances = st.checkbox(
         "Контроль групп счетов (4.3)",
         value=False,
@@ -719,7 +736,7 @@ if fetch_api:
         start_s = api_start.strftime("%Y-%m-%dT00:00:00")
         end_s = api_end.strftime("%Y-%m-%dT23:59:59")
         with st.spinner("Загружаем ОСВ из 1С:Фреш..."):
-            df = client.fetch_osv_monthly(start_s, end_s)
+            df, fetched_info = client.fetch_osv_monthly(start_s, end_s)
         st.session_state["api_balances"] = df
         st.session_state["api_meta"] = {
             "title": "ОСВ (1С:Фреш)",
@@ -730,6 +747,9 @@ if fetch_api:
             "start_s": start_s,
             "end_s": end_s,
         }
+        # В info уже лежит отчёт о целостности от fetch_osv_monthly.
+        if fetched_info.get("integrity"):
+            st.session_state["api_meta"]["integrity"] = fetched_info["integrity"]
         st.session_state["api_db_name"] = api_url.strip()
 
         keys_to_del = ["osv", "docs", "audit", "mock_data"]
@@ -777,44 +797,51 @@ if fetch_batch and _batch_entries:
 
         try:
             client = OneCClient(url, login, password)
-            df = client.fetch_osv_monthly(start_s, end_s)
+            df, fetched_info = client.fetch_osv_monthly(start_s, end_s)
             orgs = OneCClient.extract_organizations(df)
             if len(orgs) > 1:
                 for org in orgs:
                     org_df = df[df["Организация"] == org].copy()
-                    batch_loaded.append({
-                        "name": f"{name} — {org}",
-                        "df": org_df,
-                        "info": {
-                            "title": "ОСВ (1С:Фреш)",
-                            "period": f"{api_start} — {api_end}",
-                            "organization": org,
-                            "url": url,
-                            "user": login,
-                            "start_s": start_s,
-                            "end_s": end_s,
-                        },
-                    })
-            else:
-                batch_loaded.append({
-                    "name": name,
-                    "df": df,
-                    "info": {
+                    entry_info = {
                         "title": "ОСВ (1С:Фреш)",
                         "period": f"{api_start} — {api_end}",
-                        "organization": "",
+                        "organization": org,
                         "url": url,
                         "user": login,
                         "start_s": start_s,
                         "end_s": end_s,
-                    },
+                    }
+                    _attach_api_integrity(org_df, entry_info, name)
+                    batch_loaded.append({
+                        "name": f"{name} — {org}",
+                        "df": org_df,
+                        "info": entry_info,
+                    })
+            else:
+                entry_info = {
+                    "title": "ОСВ (1С:Фреш)",
+                    "period": f"{api_start} — {api_end}",
+                    "organization": "",
+                    "url": url,
+                    "user": login,
+                    "start_s": start_s,
+                    "end_s": end_s,
+                }
+                _attach_api_integrity(df, entry_info, name)
+                batch_loaded.append({
+                    "name": name,
+                    "df": df,
+                    "info": entry_info,
                 })
         except Exception as exc:
             skipped.append(f"{name}: {exc}")
 
         i += 1
 
-    progress_bar.progress(1.0, text=f"Готово: загружено датасетов {len(batch_loaded)} (из {total} баз)")
+    progress_bar.progress(
+        1.0,
+        text=f"Успешно загружено датасетов (организаций): {len(datasets_to_process)}"
+    )
     st.session_state["batch_datasets"] = batch_loaded
 
     if skipped:
@@ -954,6 +981,20 @@ if not datasets_to_process:
     else:
         st.info("👈 Загрузите файл(ы) ОСВ (CSV/XLS/XLSX/HTML) или нажмите «Использовать тестовые данные» в панели слева.")
     st.stop()
+
+# Предупреждения о целостности данных: только advisory, аудит не блокируют.
+for ds in datasets_to_process:
+    integrity = (ds.get("info") or {}).get("integrity", {})
+    if integrity.get("is_suspicious"):
+        db_name = ds.get("name", "?")
+        with st.expander(f"⚠️ Внимание: подозрительные данные в базе «{db_name}»", expanded=True):
+            for warn in integrity.get("integrity_warnings", []):
+                st.warning(warn)
+            prov = integrity.get("provenance", {})
+            st.caption(
+                f"Источник: {prov.get('source_type')} | Период: {prov.get('period_parsed')} "
+                f"| Орг.: {prov.get('org_parsed')}"
+            )
 
 if source_info.get("title") or source_info.get("organization"):
     st.sidebar.caption(

@@ -14,14 +14,17 @@ def _mock_subconto_1c(monkeypatch):
     from core.api_client import OneCClient
     monkeypatch.setattr(
         OneCClient, "fetch_osv_monthly",
-        lambda self, start, end: pd.DataFrame([
-            ["2026-01-31", "20", "-", "A", 0.0, 100.0, 0.0, 0.0, 0.0, 100.0],
-            ["2026-02-28", "20", "-", "A", 0.0, 100.0, 0.0, 0.0, 0.0, 100.0],
-        ], columns=[
-            "Период", "Счет", "Субконто", "Тип",
-            "НачалоДебет", "НачалоКредит", "ОборотДебет", "ОборотКредит",
-            "КонецДебет", "КонецКредит",
-        ]),
+        lambda self, start, end: (
+            pd.DataFrame([
+                ["2026-01-31", "20", "-", "A", 0.0, 100.0, 0.0, 0.0, 0.0, 100.0],
+                ["2026-02-28", "20", "-", "A", 0.0, 100.0, 0.0, 0.0, 0.0, 100.0],
+            ], columns=[
+                "Период", "Счет", "Субконто", "Тип",
+                "НачалоДебет", "НачалоКредит", "ОборотДебет", "ОборотКредит",
+                "КонецДебет", "КонецКредит",
+            ]),
+            {},
+        ),
     )
     monkeypatch.setattr(
         OneCClient, "fetch_osv_account_subconto",
@@ -265,7 +268,7 @@ def test_batch_audit_loads_and_audits(tmp_path, monkeypatch):
         ])
 
         def fake_fetch(self, start, end):
-            return fake_df.copy()
+            return fake_df.copy(), {}
 
         monkeypatch.setattr(OneCClient, "fetch_osv_monthly", fake_fetch)
 

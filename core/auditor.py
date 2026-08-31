@@ -218,11 +218,27 @@ def account_group(code: object) -> str:
 
 
 def _group_account_string(accounts_str: object) -> str:
-    """Переводит строку '60.01, 62.02' в '60, 62' (родительские счета без дублей)"""
+    """
+    Переводит строку '60.01, 62.02' в '60, 62' (родительские счета без дублей)
+    """
+
     if pd.isna(accounts_str) or not str(accounts_str).strip():
         return ""
-    codes = [c.strip() for c in str(accounts_str).replace(";", ",").split(",") if c.strip()]
-    grouped = sorted(set(account_group(c) for c in codes))
+
+    codes: list = []
+    raw_codes = str(accounts_str).replace(";", ",").split(",")
+    for c in raw_codes:
+        stripped_c = c.strip()
+        # Только не пустые строки добавляем
+        if stripped_c:
+            codes.append(stripped_c)
+
+    unique_groups = set()
+    for c in codes:
+        parent_account = account_group(c)
+        unique_groups.add(parent_account)
+
+    grouped = sorted(unique_groups)
     return ", ".join(grouped)
 
 
@@ -246,16 +262,24 @@ def normalize_balances(df: pd.DataFrame) -> pd.DataFrame:
     df["Счет"] = df["Счет"].astype(str).str.strip()
     df["Тип"] = df["Тип"].astype(str).str.strip().str.upper()
     df["Субконто"] = (
-        df["Субконто"].fillna("-") if "Субконто" in df.columns else pd.Series("-", index=df.index)
+        df["Субконто"].fillna("-")
+        if "Субконто" in df.columns
+        else pd.Series("-", index=df.index)
     ).astype(str)
     df["Договор"] = (
-        df["Договор"].fillna('-') if "Договор" in df.columns else pd.Series('-', index=df.index)
+        df["Договор"].fillna('-')
+        if "Договор" in df.columns
+        else pd.Series('-', index=df.index)
     ).astype(str)
     df["Период"] = (
-        df["Период"].fillna("") if "Период" in df.columns else pd.Series("", index=df.index)
+        df["Период"].fillna("")
+        if "Период" in df.columns
+        else pd.Series("", index=df.index)
     ).astype(str).str.strip()
     df["Организация"] = (
-        df["Организация"].fillna('-') if "Организация" in df.columns else pd.Series('-', index=df.index)
+        df["Организация"].fillna('-')
+        if "Организация" in df.columns
+        else pd.Series('-', index=df.index)
     ).astype(str)
 
     bad_types = set(df["Тип"]) - VALID_TYPES
@@ -340,7 +364,8 @@ class AutoAuditor1C:
         else:
             self.documents = None
         self.closing_accounts: set[str] = {
-            str(a).split(".")[0] for a in (closing_accounts or DEFAULT_CLOSING_ACCOUNTS)
+            str(a).split(".")[0]
+            for a in (closing_accounts or DEFAULT_CLOSING_ACCOUNTS)
         }
         self.ml_enabled = ml_enabled
         self.ml_amount_anomalies = ml_amount_anomalies
@@ -369,13 +394,17 @@ class AutoAuditor1C:
         return self.checks is None or key in self.checks
 
     def _add(self, level: str, title: str, data: pd.DataFrame) -> None:
-        """Перехватчик: считает модули ошибок, переводит субсчета в счета и суммирует без сальдирования"""
+        """
+        Перехватчик: считает модули ошибок,
+        переводит субсчета в счета и суммирует без сальдирования
+        """
+
         if data.empty:
             return
 
         data = data.copy()
 
-        # 1. СНАЧАЛА считаем сумму ошибки для каждой отдельной строки (до группировки).
+        # СНАЧАЛА считаем сумму ошибки для каждой отдельной строки (до группировки).
         # Это гарантирует, что ошибки не "съедят" друг друга (60.01 Д 45к + 60.02 К 30к = 75к, а не 15к).
         if "Сумма" not in data.columns:
             if {"КонецДебет", "КонецКредит"} <= set(data.columns):
@@ -386,7 +415,7 @@ class AutoAuditor1C:
             else:
                 data["Сумма"] = 0.0
 
-        # 2. Убираем прошлые месяцы и переводим субсчета в родительские (60.01 -> 60).
+        # Убираем прошлые месяцы и переводим субсчета в родительские (60.01 -> 60).
         # Только для OSV/балансовых проверок. ML/NLP-проверки в этот набор не входят:
         # их находки — отдельные события, субсчета не схлопываем.
         balance_checks = {
@@ -404,7 +433,7 @@ class AutoAuditor1C:
         }
 
         if title in balance_checks:
-            # 2. Убираем прошлые месяцы ПО ИСХОДНЫМ субсчетам (до схлопывания).
+            # Убираем прошлые месяцы ПО ИСХОДНЫМ субсчетам (до схлопывания).
             # Сортируем по хронологии (Период может быть в разных форматах: 31.01.2026 / 2026-01-31 / Январь),
             # иначе лексикографическая сортировка ломает границу годов.
             if "Период" in data.columns:
@@ -414,7 +443,7 @@ class AutoAuditor1C:
                 data = data.drop_duplicates(subset=dedup_cols, keep="last")
                 data = data.drop(columns="_pkey")
 
-            # 3. Добавляем в комментарий ТОЧНЫЙ субсчет (58.03), чтобы после схлопывания
+            # Добавляем в комментарий ТОЧНЫЙ субсчет (58.03), чтобы после схлопывания
             # в счёт (58) бухгалтер сразу видел, где именно спрятана ошибка.
             if "Счет" in data.columns and "Комментарий" in data.columns:
                 is_subaccount = data["Счет"].astype(str).str.contains(r"\.")
@@ -427,14 +456,14 @@ class AutoAuditor1C:
                         if f"на субсчете {sub_acc}" not in comment and f"{sub_acc} " not in comment:
                             data.loc[idx, "Комментарий"] = f"{comment} (на субсчете {sub_acc})"
 
-            # 4. Заменяем субсчета на родительские (60.01 -> 60).
+            # Заменяем субсчета на родительские (60.01 -> 60).
             if "Счет" in data.columns:
                 data["Счет"] = data["Счет"].apply(_group_account_string)
 
-            # 5. Группируем по родительскому счету и складываем модули сумм (Сумма).
+            # Группируем по родительскому счету и складываем модули сумм (Сумма).
             group_cols = [c for c in ["Период", "Организация", "Счет", "Субконто", "Договор"] if c in data.columns]
 
-            agg_funcs = {}
+            agg_funcs: dict = {}
             for col in data.columns:
                 if col not in group_cols:
                     if col in {"КонецДебет", "КонецКредит", "Сумма"}:
@@ -454,14 +483,28 @@ class AutoAuditor1C:
             return
 
         # Итоговая сумма для карточки ошибки (уже корректно сложенные модули).
-        amount = float(data["Сумма"].fillna(0.0).sum()) if "Сумма" in data.columns else 0.0
+        if "Сумма" in data.columns:
+            amount = float(data["Сумма"].fillna(0.0).sum())
+        else:
+            amount = 0.0
 
-        self.errors.append(Finding(level=level, title=title, data=data, amount=amount))
+        self.errors.append(Finding(
+            level=level, title=title,
+            data=data, amount=amount
+        ))
 
     @staticmethod
-    def _first_occurrence(b: pd.DataFrame, keys: list[str], flag: pd.Series) -> dict[tuple, str]:
+    def _first_occurrence(
+        b: pd.DataFrame,
+        keys: list[str],
+        flag: pd.Series
+    ) -> dict[tuple, str]:
         b2 = b.loc[flag, keys + ["Период"]].copy()
-        b2["_sort"] = pd.to_datetime(b2["Период"], errors="coerce", format="mixed")
+        b2["_sort"] = pd.to_datetime(
+            b2["Период"],
+            errors="coerce",
+            format="mixed"
+        )
         b2 = b2.sort_values(keys + ["_sort"])
         first = b2.groupby(keys, as_index=False)["Период"].first()
         return {
@@ -470,12 +513,22 @@ class AutoAuditor1C:
             if row["Период"]
         }
 
-    def _annotate_since(self, b: pd.DataFrame, flag: pd.Series, base_comment: str, since_text: str) -> pd.DataFrame:
+    def _annotate_since(
+        self,
+        b: pd.DataFrame,
+        flag: pd.Series,
+        base_comment: str,
+        since_text: str
+    ) -> pd.DataFrame:
         sub = b[flag].copy()
         if sub.empty:
             return sub
 
-        since = self._first_occurrence(b, ["Организация", "Счет", "Субконто"], flag)
+        since = self._first_occurrence(
+            b,
+            ["Организация", "Счет", "Субконто"],
+            flag
+        )
         keys = pd.Series(
             list(zip(sub["Организация"], sub["Счет"], sub["Субконто"])),
             index=sub.index
@@ -486,47 +539,65 @@ class AutoAuditor1C:
         mask_has_period = periods.notna()
         if mask_has_period.any():
             sub.loc[mask_has_period, "Комментарий"] = (
-                base_comment + "; " + since_text + ' ' + periods[mask_has_period].map(_fmt_date)
+                base_comment + "; "
+                + since_text + ' '
+                + periods[mask_has_period].map(_fmt_date)
             )
         return sub
 
     def check_red_balance(self) -> None:
         b = self.balances
+        if b.empty:
+            return
+
         net = b["КонецДебет"] - b["КонецКредит"]
 
         # Активные счета с кредитовым сальдо
         active = self._annotate_since(
             b, (b["Тип"] == "A") & (net < -EPS),
-            "Активный счет имеет кредитовое (отрицательное) сальдо", "отрицательное сальдо с"
+            "Активный счет имеет кредитовое (отрицательное) сальдо",
+            "отрицательное сальдо с"
         )
         if not active.empty:
-            self._add("error", "Красное сальдо: активный счет с кредитовым остатком", active)
+            self._add(
+                "error",
+                "Красное сальдо: активный счет с кредитовым остатком",
+                active
+            )
 
         # Пассивные счета с дебетовым сальдо
         passive = self._annotate_since(
             b, (b["Тип"] == "P") & (net > EPS),
-            "Пассивный счет имеет дебетовое (отрицательное) сальдо", "отрицательное сальдо с"
+            "Пассивный счет имеет дебетовое (отрицательное) сальдо",
+            "отрицательное сальдо с"
         )
         if not passive.empty:
-            self._add("error", "Красное сальдо: пассивный счет с дебетовым остатком", passive)
+            self._add(
+                "error",
+                "Красное сальдо: пассивный счет с дебетовым остатком",
+                passive
+            )
 
     def check_expanded_balance(self) -> None:
         b = self.balances
         both = b[
-            (b["Субконто"] != "-") & (b["КонецДебет"] > 0) & (b["КонецКредит"] > 0)
+            (b["Субконто"] != "-")
+            & (b["КонецДебет"] > 0)
+            & (b["КонецКредит"] > 0)
         ].copy()
-        both["Комментарий"] = "По контрагенту/аналитике одновременно дебетовое и кредитовое сальдо"
+        both["Комментарий"] = "По контрагенту/аналитике одновременно \
+            дебетовое и кредитовое сальдо"
         self._add("warning", "Развернутое сальдо по аналитике", both)
 
     def check_unclosed_month_end(self) -> None:
         b = self.balances
 
-        # 1. Отбираем только строки с закрываемыми счетами.
+        # Отбираем только строки с закрываемыми счетами.
         closing_mask = b["Счет"].map(account_group).isin(self.closing_accounts)
         closing_df = b[closing_mask].copy()
 
         if not closing_df.empty:
-            # 2. Для закрываемых счетов важен итог по РОДИТЕЛЬСКОМУ счету: субсчета
+            # Для закрываемых счетов важен итог по РОДИТЕЛЬСКОМУ счету: субсчета
             # (90.01 Выручка, 90.09 Прибыль/убыток) копят остаток весь год, а к нулю
             # должны сходиться именно родители 90/91. Сворачиваем субсчета в родителя.
             closing_df["Счет"] = closing_df["Счет"].map(account_group)
@@ -534,12 +605,15 @@ class AutoAuditor1C:
             closing_df["Договор"] = "-"
 
             grp_cols = ["Период", "Организация", "Счет", "Субконто", "Договор"]
-            parent_b = closing_df.groupby(grp_cols, dropna=False, as_index=False)[["КонецДебет", "КонецКредит"]].sum()
+            parent_b = closing_df.groupby(
+                grp_cols, dropna=False,
+                as_index=False
+            )[["КонецДебет", "КонецКредит"]].sum()
 
-            # Сальдо родительского счета = |Дебет - Кредит| (по всем субсчетам разом).
+            # Сальдо родительского счета = |Дебет - Кредит| (по всем субсчетам разом)
             parent_b["Сумма"] = (parent_b["КонецДебет"] - parent_b["КонецКредит"]).abs()
 
-            # 3. Аннотируем датой первого появления (по истории периодов родителя).
+            # Аннотируем датой первого появления (по истории периодов родителя).
             unclosed_parents = self._annotate_since(
                 parent_b, parent_b["Сумма"] > EPS,
                 "Остаток по закрываемому счету в целом", "остаток с"
@@ -556,7 +630,7 @@ class AutoAuditor1C:
 
                 self._add("error", "Незакрытое сальдо на конец месяца (закрываемые счета)", unclosed_parents)
 
-        # 4. Зависшее сальдо (stuck_balance_checks) остаётся без изменений: тут важно
+        # Зависшее сальдо (stuck_balance_checks) остаётся без изменений: тут важно
         # отслеживать движение каждого отдельного субсчета.
         if not self.stuck_balance_checks:
             return
@@ -602,7 +676,11 @@ class AutoAuditor1C:
             row["Комментарий"] = f"Сальдо не меняется с {_fmt_date(streak.iloc[0]['_prev_period'])} ({n_periods} пер.)"
             rows.append(row)
 
-        self._add("warning", "Зависшее сальдо (не меняется между периодами)", pd.DataFrame(rows))
+        self._add(
+            "warning",
+            "Зависшее сальдо (не меняется между периодами)",
+            pd.DataFrame(rows)
+        )
 
     @staticmethod
     def _matches_group_preset(code: Any, preset: list[str]) -> bool:
@@ -645,7 +723,10 @@ class AutoAuditor1C:
             if abs(net) <= EPS:
                 continue
 
-            org = g_unique["Организация"].iloc[0] if "Организация" in g_unique.columns else "-"
+            if "Организация" in g_unique.columns:
+                org = g_unique["Организация"].iloc[0]
+            else:
+                org = "-"
 
             rows.append({
                 "Период": last_period,
@@ -658,7 +739,11 @@ class AutoAuditor1C:
                 "Комментарий": f"Группа «{group_name}» не закрыта: остаток {'Д' if net > 0 else 'К'} {_fmt_rub(abs(net))}",
             })
         if rows:
-            self._add("warning", "Контроль групп счетов: незакрытые остатки", pd.DataFrame(rows))
+            self._add(
+                "warning",
+                "Контроль групп счетов: незакрытые остатки",
+                pd.DataFrame(rows)
+            )
 
     def check_account_000(self) -> None:
         acc = self.balances[
@@ -671,7 +756,8 @@ class AutoAuditor1C:
     def _osv_settlement_balance(self) -> pd.Series:
         b = self.balances
         sett = b[b["Счет"].map(account_group).isin(SETTLEMENT_GROUPS)]
-        return sett.groupby("Субконто")["КонецДебет"].sum() - sett.groupby("Субконто")["КонецКредит"].sum()
+        return sett.groupby("Субконто")["КонецДебет"].sum() - \
+            sett.groupby("Субконто")["КонецКредит"].sum()
 
     def _osv_settlement_breakdown(self, subconto: Any) -> dict[str, float]:
         b = self.balances
@@ -694,7 +780,10 @@ class AutoAuditor1C:
         return pd.Timestamp.today()
 
     @staticmethod
-    def _oldest_unconsumed(rows: list[tuple], consume: float) -> pd.Timestamp | None:
+    def _oldest_unconsumed(
+        rows: list[tuple],
+        consume: float
+    ) -> pd.Timestamp | None:
         rows = [r for r in rows if pd.notna(r[0]) and r[1] > 0]
         rows.sort(key=lambda r: r[0])
         remaining = consume
@@ -705,7 +794,11 @@ class AutoAuditor1C:
         return None
 
     @staticmethod
-    def _settlement_components(shipped: float, paid: float, advances: float) -> tuple[float, float, float, float]:
+    def _settlement_components(
+        shipped: float,
+        paid: float,
+        advances: float
+    ) -> tuple[float, float, float, float]:
         open_amount = shipped - paid - advances
         debt = max(open_amount, 0.0)
         credit_side = max(-open_amount, 0.0)
@@ -720,8 +813,8 @@ class AutoAuditor1C:
         rows: list = []
 
         # Группируем не только по Субконто (контрагенту), но и по ДОГОВОРУ:
-        # аванс по одному договору и долг по другому у одного контрагента — это норма.
-        grp_cols = ["Период", "Организация", "Субконто", "Договор"]
+        # аванс по одному договору и долг по другому у одного контрагента — это норма
+        grp_cols: list[str] = ["Период", "Организация", "Субконто", "Договор"]
 
         for keys, g in sett.groupby(grp_cols):
             period, org, subconto, contract = keys
@@ -730,18 +823,31 @@ class AutoAuditor1C:
                 gs = g[g["Счет"].map(account_group) == group]
                 if gs.empty:
                     continue
-                nets = {
-                    str(account): float(gg["КонецДебет"].sum() - gg["КонецКредит"].sum())
-                    for account, gg in gs.groupby("Счет")
-                }
-                debit_sum = sum(n for n in nets.values() if n > EPS)
-                credit_sum = sum(-n for n in nets.values() if n < -EPS)
 
-                # Если на одном и том же договоре есть и Дт, и Кт — ошибка (не зачтен аванс).
+                nets: dict = {}
+                for account, gg in gs.groupby("Счет"):
+                    account_str = str(account)
+                    net_value = float(gg["КонецДебет"].sum() - gg["КонецКредит"].sum())
+                    nets[account_str] = net_value
+
+                debit_sum = 0.0
+                credit_sum = 0.0
+                for n in nets.values():
+                    if n > EPS:
+                        debit_sum += n
+                    elif n < -EPS:
+                        credit_sum += -n
+
+                # Если на одном и том же договоре есть и Дт,
+                # и Кт — ошибка (не зачтен аванс)
                 if debit_sum <= EPS or credit_sum <= EPS:
                     continue
 
-                parts = [f"{a} {'Д' if n > 0 else 'К'} {_fmt_rub(abs(n))}" for a, n in sorted(nets.items())]
+                parts: list = []
+                for a, n in sorted(nets.items()):
+                    indicator = "Д" if n > 0 else "К"
+                    formatted_rub = _fmt_rub(abs(n))
+                    parts.append(f"{a} {indicator} {formatted_rub}")
 
                 rows.append({
                     "Период": period,
@@ -754,8 +860,13 @@ class AutoAuditor1C:
                     "Сумма": debit_sum + credit_sum,
                     "Комментарий": f"Долг и аванс на разных счетах по одному договору: {'; '.join(parts)}",
                 })
+
         if rows:
-            self._add("warning", "Контрагенты: аванс и долг одновременно по разным счетам (ОСВ)", pd.DataFrame(rows))
+            self._add(
+                "warning",
+                "Контрагенты: аванс и долг одновременно по разным счетам (ОСВ)",
+                pd.DataFrame(rows)
+            )
 
     def check_unclosed_settlements(self) -> None:
         self._check_settlement_advance_vs_debt()
