@@ -13,6 +13,7 @@ audit_history.db
 client_databases.json
 users.json
 t.py
+.opencode/
 
 /*.xls
 /*.xlsx
