@@ -140,7 +140,8 @@ def detect_payment_risks(
         # Проверяем пользовательские слова
         for original_kw, pattern in custom:
             if pattern.search(purpose):
-                hits.append((CUSTOM_CATEGORY, [original_kw])) # Без слешей!
+                # Без слешей
+                hits.append((CUSTOM_CATEGORY, [original_kw]))
 
         if not hits:
             continue

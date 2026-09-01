@@ -10,7 +10,11 @@ APP = "app/ui.py"
 
 @pytest.fixture(autouse=True)
 def _mock_subconto_1c(monkeypatch):
-    """Для 1С-источника подменяем OData-запросы (локального аудита это не касается)."""
+    """Для 1С-источника подменяем OData-запросы (локального аудита это не касается).
+
+    БД изолируется общей временной БД в conftest (AppTest работает in-process,
+    поэтому AUDIT_DB_PATH задаётся до импорта core.db).
+    """
     from core.api_client import OneCClient
     monkeypatch.setattr(
         OneCClient, "fetch_osv_monthly",
@@ -228,6 +232,31 @@ def test_login_gate_passes_then_audits_with_user(monkeypatch):
     # Версия логики проверок пишется в meta каждого прогона
     assert audit["meta"]["audit_logic_version"]
     assert audit["meta"]["organization"] == ""
+
+
+def test_logout_clears_session_and_returns_to_login(monkeypatch):
+    """Кнопка «Выйти» очищает сессию и возвращает на экран входа."""
+    from core import auth as auth_mod
+
+    stored = auth_mod.hash_password("pw123")
+    monkeypatch.setenv(auth_mod.AUDIT_USERS_ENV, f"tester:{stored}")
+
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.run()
+    at.text_input(key="login_user").set_value("tester")
+    at.text_input(key="login_pass").set_value("pw123")
+    at.button(key="btn_login").click()
+    at.run()
+    assert at.session_state["user"] == "tester"
+    assert at.sidebar.button(key="btn_logout")
+
+    at.sidebar.button(key="btn_logout").click()
+    at.run()
+    assert not at.exception
+    assert "user" not in at.session_state
+    # Вернулись на экран входа: форма логина есть, основной интерфейс скрыт.
+    assert at.button(key="btn_login")
+    assert not [b for b in at.button if b.key == "btn_audit"]
 
 
 # ── Массовый аудит из JSON-списка баз ──

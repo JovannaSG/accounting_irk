@@ -14,11 +14,24 @@ _DB_PATH = os.environ.get(
     )
 )
 
+# Путь к конфигу пользователей (роли + доступ к базам). По умолчанию —
+# users.json в корне проекта. Опционально переопределяется переменной
+# окружения AUDIT_USERS_CONFIG
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+USERS_CONFIG_PATH = os.environ.get(
+    "AUDIT_USERS_CONFIG",
+    os.path.join(_PROJECT_ROOT, "users.json")
+)
+
 
 def init_db():
     """
-    Создает таблицу, если её нет, и добавляет недостающие колонки
+    Создает таблицы, если их нет, и добавляет недостающие колонки
     (миграция старых БД без findings_json/meta_json/user)
+
+    Таблица `users` хранит роли и доступ к базам (ТЗ §11, доступ бухгалтеров
+    к назначенным базам). Если таблица пуста — засевается из конфига users.json
+    (или как запасной вариант — из AUDIT_USERS)
     """
 
     conn = sqlite3.connect(_DB_PATH)
@@ -35,7 +48,9 @@ def init_db():
             details_json TEXT,
             findings_json TEXT,
             meta_json TEXT,
-            user TEXT
+            user TEXT,
+            source_type TEXT,
+            source_url TEXT
         )
     """)
     cursor.execute("PRAGMA table_info(audits)")
@@ -46,8 +61,218 @@ def init_db():
         cursor.execute("ALTER TABLE audits ADD COLUMN meta_json TEXT")
     if "user" not in existing:
         cursor.execute("ALTER TABLE audits ADD COLUMN user TEXT")
+    if "source_type" not in existing:
+        cursor.execute("ALTER TABLE audits ADD COLUMN source_type TEXT")
+    if "source_url" not in existing:
+        cursor.execute("ALTER TABLE audits ADD COLUMN source_url TEXT")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            login TEXT PRIMARY KEY,
+            role TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            allowed_urls TEXT,
+            created_at TEXT,
+            active INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    conn.commit()
+
+    # Сид первого набора пользователей, если БД пуста
+    cursor.execute("SELECT COUNT(*) FROM users")
+    count = cursor.fetchone()[0]
+    if count == 0:
+        _seed_users_from_config(cursor)
+        conn.commit()
+
+    conn.close()
+
+
+def load_users_config() -> dict:
+    """
+    Читает users.json в {login: {...или строка хэша}}. Если файла нет — {}
+    """
+
+    if not os.path.exists(USERS_CONFIG_PATH):
+        return {}
+    try:
+        with open(USERS_CONFIG_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _seed_users_from_config(cursor) -> None:
+    """
+    Заполняет пустую таблицу users:
+    1) из users.json (приоритет);
+    2) если нет — как запасной вариант сеет первого админа из AUDIT_USERS
+    """
+
+    config = load_users_config()
+
+    for login, spec in config.items():
+        if not isinstance(spec, dict) or not login.strip():
+            continue
+        role = str(spec.get("role") or "accountant").strip().lower()
+        pwd_hash = str(
+            spec.get("password_hash")
+            or spec.get("password")
+            or ""
+        ).strip()
+        if not pwd_hash:
+            continue
+        allowed = spec.get("allowed_urls") or []
+        insert_user(
+            cursor,
+            login=login.strip().lower(),
+            role=role,
+            password_hash=pwd_hash,
+            allowed_urls=allowed if isinstance(allowed, list) else [],
+        )
+
+    if not config:
+        # Запасной вариант: первый admin из AUDIT_USERS (обратная совместимость)
+        seed = os.environ.get("AUDIT_USERS") or ""
+        first_login = None
+        first_hash = None
+        for fragment in seed.split(","):
+            login, sep, stored = fragment.partition(":")
+            if sep and login.strip() and stored.strip():
+                first_login = login.strip().lower()
+                first_hash = stored.strip()
+                break
+        if first_login:
+            insert_user(
+                cursor,
+                login=first_login,
+                role="admin",
+                password_hash=first_hash,
+                allowed_urls=[],
+            )
+
+
+def insert_user(
+    cursor,
+    login: str,
+    role: str,
+    password_hash: str,
+    allowed_urls: list,
+) -> None:
+    """
+    Вставляет пользователя. SQLite поддерживает UPSERT начиная с 3.24;
+    для совместимости используем INSERT OR REPLACE
+    """
+
+    cursor.execute(
+        "INSERT OR REPLACE INTO users "
+        "(login, role, password_hash, allowed_urls, created_at, active) "
+        "VALUES (?, ?, ?, ?, ?, 1)",
+        (
+            login.strip().lower(),
+            role,
+            password_hash,
+            json.dumps(list(allowed_urls or []), ensure_ascii=False),
+            datetime.now().isoformat(timespec="seconds"),
+        ),
+    )
+
+
+def upsert_user(
+    login: str,
+    role: str,
+    password_hash: str,
+    allowed_urls: list,
+    active: bool = True,
+) -> None:
+    """
+    Сохраняет/обновляет пользователя в БД (используется при загрузке из конфига)
+    """
+
+    init_db()
+    conn = sqlite3.connect(_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO users (login, role, password_hash, allowed_urls, created_at, active) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(login) DO UPDATE SET "
+        "role=excluded.role, password_hash=excluded.password_hash, "
+        "allowed_urls=excluded.allowed_urls, active=excluded.active",
+        (
+            login.strip().lower(),
+            role,
+            password_hash,
+            json.dumps(list(allowed_urls or []), ensure_ascii=False),
+            datetime.now().isoformat(timespec="seconds"),
+            int(bool(active)),
+        ),
+    )
     conn.commit()
     conn.close()
+
+
+def get_user(login: str) -> dict | None:
+    """
+    Возвращает пользователя по логину или None
+    """
+
+    init_db()
+    conn = sqlite3.connect(_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT login, role, password_hash, allowed_urls, active "
+        "FROM users WHERE login = ?",
+        (str(login).strip().lower(),),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if row is None:
+        return None
+    urls = []
+    try:
+        parsed = json.loads(row[3]) if row[3] else []
+        if isinstance(parsed, list):
+            urls = parsed
+    except (TypeError, ValueError):
+        urls = []
+    return {
+        "login": row[0],
+        "role": row[1],
+        "password_hash": row[2],
+        "allowed_urls": urls,
+        "active": bool(row[4]),
+    }
+
+
+def list_users() -> list[dict]:
+    """
+    Возвращает список всех пользователей (без конфиденциальной части)
+    """
+
+    init_db()
+    conn = sqlite3.connect(_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT login, role, allowed_urls, active FROM users ORDER BY login")
+    rows = cursor.fetchall()
+    conn.close()
+    return [
+        {
+            "login": r[0],
+            "role": r[1],
+            "allowed_urls": _parse_urls(r[2]),
+            "active": bool(r[3]),
+        }
+        for r in rows
+    ]
+
+
+def _parse_urls(raw) -> list:
+    try:
+        parsed = json.loads(raw) if raw else []
+        return parsed if isinstance(parsed, list) else []
+    except (TypeError, ValueError):
+        return []
 
 
 def _json_default(value):
@@ -133,7 +358,7 @@ def rebuild_auditor(entry: dict):
     """
     Восстанавливает аудитора для записи истории (без живого объекта):
     из сохраненных находок, а для старых записей — по плоской таблице
-    деталей. Возвращает None, если данных недостаточно.
+    деталей. Возвращает None, если данных недостаточно
     """
 
     from core.auditor import AutoAuditor1C
@@ -210,11 +435,25 @@ def save_audit_log(result: dict) -> None:
         if meta_payload else None
     )
 
+    # Происхождение записи (для фильтрации доступа по базам):
+    # source_type: file | mock | odata | batch;
+    # source_url — URL базы (для odata/batch)
+    _source = result.get("source") or {}
+    if not isinstance(_source, dict):
+        _source = {}
+    source_type = str(_source.get("source_type") or "") \
+        or str((meta_payload or {}).get("source_type") or "") \
+        or str(result.get("source_type") or "")
+    source_url = str((meta_payload or {}).get("url") or "") \
+        or str(_source.get("url") or "") \
+        or str(result.get("source_url") or "")
+
     cursor.execute("""
         INSERT OR REPLACE INTO audits
         (audit_id, db_name, accountant, viewed_at, status, status_label,
-         total_flags, details_json, findings_json, meta_json, user)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         total_flags, details_json, findings_json, meta_json, user,
+         source_type, source_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         result.get("audit_id", ""),
         result.get("db_name", "Неизвестная база"),
@@ -227,29 +466,63 @@ def save_audit_log(result: dict) -> None:
         findings_json,
         meta_json,
         str(result.get("user") or "") or None,
+        str(source_type) or None,
+        str(source_url) or None,
     ))
     conn.commit()
     conn.close()
 
 
-def load_audit_history() -> list[dict]:
+def load_audit_history(
+    user: str | None = None,
+    allowed_urls: list | None = None
+) -> list[dict]:
     """
-    Загружает историю с жестко заданным порядком колонок
+    Загружает историю с жестко заданным порядком колонок.
+
+    Если задан `user`:
+      - для роли admin (allowed_urls пуст) — возвращаются все записи;
+      - для accountant — возвращаются только записи его баз (по source_url из
+        allowed_urls) плюс его собственные локальные/файловые прогоны
+        (record user == login)
     """
 
     init_db()
     conn = sqlite3.connect(_DB_PATH)
     cursor = conn.cursor()
 
-    # Явно указываем колонки, чтобы row[7] всегда был details_json!
-    # user — последняя колонка, чтобы не сдвинуть позиционные индексы.
-    cursor.execute("""
+    params: list = []
+    where = ""
+    if user:
+        if allowed_urls:
+            allow_urls = [u.rstrip("/") for u in allowed_urls if u]
+            placeholders = ",".join("?" for _ in allow_urls)
+            # accountant: свои локальные (source_url пуст/локальный тип) ИЛИ
+            # записи по доступным базам (source_url в списке) ИЛИ
+            # записи, созданные самим пользователем вне баз
+            where = (
+                " WHERE (source_url IN ({ph})"
+                " OR user = ?)"
+            ).format(ph=placeholders)
+            params = list(allow_urls) + [user]
+        else:
+            # admin (allowed_urls пуст) — видит всё.
+            where = ""
+
+    # Явно указываем колонки, чтобы row[7] всегда был details_json
+    # user, source_type, source_url — в конце,
+    # чтобы не сдвинуть позиционные индексы
+    cursor.execute(
+        """
         SELECT audit_id, db_name, accountant, viewed_at,
                status, status_label, total_flags, details_json,
-               findings_json, meta_json, user
+               findings_json, meta_json, user, source_type, source_url
         FROM audits
+        """ + where + """
         ORDER BY viewed_at ASC
-    """)
+        """,
+        params,
+    )
     rows = cursor.fetchall()
 
     history = []
@@ -258,7 +531,10 @@ def load_audit_history() -> list[dict]:
         if row[7]:
             try:
                 # StringIO защищает от FutureWarnings в новых версиях pandas
-                details_df = pd.read_json(io.StringIO(row[7]), orient="records")
+                details_df = pd.read_json(
+                    io.StringIO(row[7]),
+                    orient="records"
+                )
             except Exception:
                 pass
 
@@ -289,6 +565,10 @@ def load_audit_history() -> list[dict]:
 
         if len(row) > 10 and row[10]:
             entry["user"] = row[10]
+        if len(row) > 11 and row[11]:
+            entry["source_type"] = row[11]
+        if len(row) > 12 and row[12]:
+            entry["source_url"] = row[12]
 
         history.append(entry)
 

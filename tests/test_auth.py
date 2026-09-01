@@ -1,4 +1,16 @@
+import pytest
+
 import core.auth as auth
+import core.db as db_mod
+
+
+@pytest.fixture(autouse=True)
+def _isolated_db(tmp_path, monkeypatch):
+    """Изолирует БД пользователей для каждого теста (иначе засев из AUDIT_USERS
+    в одном тесте «загрязняет» следующий — auth_enabled становится True)."""
+    test_path = str(tmp_path / "auth_test.db")
+    monkeypatch.setattr(db_mod, "_DB_PATH", test_path)
+    yield
 
 
 # ── 1. Разбор строки AUDIT_USERS ──

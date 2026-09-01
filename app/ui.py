@@ -21,6 +21,7 @@ load_project_env()
 import streamlit as st
 
 from core.api_client import OneCClient
+from core import auth
 from core.auth import auth_enabled
 from core.auth import verify as verify_credentials
 from core.auditor import (
@@ -88,16 +89,88 @@ def _render_login_form() -> None:
             st.error("Введите логин и пароль.")
         elif verify_credentials(login_input, password_input):
             st.session_state["user"] = login_input.strip()
+            _store_access_ctx()
             st.rerun()
         else:
             st.error("Неверный логин или пароль.")
 
 
-# Аутентификация включается только переменной окружения AUDIT_USERS
-# («логин:хэш,...»); если она не задана, приложение работает как раньше.
+def _store_access_ctx() -> None:
+    """
+    Сохраняет роль и список доступных баз текущего пользователя в session_state.
+    Вызывается после успешного входа.
+    """
+    user = st.session_state.get("user") or ""
+    if not user:
+        st.session_state.pop("user_allowed_urls", None)
+        st.session_state.pop("user_role", None)
+        return
+    st.session_state["user_role"] = auth.user_role(user)
+    st.session_state["user_allowed_urls"] = auth.user_allowed_urls(user)
+    # Кэш истории сбрасываем — он зависит от прав текущего пользователя.
+    st.session_state.pop("audit_history", None)
+
+
+def _render_logout_button() -> None:
+    """
+    Кнопка «Выйти» в верхней части сайдбара. Показывается, пока в session_state
+    есть пользователь (в т.ч. когда аутентификация выключена, т.к. в проде она
+    всегда включена). Очищает сессию и возвращает на экран входа.
+    """
+    user = st.session_state.get("user") or ""
+    if not user:
+        return
+    if st.sidebar.button(
+        "🔓 Выйти", key="btn_logout", type="secondary", use_container_width=True
+    ):
+        for key in ("user", "user_role", "user_allowed_urls", "audit_history"):
+            st.session_state.pop(key, None)
+        st.rerun()
+
+
+def _visible_databases(entries: list) -> list:
+    """
+    Фильтрует список баз для текущего пользователя.
+
+    - если пользователь не залогинен (аутентификация выключена) — возвращает всё;
+    - admin — всё;
+    - accountant — только базы, URL которых есть в его списке доступа.
+    """
+    user = st.session_state.get("user") or ""
+    if not user:
+        return entries
+    return [
+        e for e in entries
+        if auth.user_can_access(user, (e.get("url") or ""))
+    ]
+
+
+def _current_user_history() -> list[dict]:
+    """
+    История аудита с учётом прав пользователя:
+
+    - без логина / admin (allowed_urls пуст) — все записи;
+    - бухгалтер — только записи своих баз (по source_url) + свои локальные прогоны.
+    """
+    user = st.session_state.get("user") or ""
+    if not user:
+        return load_audit_history()
+    allowed = st.session_state.get("user_allowed_urls") or []
+    if not allowed:
+        # admin (или пользователь без назначенных баз в старой схеме) — видит всё,
+        # т.к. пустой список означает «все базы».
+        return load_audit_history(user=user, allowed_urls=[])
+    return load_audit_history(user=user, allowed_urls=allowed)
+
+
+# Аутентификация включается переменной окружения AUDIT_USERS или наличием
+# пользователей в БД (users.json). Если не задано — приложение работает как раньше.
 if auth_enabled() and not st.session_state.get("user"):
     _render_login_form()
     st.stop()
+elif st.session_state.get("user"):
+    # Для уже вошедшего пользователя (после rerun) — восстанавливаем роль/доступ.
+    _store_access_ctx()
 
 
 def _filter_documents_by_period(
@@ -176,6 +249,13 @@ def _run_audit_local(
     meta: dict = {"organization": options.get("organization") or ""}
     # Версия логики проверок — для распознавания устаревших записей истории
     meta["audit_logic_version"] = AUDIT_LOGIC_VERSION
+    # Происхождение данных — чтобы фильтровать доступ к историям по базам
+    stype = str(source_info.get("source_type") or "").strip()
+    if stype:
+        meta["source_type"] = stype
+    surl = str(source_info.get("url") or "").strip()
+    if surl:
+        meta["url"] = surl
 
     real_periods: list = []
     i: int = 0
@@ -531,6 +611,9 @@ def _render_dashboard(history: list[dict]) -> None:
 
 
 # ============ Боковая панель ============
+if st.session_state.get("user"):
+    _render_logout_button()
+
 st.sidebar.header("📥 Загрузка данных")
 data_source = st.sidebar.radio(
     "Источник данных",
@@ -591,7 +674,6 @@ elif data_source.startswith("☁️"):
         api_pass = st.text_input(
             "Пароль",
             type="password",
-            value=os.environ.get("ONEC_PASS", ""),
             key="api_pass",
         )
     c1, c2 = st.sidebar.columns(2)
@@ -618,12 +700,22 @@ elif data_source.startswith("🚀"):
             _batch_entries = []
 
         if _batch_entries:
-            st.sidebar.caption(f"Найдено баз: {len(_batch_entries)}")
+            # Доступны только базы, назначенные текущему пользователю
+            # (admin/открытый доступ — все; бухгалтер — только свои).
+            _batch_entries = _visible_databases(_batch_entries)
+            st.sidebar.caption(
+                f"Доступно баз: {len(_batch_entries)}"
+            )
             with st.sidebar.expander("Список баз", expanded=False):
                 i = 0
                 while i < len(_batch_entries):
                     st.write(f"{i + 1}. {_batch_entries[i].get('name', '?')}")
                     i += 1
+            if not _batch_entries:
+                st.sidebar.info(
+                    "Вам не назначено ни одной базы для массового аудита. "
+                    "Обратитесь к администратору."
+                )
 
         # МЫ УДАЛИЛИ ВВОД БАЗОВОГО ЛОГИНА И ПАРОЛЯ ОТСЮДА!
         # Оставляем только выбор дат.
@@ -731,6 +823,12 @@ source_info: dict = {}
 datasets_to_process = []
 
 if fetch_api:
+    user = st.session_state.get("user") or ""
+    if user and not auth.user_can_access(user, api_url.strip()):
+        st.sidebar.error(
+            "Доступ к этой базе не назначен. Обратитесь к администратору."
+        )
+        st.stop()
     try:
         client = OneCClient(api_url.strip(), api_user.strip(), api_pass)
         start_s = api_start.strftime("%Y-%m-%dT00:00:00")
@@ -746,6 +844,7 @@ if fetch_api:
             "user": api_user.strip(),
             "start_s": start_s,
             "end_s": end_s,
+            "source_type": "odata",
         }
         # В info уже лежит отчёт о целостности от fetch_osv_monthly.
         if fetched_info.get("integrity"):
@@ -810,6 +909,7 @@ if fetch_batch and _batch_entries:
                         "user": login,
                         "start_s": start_s,
                         "end_s": end_s,
+                        "source_type": "batch",
                     }
                     _attach_api_integrity(org_df, entry_info, name)
                     batch_loaded.append({
@@ -826,6 +926,7 @@ if fetch_batch and _batch_entries:
                     "user": login,
                     "start_s": start_s,
                     "end_s": end_s,
+                    "source_type": "batch",
                 }
                 _attach_api_integrity(df, entry_info, name)
                 batch_loaded.append({
@@ -840,7 +941,7 @@ if fetch_batch and _batch_entries:
 
     progress_bar.progress(
         1.0,
-        text=f"Успешно загружено датасетов (организаций): {len(datasets_to_process)}"
+        text=f"Успешно загружено датасетов (организаций): {len(batch_loaded)}"
     )
     st.session_state["batch_datasets"] = batch_loaded
 
@@ -911,7 +1012,6 @@ try:
         )
         documents = None
         source_info = {"title": f"Массовый аудит ({len(datasets_to_process)} баз)"}
-
     elif data_source.startswith("📁") and osv_files:
         if merge_mode.startswith("Объединить"):
             all_b: list = []
@@ -1008,8 +1108,12 @@ if data_source.startswith("🚀"):
     )
 
 # Подготовка списков для фильтров
-unique_periods = [p for p in balances["Период"].dropna().unique().tolist() if p != ""]
-periods = sorted(unique_periods)
+unique_periods: list = [
+    p
+    for p in balances["Период"].dropna().unique().tolist()
+    if p != ""
+]
+periods: list = sorted(unique_periods)
 
 selected_periods = st.sidebar.multiselect(
     "Период проверки",
@@ -1136,7 +1240,7 @@ if st.button("🚀 Запустить Аудит", type="primary", key="btn_audi
         # Инициализируем историю, если она еще не загружена из БД
         history = st.session_state.setdefault(
             "audit_history",
-            load_audit_history()
+            _current_user_history()
         )
 
         for ds in datasets_to_process:
@@ -1196,7 +1300,7 @@ if st.button("🚀 Запустить Аудит", type="primary", key="btn_audi
 #                           ========== ВЫВОД РЕЗУЛЬТАТОВ И СРАВНЕНИЕ ==========
 # При старте приложения подтягиваем историю из БД
 if "audit_history" not in st.session_state:
-    st.session_state["audit_history"] = load_audit_history()
+    st.session_state["audit_history"] = _current_user_history()
 
 history = st.session_state.get("audit_history", [])
 if history:

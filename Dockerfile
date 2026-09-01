@@ -16,7 +16,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY core ./core
 COPY app ./app
 COPY data ./data
-    COPY client_databases.json ./client_databases.json
 
 EXPOSE 8501
 
