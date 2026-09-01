@@ -1,0 +1,16 @@
+{
+  "_comment": "Шаблон конфига пользователей. Скопируйте в users.json в корне проекта. Хэши паролей: python -m core.auth hash <пароль>. Роли: admin (видит все базы) | accountant (только указанные allowed_urls).",
+  "admin": {
+    "role": "admin",
+    "password_hash": "200000$<соль>$<хэш>",
+    "allowed_urls": []
+  },
+  "bu_ivanova": {
+    "role": "accountant",
+    "password_hash": "200000$<соль>$<хэш>",
+    "allowed_urls": [
+      "https://1cfresh.com/a/ab/123",
+      "https://1cfresh.com/a/cd/456"
+    ]
+  }
+}

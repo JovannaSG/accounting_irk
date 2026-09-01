@@ -307,9 +307,15 @@ def normalize_balances(df: pd.DataFrame) -> pd.DataFrame:
 def normalize_documents(df: pd.DataFrame) -> pd.DataFrame:
     df = _rename_by_aliases(df, DOCUMENT_ALIASES).copy()
 
-    missing: list[str] = [c for c in ["Дата", "Контрагент", "Вид", "Сумма"] if c not in df.columns]
+    missing: list[str] = [
+        c
+        for c in ["Дата", "Контрагент", "Вид", "Сумма"]
+        if c not in df.columns
+    ]
     if missing:
-        raise ValueError(f"В файле документов отсутствуют колонки: {', '.join(missing)}")
+        raise ValueError(
+            f"В файле документов отсутствуют колонки: {', '.join(missing)}"
+        )
 
     df["Контрагент"] = df["Контрагент"].astype(str).str.strip()
     df["Дата"] = pd.to_datetime(df["Дата"], errors="coerce")
@@ -323,8 +329,9 @@ def normalize_documents(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("Колонка 'Сумма' содержит нечисловые значения")
 
     kind: dict[str, str] = {
-        "отгрузка": "отгрузка", "реализация": "отгрузка", "продажа": "отгрузка",
-        "оплата": "оплата", "платеж": "оплата", "платёж": "оплата",
+        "отгрузка": "отгрузка", "реализация": "отгрузка",
+        "продажа": "отгрузка", "оплата": "оплата",
+        "платеж": "оплата", "платёж": "оплата",
         "аванс": "аванс", "предоплата": "аванс",
     }
     df["ВидНорм"] = df["Вид"].map(kind)
@@ -404,8 +411,9 @@ class AutoAuditor1C:
 
         data = data.copy()
 
-        # СНАЧАЛА считаем сумму ошибки для каждой отдельной строки (до группировки).
-        # Это гарантирует, что ошибки не "съедят" друг друга (60.01 Д 45к + 60.02 К 30к = 75к, а не 15к).
+        # Сначала считаем сумму ошибки для каждой отдельной строки (до группировки)
+        # Это гарантирует, что ошибки не "съедят" друг друга
+        # (60.01 Д 45к + 60.02 К 30к = 75к, а не 15к)
         if "Сумма" not in data.columns:
             if {"КонецДебет", "КонецКредит"} <= set(data.columns):
                 if "Развернутое" in title:
@@ -415,10 +423,10 @@ class AutoAuditor1C:
             else:
                 data["Сумма"] = 0.0
 
-        # Убираем прошлые месяцы и переводим субсчета в родительские (60.01 -> 60).
+        # Убираем прошлые месяцы и переводим субсчета в родительские (60.01 -> 60)
         # Только для OSV/балансовых проверок. ML/NLP-проверки в этот набор не входят:
-        # их находки — отдельные события, субсчета не схлопываем.
-        balance_checks = {
+        # их находки — отдельные события, субсчета не схлопываем
+        balance_checks: set = {
             "Красное сальдо: активный счет с кредитовым остатком",
             "Красное сальдо: пассивный счет с дебетовым остатком",
             "Развернутое сальдо по аналитике",
@@ -433,18 +441,23 @@ class AutoAuditor1C:
         }
 
         if title in balance_checks:
-            # Убираем прошлые месяцы ПО ИСХОДНЫМ субсчетам (до схлопывания).
-            # Сортируем по хронологии (Период может быть в разных форматах: 31.01.2026 / 2026-01-31 / Январь),
-            # иначе лексикографическая сортировка ломает границу годов.
+            # Убираем прошлые месяцы ПО ИСХОДНЫМ субсчетам (до схлопывания)
+            # Сортируем по хронологии
+            # (Период может быть в разных форматах: 31.01.2026 / 2026-01-31 / Январь),
+            # иначе лексикографическая сортировка ломает границу годов
             if "Период" in data.columns:
                 data["_pkey"] = period_sort_series(data["Период"])
                 data = data.sort_values("_pkey", kind="stable", na_position="last")
-                dedup_cols = [c for c in ["Организация", "Счет", "Субконто", "Договор"] if c in data.columns]
+                dedup_cols = [
+                    c
+                    for c in ["Организация", "Счет", "Субконто", "Договор"]
+                    if c in data.columns
+                ]
                 data = data.drop_duplicates(subset=dedup_cols, keep="last")
                 data = data.drop(columns="_pkey")
 
             # Добавляем в комментарий ТОЧНЫЙ субсчет (58.03), чтобы после схлопывания
-            # в счёт (58) бухгалтер сразу видел, где именно спрятана ошибка.
+            # в счёт (58) бухгалтер сразу видел, где именно спрятана ошибка
             if "Счет" in data.columns and "Комментарий" in data.columns:
                 is_subaccount = data["Счет"].astype(str).str.contains(r"\.")
                 if is_subaccount.any():
@@ -452,16 +465,23 @@ class AutoAuditor1C:
                         sub_acc = str(data.loc[idx, "Счет"]).strip()
                         comment = str(data.loc[idx, "Комментарий"])
                         # Защита от дублирования: субсчет уже упомянут в тексте
-                        # (напр. «60.01 Д ...») — не вставляем повторно.
-                        if f"на субсчете {sub_acc}" not in comment and f"{sub_acc} " not in comment:
+                        # (напр. «60.01 Д ...») — не вставляем повторно
+                        if (
+                            f"на субсчете {sub_acc}" not in comment
+                            and f"{sub_acc} " not in comment
+                        ):
                             data.loc[idx, "Комментарий"] = f"{comment} (на субсчете {sub_acc})"
 
-            # Заменяем субсчета на родительские (60.01 -> 60).
+            # Заменяем субсчета на родительские (60.01 -> 60)
             if "Счет" in data.columns:
                 data["Счет"] = data["Счет"].apply(_group_account_string)
 
-            # Группируем по родительскому счету и складываем модули сумм (Сумма).
-            group_cols = [c for c in ["Период", "Организация", "Счет", "Субконто", "Договор"] if c in data.columns]
+            # Группируем по родительскому счету и складываем модули сумм (Сумма)
+            group_cols = [
+                c
+                for c in ["Период", "Организация", "Счет", "Субконто", "Договор"]
+                if c in data.columns
+            ]
 
             agg_funcs: dict = {}
             for col in data.columns:
@@ -470,7 +490,7 @@ class AutoAuditor1C:
                         agg_funcs[col] = "sum"
                     elif col == "Комментарий":
                         # Разные субсчета одного родителя могут иметь разные тексты ошибок —
-                        # объединяем их через " | " (порядок сохраняем, дубли убираем).
+                        # объединяем их через " | " (порядок сохраняем, дубли убираем)
                         agg_funcs[col] = lambda x: " | ".join(
                             dict.fromkeys(str(v) for v in x if pd.notna(v))
                         )
@@ -482,7 +502,7 @@ class AutoAuditor1C:
         if data.empty:
             return
 
-        # Итоговая сумма для карточки ошибки (уже корректно сложенные модули).
+        # Итоговая сумма для карточки ошибки (уже корректно сложенные модули)
         if "Сумма" in data.columns:
             amount = float(data["Сумма"].fillna(0.0).sum())
         else:
@@ -592,21 +612,22 @@ class AutoAuditor1C:
     def check_unclosed_month_end(self) -> None:
         b = self.balances
 
-        # Отбираем только строки с закрываемыми счетами.
+        # Отбираем только строки с закрываемыми счетами
         closing_mask = b["Счет"].map(account_group).isin(self.closing_accounts)
         closing_df = b[closing_mask].copy()
 
         if not closing_df.empty:
             # Для закрываемых счетов важен итог по РОДИТЕЛЬСКОМУ счету: субсчета
             # (90.01 Выручка, 90.09 Прибыль/убыток) копят остаток весь год, а к нулю
-            # должны сходиться именно родители 90/91. Сворачиваем субсчета в родителя.
+            # должны сходиться именно родители 90/91. Сворачиваем субсчета в родителя
             closing_df["Счет"] = closing_df["Счет"].map(account_group)
             closing_df["Субконто"] = "-"
             closing_df["Договор"] = "-"
 
-            grp_cols = ["Период", "Организация", "Счет", "Субконто", "Договор"]
+            grp_cols: list = ["Период", "Организация", "Счет", "Субконто", "Договор"]
             parent_b = closing_df.groupby(
-                grp_cols, dropna=False,
+                grp_cols,
+                dropna=False,
                 as_index=False
             )[["КонецДебет", "КонецКредит"]].sum()
 
@@ -616,22 +637,32 @@ class AutoAuditor1C:
             # Аннотируем датой первого появления (по истории периодов родителя).
             unclosed_parents = self._annotate_since(
                 parent_b, parent_b["Сумма"] > EPS,
-                "Остаток по закрываемому счету в целом", "остаток с"
+                "Остаток по закрываемому счету в целом",
+                "остаток с"
             )
 
             if not unclosed_parents.empty:
                 # Корректируем Д/К: показываем весь остаток на той стороне, где он есть.
                 unclosed_parents["КонецДебет"] = unclosed_parents.apply(
-                    lambda r: r["Сумма"] if r["КонецДебет"] > r["КонецКредит"] else 0.0, axis=1
+                    lambda r:
+                        r["Сумма"]
+                        if r["КонецДебет"] > r["КонецКредит"]
+                        else 0.0, axis=1
                 )
                 unclosed_parents["КонецКредит"] = unclosed_parents.apply(
-                    lambda r: r["Сумма"] if r["КонецКредит"] > r["КонецДебет"] else 0.0, axis=1
+                    lambda r: r["Сумма"]
+                        if r["КонецКредит"] > r["КонецДебет"]
+                        else 0.0, axis=1
                 )
 
-                self._add("error", "Незакрытое сальдо на конец месяца (закрываемые счета)", unclosed_parents)
+                self._add(
+                    "error",
+                    "Незакрытое сальдо на конец месяца (закрываемые счета)",
+                    unclosed_parents
+                )
 
         # Зависшее сальдо (stuck_balance_checks) остаётся без изменений: тут важно
-        # отслеживать движение каждого отдельного субсчета.
+        # отслеживать движение каждого отдельного субсчета
         if not self.stuck_balance_checks:
             return
         b_nonzero = b[(b["КонецДебет"] > 0) | (b["КонецКредит"] > 0)]
@@ -641,7 +672,11 @@ class AutoAuditor1C:
         b2 = b_nonzero.copy()
         b2["_pkey"] = period_sort_series(b2["Период"])
 
-        b2 = b2.sort_values(["Организация", "Счет", "Субконто", "_pkey"], kind="stable", na_position="last")
+        b2 = b2.sort_values(
+            ["Организация", "Счет", "Субконто", "_pkey"],
+            kind="stable",
+            na_position="last"
+        )
         grp = b2.groupby(["Организация", "Счет", "Субконто"], sort=False)
 
         prev_d = grp["КонецДебет"].shift(1)
@@ -660,9 +695,9 @@ class AutoAuditor1C:
         prev_stuck = b2["_stuck"].shift(1, fill_value=False)
 
         same_group = (
-            (b2["Организация"] == b2["Организация"].shift(1)) &
-            (b2["Счет"] == b2["Счет"].shift(1)) &
-            (b2["Субконто"] == b2["Субконто"].shift(1))
+            (b2["Организация"] == b2["Организация"].shift(1))
+            & (b2["Счет"] == b2["Счет"].shift(1))
+            & (b2["Субконто"] == b2["Субконто"].shift(1))
         )
         streak_start = b2["_stuck"] & ~(prev_stuck & same_group)
         b2["_streak"] = streak_start.cumsum()
@@ -705,7 +740,11 @@ class AutoAuditor1C:
         last_period = periods[-1]
         rows: list = []
         for group_name, preset in GROUP_PRESETS.items():
-            matched = b[b["Счет"].map(lambda code: self._matches_group_preset(code, preset))]
+            matched = b[
+                b["Счет"].map(
+                    lambda code: self._matches_group_preset(code, preset)
+                )
+            ]
             if matched.empty:
                 continue
 
@@ -715,7 +754,9 @@ class AutoAuditor1C:
             if g.empty:
                 continue
 
-            g_unique = g.drop_duplicates(subset=["Организация", "Счет", "Субконто"])
+            g_unique = g.drop_duplicates(
+                subset=["Организация", "Счет", "Субконто"]
+            )
             d = float(g_unique["КонецДебет"].sum())
             k = float(g_unique["КонецКредит"].sum())
 
@@ -728,6 +769,12 @@ class AutoAuditor1C:
             else:
                 org = "-"
 
+            if net > 0:
+                indicator = "Д"
+            else:
+                indicator = "К"
+            formatted_rub = _fmt_rub(abs(net))
+
             rows.append({
                 "Период": last_period,
                 "Организация": org,
@@ -736,7 +783,7 @@ class AutoAuditor1C:
                 "КонецДебет": d,
                 "КонецКредит": k,
                 "Сумма": abs(net),
-                "Комментарий": f"Группа «{group_name}» не закрыта: остаток {'Д' if net > 0 else 'К'} {_fmt_rub(abs(net))}",
+                "Комментарий": f"Группа «{group_name}» не закрыта: остаток {indicator} {formatted_rub}",
             })
         if rows:
             self._add(
@@ -761,7 +808,10 @@ class AutoAuditor1C:
 
     def _osv_settlement_breakdown(self, subconto: Any) -> dict[str, float]:
         b = self.balances
-        sett = b[(b["Счет"].map(account_group).isin(SETTLEMENT_GROUPS)) & (b["Субконто"] == subconto)]
+        sett = b[
+            (b["Счет"].map(account_group).isin(SETTLEMENT_GROUPS))
+            & (b["Субконто"] == subconto)
+        ]
         out: dict[str, float] = {}
         for account, g in sett.groupby("Счет"):
             net = float(g["КонецДебет"].sum() - g["КонецКредит"].sum())
@@ -809,7 +859,10 @@ class AutoAuditor1C:
 
     def _check_settlement_advance_vs_debt(self) -> None:
         b = self.balances
-        sett = b[(b["Счет"].map(account_group).isin(SETTLEMENT_GROUPS)) & (b["Субконто"] != "-")]
+        sett = b[
+            (b["Счет"].map(account_group).isin(SETTLEMENT_GROUPS))
+            & (b["Субконто"] != "-")
+        ]
         rows: list = []
 
         # Группируем не только по Субконто (контрагенту), но и по ДОГОВОРУ:
@@ -898,14 +951,20 @@ class AutoAuditor1C:
 
             if debt > EPS:
                 oldest = self._oldest_unconsumed(
-                    list(g.loc[g["ВидНорм"] == "отгрузка", ["Дата", "Сумма"]].itertuples(index=False, name=None)),
+                    list(g.loc[
+                        g["ВидНорм"] == "отгрузка",
+                        ["Дата", "Сумма"]
+                    ].itertuples(index=False, name=None)),
                     paid + consumed,
                 )
                 if oldest is not None:
                     issues.append(f"старейший долг от {_fmt_date(oldest)}")
             if advance_left > EPS:
                 oldest = self._oldest_unconsumed(
-                    list(g.loc[g["ВидНорм"] == "аванс", ["Дата", "Сумма"]].itertuples(index=False, name=None)),
+                    list(g.loc[
+                        g["ВидНорм"] == "аванс",
+                        ["Дата", "Сумма"]
+                    ].itertuples(index=False, name=None)),
                     consumed,
                 )
                 if oldest is not None:
@@ -936,29 +995,51 @@ class AutoAuditor1C:
         res = pd.DataFrame(rows)
         if not res.empty:
             problems = res[res["Сумма"] > EPS]
-            self._add("error", "Контрагенты: расчеты не закрыты документами", problems.copy())
+            self._add(
+                "error",
+                "Контрагенты: расчеты не закрыты документами",
+                problems.copy()
+            )
             mismatches = res[res["Комментарий"].str.contains("расхождение", na=False)]
-            self._add("warning", "Контрагенты: расхождение документов и остатков ОСВ", mismatches.copy())
+            self._add(
+                "warning",
+                "Контрагенты: расхождение документов и остатков ОСВ",
+                mismatches.copy()
+            )
 
     def check_amount_anomalies(self) -> None:
         if self.documents is None:
             return
         found = ml.detect_amount_anomalies(
-            self.documents, k=self.anomaly_k, min_abs=self.anomaly_min_abs, min_ops=self.anomaly_min_ops
+            self.documents, k=self.anomaly_k,
+            min_abs=self.anomaly_min_abs, min_ops=self.anomaly_min_ops
         )
         self._add("warning", "ML: нетипичная сумма операции", found)
 
     def check_turnover_jumps(self) -> None:
-        found = ml.detect_turnover_jumps(self.balances, ratio=self.jump_ratio, min_abs=self.jump_min_abs)
-        self._add("warning", "ML: резкий скачок оборотов между периодами", found)
+        found = ml.detect_turnover_jumps(
+            self.balances, ratio=self.jump_ratio,
+            min_abs=self.jump_min_abs
+        )
+        self._add(
+            "warning",
+            "ML: резкий скачок оборотов между периодами",
+            found
+        )
 
     def check_duplicate_counterparties(self) -> None:
         names: list[object] = []
         if "Субконто" in self.balances.columns:
             names += list(self.balances["Субконто"].dropna())
-        if self.documents is not None and "Контрагент" in self.documents.columns:
+        if (
+            self.documents is not None
+            and "Контрагент" in self.documents.columns
+        ):
             names += list(self.documents["Контрагент"].dropna())
-        found = ml.find_duplicate_counterparties(names, threshold=self.dup_threshold)
+        found = ml.find_duplicate_counterparties(
+            names,
+            threshold=self.dup_threshold
+        )
         self._add("warning", "ML: возможные дубли контрагентов", found)
 
     def run_ml_checks(self) -> None:
@@ -975,7 +1056,11 @@ class AutoAuditor1C:
         if self.documents is None:
             return
         found = nlp.detect_payment_risks(self.documents)
-        self._add("warning", "NLP: подозрительные назначения платежей (115-ФЗ)", found)
+        self._add(
+            "warning",
+            "NLP: подозрительные назначения платежей (115-ФЗ)",
+            found
+        )
 
     def run_audit(self) -> list[Finding]:
         self.errors = []
@@ -996,7 +1081,11 @@ class AutoAuditor1C:
         return self.errors
 
     @classmethod
-    def from_findings(cls, errors: list[dict], meta: dict | None = None) -> "AutoAuditor1C":
+    def from_findings(
+        cls,
+        errors: list[dict],
+        meta: dict | None = None
+    ) -> "AutoAuditor1C":
         instance = cls.__new__(cls)
         instance.balances = pd.DataFrame(columns=OSV_COLUMNS)
         instance.documents = None
@@ -1016,7 +1105,11 @@ class AutoAuditor1C:
         return instance
 
     def summary_df(self) -> pd.DataFrame:
-        columns = ["Проверка", "Уровень", "Период", "Строк", "Сумма", "Рекомендации"]
+        columns: list[str] = [
+            "Проверка", "Уровень",
+            "Период", "Строк",
+            "Сумма", "Рекомендации"
+        ]
         details = self.details_df()
         if details.empty:
             return pd.DataFrame(columns=columns)
@@ -1030,7 +1123,7 @@ class AutoAuditor1C:
         return grouped[columns]
 
     def details_df(self) -> pd.DataFrame:
-        rows = []
+        rows: list = []
         for e in self.errors:
             for _, r in e["data"].iterrows():
                 rows.append({
@@ -1056,7 +1149,12 @@ class AutoAuditor1C:
         return pd.DataFrame(rows, columns=DETAIL_COLUMNS)
 
     def top_findings_df(self, limit: int = 10) -> pd.DataFrame:
-        columns = ["Проверка", "Уровень", "Период", "Организация", "Счет", "Субконто", "Сумма"]
+        columns: list[str] = [
+            "Проверка", "Уровень",
+            "Период", "Организация",
+            "Счет", "Субконто",
+            "Сумма"
+        ]
         details = self.details_df()
         if details.empty or limit <= 0:
             return pd.DataFrame(columns=columns)
@@ -1084,16 +1182,30 @@ class AutoAuditor1C:
             used.update(titles)
 
             if len(titles) > 1:
-                sec_df["Проверка"] = sec_df["Проверка"].map(lambda x: _SHORT_PDF_LABELS.get(x, x))
+                sec_df["Проверка"] = sec_df["Проверка"].map(
+                    lambda x: _SHORT_PDF_LABELS.get(str(x), str(x))
+                )
             else:
                 sec_df = sec_df.drop(columns=["Проверка"], errors="ignore")
 
-            recs = " ".join(dict.fromkeys(RECOMMENDATIONS.get(t, "") for t in titles if RECOMMENDATIONS.get(t, "")))
-            level = "error" if "error" in sec_df["Уровень"].unique() else "warning"
+            recs = " ".join(
+                dict.fromkeys(
+                    RECOMMENDATIONS.get(t, "")
+                    for t in titles
+                    if RECOMMENDATIONS.get(t, "")
+                )
+            )
+            if "error" in sec_df["Уровень"].unique():
+                level = "error"
+            else:
+                level = "warning"
             sec_df = self._drop_empty_columns(sec_df)
 
             sections.append({
-                "title": sec_title, "level": level, "recommendation": recs, "df": sec_df,
+                "title": sec_title,
+                "level": level,
+                "recommendation": recs,
+                "df": sec_df,
             })
 
         remaining_mask = ~details["Проверка"].isin(used)
@@ -1101,9 +1213,14 @@ class AutoAuditor1C:
             rem_df = details[remaining_mask]
             for title, group in rem_df.groupby("Проверка"):
                 grp = group.drop(columns=["Проверка"], errors="ignore")
-                level = "error" if "error" in grp["Уровень"].unique() else "warning"
+                if "error" in grp["Уровень"].unique():
+                    level = "error"
+                else:
+                    level = "warning"
                 sections.append({
-                    "title": str(title), "level": level, "recommendation": RECOMMENDATIONS.get(str(title), ""),
+                    "title": str(title),
+                    "level": level,
+                    "recommendation": RECOMMENDATIONS.get(str(title), ""),
                     "df": self._drop_empty_columns(grp),
                 })
         return sections
@@ -1116,7 +1233,8 @@ class AutoAuditor1C:
         for col in df.columns:
             series = df[col]
             non_empty = series.notna() & (
-                series.astype(str).str.strip().ne("") & series.astype(str).ne("nan")
+                series.astype(str).str.strip().ne("")
+                & series.astype(str).ne("nan")
             )
             if bool(non_empty.any()):
                 keep.append(col)
@@ -1124,7 +1242,11 @@ class AutoAuditor1C:
 
     @staticmethod
     def _account_codes_in(cell: object) -> list[str]:
-        return [c.strip() for c in str(cell).replace(";", ",").split(",") if c.strip()]
+        return [
+            c.strip()
+            for c in str(cell).replace(";", ",").split(",")
+            if c.strip()
+        ]
 
     def accounts_with_errors(self) -> list[str]:
         codes: set[str] = set()
@@ -1138,7 +1260,8 @@ class AutoAuditor1C:
         code = str(account_code).strip()
         if "." in code:
             return [code]
-        sub: set[str] = {code}  # родительский счет сам по себе (после схлопывания 60.01 -> 60)
+        # родительский счет сам по себе (после схлопывания 60.01 -> 60)
+        sub: set[str] = {code}
         if self.balances is not None and "Счет" in self.balances.columns:
             values = self.balances["Счет"].dropna()
             idx = 0
@@ -1154,40 +1277,80 @@ class AutoAuditor1C:
         if details.empty:
             return details
         subaccounts = set(self.account_subaccounts(account_code))
-        return details[details["Счет"].map(lambda cell: bool(set(self._account_codes_in(cell)) & subaccounts))]
+        return details[
+            details["Счет"].map(
+                lambda cell: bool(
+                    set(self._account_codes_in(cell))
+                    & subaccounts
+                )
+            )
+        ]
 
     def account_subconto(self, account_code: str) -> list[str]:
         names: set[str] = set()
         subaccounts = self.account_subaccounts(account_code)
-        if "Счет" in self.balances.columns and "Субконто" in self.balances.columns:
+        if (
+            "Счет" in self.balances.columns
+            and "Субконто" in self.balances.columns
+        ):
             rows = self.balances[self.balances["Счет"].isin(subaccounts)]["Субконто"]
-            names.update(str(n).strip() for n in rows.dropna() if str(n).strip() != "-")
-        if self.documents is not None and "Счет" in self.documents.columns and "Контрагент" in self.documents.columns:
+            names.update(
+                str(n).strip()
+                for n in rows.dropna()
+                if str(n).strip() != "-"
+            )
+        if (
+            self.documents is not None
+            and "Счет" in self.documents.columns
+            and "Контрагент" in self.documents.columns
+        ):
             rows = self.documents[self.documents["Счет"].isin(subaccounts)]["Контрагент"]
-            names.update(str(n).strip() for n in rows.dropna() if str(n).strip())
+            names.update(
+                str(n).strip()
+                for n in rows.dropna()
+                if str(n).strip()
+            )
         return sorted(names)
 
-    def account_subconto_duplicates(self, account_code: str, threshold: int | None = None) -> pd.DataFrame:
+    def account_subconto_duplicates(
+        self,
+        account_code: str,
+        threshold: int | None = None
+    ) -> pd.DataFrame:
         names = self.account_subconto(account_code)
         if not names:
-            return pd.DataFrame(columns=["Субконто", "Название А", "Название Б", "Сходство", "Комментарий"])
+            return pd.DataFrame(columns=[
+                "Субконто", "Название А",
+                "Название Б", "Сходство",
+                "Комментарий"
+            ])
         return ml.find_duplicate_counterparties(
-            names, threshold=threshold if threshold is not None else self.dup_threshold
+            names,
+            threshold=threshold if threshold is not None else self.dup_threshold
         )
 
     def accounts_summary_df(self) -> pd.DataFrame:
-        columns: list[str] = ["Счет", "Кол-во нарушений", "Проверки", "Периоды", "Сумма", "Дубли контрагентов"]
+        columns: list[str] = [
+            "Счет", "Кол-во нарушений",
+            "Проверки", "Периоды",
+            "Сумма", "Дубли контрагентов"
+        ]
+
         details = self.details_df()
         if details.empty:
             return pd.DataFrame(columns=columns)
-        rows = []
+
+        rows: list = []
         for account in self.accounts_with_errors():
             g = self.account_report_df(account)
             checks = sorted(set(g["Проверка"].astype(str)))
             periods = sorted(p for p in set(g["Период"].astype(str)) if p)
 
             # Мы не суммируем ошибку 12 раз! Берем только актуальную сумму
-            max_per_issue = g.groupby(["Проверка", "Организация", "Субконто"], dropna=False)["Сумма"].max()
+            max_per_issue = g.groupby(
+                ["Проверка", "Организация", "Субконто"],
+                dropna=False
+            )["Сумма"].max()
             total_sum = round(float(max_per_issue.sum()), 2)
 
             rows.append({
@@ -1214,7 +1377,8 @@ class AutoAuditor1C:
             total_flags = len(details)
             total_amount = float(
                 details.groupby(
-                    ["Проверка", "Организация", "Счет", "Субконто"], dropna=False
+                    ["Проверка", "Организация", "Счет", "Субконто"],
+                    dropna=False
                 )["Сумма"].max().sum()
             )
         else:
@@ -1239,10 +1403,16 @@ class AutoAuditor1C:
 
         summary = self.summary_df()
         details = self.details_df()
-        details = details.drop(columns=["Субконто", "Договор"], errors="ignore")
+        details = details.drop(
+            columns=["Субконто", "Договор"],
+            errors="ignore"
+        )
         by_account = self.accounts_summary_df()
         top_findings = self.top_findings_df(TOP_FINDINGS_LIMIT)
-        top_findings = top_findings.drop(columns=["Субконто"], errors="ignore")
+        top_findings = top_findings.drop(
+            columns=["Субконто"],
+            errors="ignore"
+        )
 
         pass_details = pd.DataFrame()
         if account_pass is not None:
@@ -1251,7 +1421,13 @@ class AutoAuditor1C:
                 pass_details = pd_
 
         n_err = sum(len(e["data"]) for e in self.errors if e["level"] == "error")
-        status_label = "Есть ошибки" if n_err else ("Есть предупреждения" if self.errors else "Успешно")
+        if n_err:
+            status_label = "Есть ошибки"
+        else:
+            if self.errors:
+                status_label = "Есть предупреждения"
+            else:
+                status_label = "Успешно"
 
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -1269,7 +1445,11 @@ class AutoAuditor1C:
             details.to_excel(writer, sheet_name="Детальный отчет", index=False)
             by_account.to_excel(writer, sheet_name="По счетам", index=False)
             if not pass_details.empty:
-                pass_details.to_excel(writer, sheet_name="Проход по счетам", index=False)
+                pass_details.to_excel(
+                    writer,
+                    sheet_name="Проход по счетам",
+                    index=False
+                )
 
             wb = writer.book
             header_fill = PatternFill("solid", fgColor="4472C4")
@@ -1277,7 +1457,11 @@ class AutoAuditor1C:
             red_fill = PatternFill("solid", fgColor="FFC7CE")
             yellow_fill = PatternFill("solid", fgColor="FFEB9C")
             title_font = Font(bold=True, size=12)
-            header_align = Alignment(horizontal="center", vertical="top", wrap_text=True)
+            header_align = Alignment(
+                horizontal="center",
+                vertical="top",
+                wrap_text=True
+            )
 
             def _finish_table_sheet(ws) -> None:
                 for cell in ws[1]:
@@ -1292,10 +1476,19 @@ class AutoAuditor1C:
             overview = writer.sheets["Обзор"]
             blocks: list[tuple[int, pd.DataFrame]] = []
 
-            def _add_block(cursor: int, title: str, frame: pd.DataFrame) -> int:
+            def _add_block(
+                cursor: int,
+                title: str,
+                frame: pd.DataFrame
+            ) -> int:
                 overview.cell(row=cursor + 1, column=1, value=title).font = title_font
                 header_row = cursor + 2
-                frame.to_excel(writer, sheet_name="Обзор", index=False, startrow=cursor + 1)
+                frame.to_excel(
+                    writer,
+                    sheet_name="Обзор",
+                    index=False,
+                    startrow=cursor + 1
+                )
                 blocks.append((header_row, frame))
                 return cursor + 2 + len(frame) + 1
 
@@ -1303,7 +1496,11 @@ class AutoAuditor1C:
             if not summary.empty:
                 cursor = _add_block(cursor, "Сводка по проверкам", summary)
             if not top_findings.empty:
-                cursor = _add_block(cursor, "Крупнейшие нарушения", top_findings)
+                cursor = _add_block(
+                    cursor,
+                    "Крупнейшие нарушения",
+                    top_findings
+                )
 
             overview["A1"].fill = header_fill
             overview["B1"].fill = header_fill
@@ -1321,14 +1518,23 @@ class AutoAuditor1C:
                     lvl_j = list(frame.columns).index("Уровень") + 1
                     for i in range(len(frame)):
                         level = overview.cell(row=header_row + 1 + i, column=lvl_j).value
-                        fill = red_fill if level == "error" else (yellow_fill if level == "warning" else None)
+                        if level == "error":
+                            fill = red_fill
+                        else:
+                            if level == "warning":
+                                fill = yellow_fill
+                            else:
+                                fill = None
                         if fill:
                             for j in range(1, len(frame.columns) + 1):
                                 overview.cell(row=header_row + 1 + i, column=j).fill = fill
                 for j, h in enumerate(frame.columns, start=1):
                     if str(h) in _MONEY_COLUMNS:
                         for row_cells in overview.iter_rows(
-                            min_row=header_row + 1, max_row=header_row + len(frame), min_col=j, max_col=j
+                            min_row=header_row + 1,
+                            max_row=header_row + len(frame),
+                            min_col=j,
+                            max_col=j
                         ):
                             for cell in row_cells:
                                 cell.number_format = _EXCEL_MONEY_FORMAT
@@ -1342,7 +1548,13 @@ class AutoAuditor1C:
                 _finish_table_sheet(ws)
                 for row in ws.iter_rows(min_row=2):
                     level = row[level_col].value
-                    fill = red_fill if level == "error" else (yellow_fill if level == "warning" else None)
+                    if level == "error":
+                        fill = red_fill
+                    else:
+                        if level == "warning":
+                            fill = yellow_fill
+                        else:
+                            fill = None
                     if fill:
                         for cell in row:
                             cell.fill = fill
@@ -1363,7 +1575,10 @@ class AutoAuditor1C:
                 if length > widths.get(cell.column, 0):
                     widths[cell.column] = length
         for idx, width in widths.items():
-            ws.column_dimensions[get_column_letter(idx)].width = min(cap, max(9, width + 2))
+            ws.column_dimensions[get_column_letter(idx)].width = min(
+                cap,
+                max(9, width + 2)
+            )
 
     @staticmethod
     def _excel_money_formats(ws) -> None:
@@ -1378,33 +1593,20 @@ class AutoAuditor1C:
     @staticmethod
     def _find_pdf_font() -> str | None:
         import os
-        bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "DejaVuSans.ttf")
-        candidates = [
-            bundled,
-            r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\segoeui.ttf", r"C:\Windows\Fonts\times.ttf",
-            r"C:\Windows\Fonts\DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        ]
-        for path in candidates:
-            if os.path.exists(path):
-                return path
-        return None
+        bundled = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "fonts", "DejaVuSans.ttf"
+        )
+        return bundled if os.path.exists(bundled) else None
 
     @staticmethod
     def _register_pdf_fonts(pdf, font_path: str) -> bool:
         import os as _os
         pdf.add_font("DejaVu", "", font_path)
-        candidates = [
-            _os.path.join(_os.path.dirname(font_path), "DejaVuSans-Bold.ttf"),
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        ]
-        for path in candidates:
-            if _os.path.exists(path):
-                pdf.add_font("DejaVu", "B", path)
-                return True
+        bold = _os.path.join(_os.path.dirname(font_path), "DejaVuSans-Bold.ttf")
+        if _os.path.exists(bold):
+            pdf.add_font("DejaVu", "B", bold)
+            return True
         return False
 
     @staticmethod
@@ -1436,11 +1638,18 @@ class AutoAuditor1C:
                 aligns.append("LEFT")
                 fmts.append(lambda v: "" if v is None else str(v))
 
-        headings_style = FontFace(fill_color=(235, 238, 242), emphasis="BOLD" if has_bold else None)
+        headings_style = FontFace(
+            fill_color=(235, 238, 242),
+            emphasis="BOLD" if has_bold else None
+        )
         pdf.set_font("DejaVu", size=8)
         with pdf.table(
-            col_widths=tuple(col_widths), text_align=tuple(aligns), line_height=4.4,
-            padding=1.2, headings_style=headings_style, cell_fill_color=(249, 250, 251),
+            col_widths=tuple(col_widths),
+            text_align=tuple(aligns),
+            line_height=4.4,
+            padding=1.2,
+            headings_style=headings_style,
+            cell_fill_color=(249, 250, 251),
             cell_fill_mode="ROWS",
         ) as table:
             hr = table.row()
@@ -1478,34 +1687,78 @@ class AutoAuditor1C:
 
         meta = self._meta_payload()
         pdf.set_font("DejaVu", size=14, style="B" if has_bold else "")
-        pdf.cell(0, 8, meta.get("title", "Отчет аудита бухгалтерских баз 1С"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(
+            0, 8,
+            meta.get("title", "Отчет аудита бухгалтерских баз 1С"),
+            new_x=XPos.LMARGIN, new_y=YPos.NEXT
+        )
         pdf.ln(2)
         pdf.set_font("DejaVu", size=10)
-        pdf.cell(0, 6, f"Организация: {meta.get('organization', '—')}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.cell(0, 6, f"Период: {meta.get('period', '—')}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.cell(0, 6, f"Дата отчета: {pd.Timestamp.now().strftime('%d.%m.%Y %H:%M')}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(
+            0, 6,
+            f"Организация: {meta.get('organization', '—')}",
+            new_x=XPos.LMARGIN, new_y=YPos.NEXT
+        )
+        pdf.cell(
+            0, 6,
+            f"Период: {meta.get('period', '—')}",
+            new_x=XPos.LMARGIN, new_y=YPos.NEXT
+        )
+        pdf.cell(
+            0, 6,
+            f"Дата отчета: {pd.Timestamp.now().strftime('%d.%m.%Y %H:%M')}",
+            new_x=XPos.LMARGIN, new_y=YPos.NEXT
+        )
 
         sections = self._sections()
-        n_err_rows = int(sum(len(e["data"]) for e in self.errors if e["level"] == "error"))
-        n_warn_rows = int(sum(len(e["data"]) for e in self.errors if e["level"] == "warning"))
+        n_err_rows = int(sum(
+                len(e["data"])
+                for e in self.errors
+                if e["level"] == "error"
+        ))
+        n_warn_rows = int(sum(
+            len(e["data"])
+            for e in self.errors
+            if e["level"] == "warning"
+        ))
         counts = []
         if n_err_rows:
             counts.append(f"Ошибок: {n_err_rows}")
         if n_warn_rows:
             counts.append(f"Предупреждений: {n_warn_rows}")
-        pdf.cell(0, 6, " · ".join(counts) if counts else "Нарушений не выявлено", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(
+            0, 6,
+            " · ".join(counts) if counts else "Нарушений не выявлено",
+            new_x=XPos.LMARGIN, new_y=YPos.NEXT
+        )
 
-        status = "Есть ошибки" if n_err_rows else ("Есть предупреждения" if n_warn_rows else "Успешно")
-        status_rgb = (156, 0, 6) if n_err_rows else ((156, 101, 0) if n_warn_rows else (0, 128, 0))
+        if n_err_rows:
+            status = "Есть ошибки"
+            status_rgb = (156, 0, 6)
+        else:
+            if n_warn_rows:
+                status = "Есть предупреждения"
+                status_rgb = (156, 101, 0)
+            else:
+                status = "Успешно"
+                status_rgb = (0, 128, 0)
         pdf.set_text_color(*status_rgb)
         pdf.set_font("DejaVu", size=10, style="B" if has_bold else "")
-        pdf.cell(0, 6, f"Статус: {status}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(
+            0, 6,
+            f"Статус: {status}",
+            new_x=XPos.LMARGIN, new_y=YPos.NEXT
+        )
         pdf.set_text_color(0, 0, 0)
 
         if not sections:
             pdf.ln(4)
             pdf.set_text_color(0, 128, 0)
-            pdf.cell(0, 7, "Нарушений не выявлено.", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.cell(
+                0, 7,
+                "Нарушений не выявлено.",
+                new_x=XPos.LMARGIN, new_y=YPos.NEXT
+            )
             pdf.set_text_color(0, 0, 0)
             return bytes(pdf.output())
 
@@ -1514,7 +1767,11 @@ class AutoAuditor1C:
         if not summary.empty:
             pdf.set_text_color(68, 114, 196)
             pdf.set_font("DejaVu", size=11, style="B" if has_bold else "")
-            pdf.cell(0, 7, "Сводка по проверкам", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.cell(
+                0, 7,
+                "Сводка по проверкам",
+                new_x=XPos.LMARGIN, new_y=YPos.NEXT
+            )
             pdf.set_text_color(0, 0, 0)
             sum_rows = [
                 [
@@ -1524,25 +1781,42 @@ class AutoAuditor1C:
                 ]
                 for _, r in summary.iterrows()
             ]
-            self._pdf_table(pdf, ["Проверка", "Уровень", "Строк", "Сумма"], sum_rows, [64, 26, 14, 24], has_bold=has_bold)
+            self._pdf_table(
+                pdf,
+                ["Проверка", "Уровень", "Строк", "Сумма"],
+                sum_rows,
+                [64, 26, 14, 24],
+                has_bold=has_bold
+            )
 
             top = self.top_findings_df(TOP_FINDINGS_LIMIT)
             if not top.empty:
                 pdf.ln(2)
                 pdf.set_text_color(68, 114, 196)
                 pdf.set_font("DejaVu", size=11, style="B" if has_bold else "")
-                pdf.cell(0, 7, "Крупнейшие нарушения", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                pdf.cell(
+                    0, 7,
+                    "Крупнейшие нарушения",
+                    new_x=XPos.LMARGIN, new_y=YPos.NEXT
+                )
                 pdf.set_text_color(0, 0, 0)
                 top_rows = [
                     [
-                        _SHORT_PDF_LABELS.get(str(r["Проверка"]), str(r["Проверка"])),
-                        r["Период"], r["Организация"], r["Счет"], r["Субконто"], float(r["Сумма"]),
+                        _SHORT_PDF_LABELS.get(
+                            str(r["Проверка"]), str(r["Проверка"])),
+                            r["Период"], r["Организация"],
+                            r["Счет"], r["Субконто"],
+                            float(r["Сумма"]
+                        ),
                     ]
                     for _, r in top.iterrows()
                 ]
                 self._pdf_table(
-                    pdf, ["Проверка", "Период", "Орг.", "Счет", "Субконто", "Сумма"],
-                    top_rows, [30, 16, 18, 12, 34, 20], has_bold=has_bold,
+                    pdf,
+                    ["Проверка", "Период", "Орг.", "Счет", "Субконто", "Сумма"],
+                    top_rows,
+                    [30, 16, 18, 12, 34, 20],
+                    has_bold=has_bold,
                 )
 
         for s in sections:
@@ -1561,7 +1835,10 @@ class AutoAuditor1C:
             pdf.ln(1)
 
             headers = list(df.columns)
-            widths = [_PDF_COL_STYLE.get(h, (20, "LEFT"))[0] for h in headers]
+            widths = [
+                _PDF_COL_STYLE.get(h, (20, "LEFT"))[0]
+                for h in headers
+            ]
             rows = [[v for v in rec] for rec in df.to_numpy()]
             self._pdf_table(pdf, headers, rows, widths, has_bold=has_bold)
 
@@ -1582,12 +1859,23 @@ class AutoAuditor1C:
                 pdf.ln(4)
             pdf.set_text_color(68, 114, 196)
             pdf.set_font("DejaVu", size=11, style="B" if has_bold else "")
-            pdf.cell(0, 7, "Автопроход по счетам", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.cell(
+                0, 7,
+                "Автопроход по счетам",
+                new_x=XPos.LMARGIN, new_y=YPos.NEXT
+            )
             pdf.set_text_color(0, 0, 0)
 
-            pass_headers = ["Проверка", "Период", "Субконто", "Дебет", "Кредит", "Сумма"]
+            pass_headers: list[str] = [
+                "Проверка", "Период",
+                "Субконто", "Дебет",
+                "Кредит", "Сумма"
+            ]
             pass_widths = [_PDF_COL_STYLE[h][0] for h in pass_headers]
-            accounts = sorted(set(str(c) for c in pass_details["Счет"].dropna()))
+            accounts = sorted(set(
+                str(c)
+                for c in pass_details["Счет"].dropna()
+            ))
             for account in accounts:
                 acc_rows = pass_details[pass_details["Счет"].astype(str) == account]
                 dups_n = 0
@@ -1600,11 +1888,18 @@ class AutoAuditor1C:
                 pdf.cell(0, 6, note, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
                 table_rows = [
                     [
-                        r.get("Проверка", ""), r.get("Период", ""), r.get("Субконто", ""),
-                        r.get("Дебет", 0.0), r.get("Кредит", 0.0), r.get("Сумма", 0.0),
+                        r.get("Проверка", ""), r.get("Период", ""),
+                        r.get("Субконто", ""), r.get("Дебет", 0.0),
+                        r.get("Кредит", 0.0), r.get("Сумма", 0.0),
                     ]
                     for _, r in acc_rows.iterrows()
                 ]
-                self._pdf_table(pdf, pass_headers, table_rows, pass_widths, has_bold=has_bold)
+                self._pdf_table(
+                    pdf,
+                    pass_headers,
+                    table_rows,
+                    pass_widths,
+                    has_bold=has_bold
+                )
 
         return bytes(pdf.output())

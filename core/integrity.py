@@ -14,24 +14,26 @@ from typing import Any
 import pandas as pd
 
 # Русские тексты предупреждений для UI
-WARN_COLUMN_SHIFT = (
+WARN_COLUMN_SHIFT: str = (
     "Аномалия математического баланса: Остаток на конец не сходится с оборотами. "
     "Вероятно, при загрузке колонки сместились (например, «Обороты» загрузились как "
     "«Остаток на конец»)."
 )
-WARN_MAGNITUDE_MISMATCH = (
+WARN_MAGNITUDE_MISMATCH: str = (
     "Аномалия сумм: Средние обороты многократно превышают остатки. "
     "Убедитесь, что колонки Оборотов и Остатков не перепутаны местами в исходном файле."
 )
 
 
 def check_bookkeeping_identity(df: pd.DataFrame) -> list[str]:
-    """Проверка 1: математическое тождество баланса.
+    """
+    Проверка 1: математическое тождество баланса
 
     (КонецДебет - КонецКредит) - (НачалоДебет - НачалоКредит) - (ОборотДебет - ОборотКредит) == 0
     """
+
     warnings: list[str] = []
-    required_cols = [
+    required_cols: list[str] = [
         "НачалоДебет", "НачалоКредит",
         "ОборотДебет", "ОборотКредит",
         "КонецДебет", "КонецКредит",
@@ -48,7 +50,7 @@ def check_bookkeeping_identity(df: pd.DataFrame) -> list[str]:
     diff = (end_net - beg_net - turn_net).abs()
 
     # Если более 10% строк с ненулевыми остатками нарушают базовое уравнение
-    # больше чем на 1 рубль (ошибка округления) — колонки, скорее всего, сдвинуты.
+    # больше чем на 1 рубль (ошибка округления) — колонки, скорее всего, сдвинуты
     active_rows = df[(df[required_cols] > 0).any(axis=1)]
     if not active_rows.empty:
         violation_rate = (diff > 1.0).sum() / len(active_rows)
@@ -59,36 +61,47 @@ def check_bookkeeping_identity(df: pd.DataFrame) -> list[str]:
 
 
 def check_magnitude_correlation(df: pd.DataFrame) -> list[str]:
-    """Проверка 2: соотношение оборотов и остатков по модулю.
+    """
+    Проверка 2: соотношение оборотов и остатков по модулю
 
     Ловит случай, когда «Обороты» ошибочно попали в колонку «Остаток».
     """
+
     warnings: list[str] = []
-    if "ОборотДебет" not in df.columns or "КонецДебет" not in df.columns or df.empty:
+    if (
+        "ОборотДебет" not in df.columns
+        or "КонецДебет" not in df.columns
+        or df.empty
+    ):
         return warnings
 
     mean_turnover = df["ОборотДебет"].fillna(0).mean()
     max_balance = df["КонецДебет"].fillna(0).max()
 
     # Средний оборот аномально больше максимального остатка на конец —
-    # при этом уравнение баланса не сходится. Огромный красный флаг.
+    # при этом уравнение баланса не сходится. Огромный красный флаг
     if max_balance > 0 and mean_turnover > (max_balance * 10):
         warnings.append(WARN_MAGNITUDE_MISMATCH)
 
     return warnings
 
 
-def validate_osv_integrity(df: pd.DataFrame, meta: dict[str, Any]) -> dict[str, Any]:
-    """Агрегирует все проверки целостности.
+def validate_osv_integrity(
+    df: pd.DataFrame,
+    meta: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Агрегирует все проверки целостности
 
     Возвращает словарь, который можно безопасно вложить в `info`, возвращаемый
-    загрузчиками.
+    загрузчиками
     """
+
     findings: list[str] = []
     findings.extend(check_bookkeeping_identity(df))
     findings.extend(check_magnitude_correlation(df))
 
-    provenance = {
+    provenance: dict[str, Any] = {
         "db_name": meta.get("db_name", "Неизвестная база"),
         "source_type": meta.get("source_type", "file"),
         "period_parsed": meta.get("period", "Не определен"),

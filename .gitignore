@@ -11,7 +11,9 @@ data/examples/
 audit_history.db
 .ruff_cache
 client_databases.json
+users.json
 t.py
+.opencode/
 
 /*.xls
 /*.xlsx
