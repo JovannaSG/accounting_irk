@@ -582,6 +582,62 @@ def test_summary_contains_recommendations():
     assert summary.iloc[0]["Рекомендации"]  # непустая рекомендация по 4.1
 
 
+def test_summary_collapses_months_details_keeps_period():
+    # Детализация «Развернутое сальдо» сохраняет Период и строки по аналитике;
+    # сводка схлопывает их в одну строку на проверку (без колонки Период).
+    df = osv([
+        ["2026-01-31", "60.01", "ООО Ромашка", "A", 0, 0, 0, 0, 5000, 2000],
+        ["2026-01-31", "60.01", "ООО Лютик", "A", 0, 0, 0, 0, 4000, 1000],
+    ])
+    auditor = AutoAuditor1C(df, closing_accounts=["60"])
+    auditor.run_audit()
+
+    details = auditor.details_df()
+    assert "Период" in details.columns
+    exp_details = details[details["Проверка"].str.contains("Развернутое сальдо", na=False)]
+    assert len(exp_details) == 2
+
+    summary = auditor.summary_df()
+    assert "Период" not in summary.columns
+    exp_summary = summary[summary["Проверка"].str.contains("Развернутое сальдо", na=False)]
+    assert len(exp_summary) == 1
+    assert exp_summary.iloc[0]["Строк"] == 2
+    assert exp_summary.iloc[0]["Сумма"] == pytest.approx(12000.0)
+
+
+def test_summary_ml_duplicates_show_contragent_names():
+    # ML-дубли контрагентов: в сводке (summary_df) и Excel «Сводный отчет»
+    # пары названий попадают в колонку «Контрагенты», а «Детальный отчет»
+    # сохраняет колонку «Субконто» с именами.
+    df = osv([
+        ["2026-01-31", "60.01", "ООО Ромашка", "A", 0, 0, 0, 0, 5000, 0],
+        ["2026-01-31", "60.01", "Ромашка ООО", "A", 0, 0, 0, 0, 3000, 0],
+    ])
+    auditor = AutoAuditor1C(df, closing_accounts=["60"], ml_enabled=True)
+    auditor.run_audit()
+
+    summary = auditor.summary_df()
+    assert "Контрагенты" in summary.columns
+    dup = summary[summary["Проверка"].str.contains("дубли контрагентов", na=False)]
+    assert len(dup) == 1
+    assert "ООО Ромашка ≈ Ромашка ООО" in str(dup.iloc[0]["Контрагенты"])
+
+    data = auditor.to_excel()
+    import io
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(data))
+    detail = wb["Детальный отчет"]
+    headers = [c.value for c in detail[1]]
+    assert "Субконто" in headers
+    assert any(
+        "Ромашка" in str(c.value)
+        for row in detail.iter_rows(min_row=2)
+        for c in row
+    )
+    svod = wb["Сводный отчет"]
+    assert "Контрагенты" in [c.value for c in svod[1]]
+
+
 def test_to_pdf():
     pytest.importorskip("fpdf")
     df = osv([["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 5000]])
