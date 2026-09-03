@@ -115,7 +115,7 @@ def _render_logout_button() -> None:
     if not user:
         return
     if st.sidebar.button(
-        "🔓 Выйти", key="btn_logout", type="secondary", use_container_width=True
+        "🔓 Выйти", key="btn_logout", type="secondary", width="stretch"
     ):
         for key in ("user", "user_role", "user_allowed_urls", "audit_history"):
             st.session_state.pop(key, None)
@@ -458,7 +458,7 @@ def _render_dashboard(history: list[dict]) -> None:
     if col_reset.button(
         "✖️ Сбросить результаты",
         key="btn_reset_dash",
-        use_container_width=True
+        width="stretch"
     ):
         st.session_state["audit_history"] = []
 
@@ -484,7 +484,7 @@ def _render_dashboard(history: list[dict]) -> None:
         on_select="rerun",
         selection_mode="single-row",
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         key="dashboard_df",
     )
 

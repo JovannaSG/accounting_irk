@@ -7,6 +7,17 @@ _APP_TEST_DIR = tempfile.mkdtemp(prefix="app_test_db_")
 _APP_TEST_DB = os.path.join(_APP_TEST_DIR, "app_test.db")
 
 
+def _remove_db_with_sidecars(db_path):
+    """Удаляет файл БД и его WAL-соседей (-wal/-shm), если они остались."""
+    for suffix in ("", "-wal", "-shm"):
+        p = db_path + suffix
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
 def pytest_configure(config):
     """Отключаем аутентификацию в тестах (иначе st.stop() блокирует sidebar).
 
@@ -28,11 +39,8 @@ def pytest_configure(config):
 def pytest_sessionfinish(session, exitstatus):
     """Убираем общий временный файл БД после прогона."""
     db_path = os.environ.get("AUDIT_DB_PATH")
-    if db_path and os.path.exists(db_path):
-        try:
-            os.remove(db_path)
-        except OSError:
-            pass
+    if db_path:
+        _remove_db_with_sidecars(db_path)
 
 
 @pytest.fixture(autouse=True)
@@ -41,9 +49,4 @@ def _clean_app_db():
     засеянные одним тестом, не влияли на следующий)."""
     yield
     os.environ["AUDIT_USERS"] = ""
-    db_path = _APP_TEST_DB
-    if os.path.exists(db_path):
-        try:
-            os.remove(db_path)
-        except OSError:
-            pass
+    _remove_db_with_sidecars(_APP_TEST_DB)

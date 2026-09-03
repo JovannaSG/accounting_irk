@@ -10,10 +10,14 @@ services:
     container_name: accounting_irk
     ports:
       - "8501:8501"
+    environment:
+      # Точка монтирования БД. Держим рядом с описанием volume, чтобы путь,
+      # куда пишет приложение, всегда совпадал с путём монтирования.
+      AUDIT_DB_PATH: /app/dbdata/audit_history.db
     volumes:
       - ./users.json:/app/users.json:ro
       - ./client_databases.json:/app/client_databases.json:ro
-      - audit_data:/app/audit_history.db
+      - audit_data:/app/dbdata
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]

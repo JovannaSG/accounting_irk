@@ -14,9 +14,9 @@ _DB_PATH = os.environ.get(
     )
 )
 
-# Путь к конфигу пользователей (роли + доступ к базам). По умолчанию —
-# users.json в корне проекта. Опционально переопределяется переменной
-# окружения AUDIT_USERS_CONFIG
+# Путь к конфигу пользователей (роли + доступ к базам)
+# По умолчанию — users.json в корне проекта
+# Опционально переопределяется переменной окружения AUDIT_USERS_CONFIG
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 USERS_CONFIG_PATH = os.environ.get(
     "AUDIT_USERS_CONFIG",
@@ -30,11 +30,17 @@ def init_db():
     (миграция старых БД без findings_json/meta_json/user)
 
     Таблица `users` хранит роли и доступ к базам (ТЗ §11, доступ бухгалтеров
-    к назначенным базам). Если таблица пуста — засевается из конфига users.json.
+    к назначенным базам). Если таблица пуста — засевается из конфига users.json
     """
 
-    conn = sqlite3.connect(_DB_PATH)
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
+    # WAL: многие читатели одновременно с одним писателем
+    # (несколько сессий Streamlit / процессов)
+    # synchronous=NORMAL безопасен в WAL-режиме и
+    # сильно снижает оверхед по диску.
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA synchronous=NORMAL;")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS audits (
             audit_id TEXT PRIMARY KEY,
@@ -170,7 +176,7 @@ def upsert_user(
     """
 
     init_db()
-    conn = sqlite3.connect(_DB_PATH)
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO users (login, role, password_hash, allowed_urls, created_at, active) "
@@ -197,7 +203,7 @@ def get_user(login: str) -> dict | None:
     """
 
     init_db()
-    conn = sqlite3.connect(_DB_PATH)
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT login, role, password_hash, allowed_urls, active "
@@ -230,7 +236,7 @@ def list_users() -> list[dict]:
     """
 
     init_db()
-    conn = sqlite3.connect(_DB_PATH)
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
     cursor.execute("SELECT login, role, allowed_urls, active FROM users ORDER BY login")
     rows = cursor.fetchall()
@@ -393,8 +399,10 @@ def save_audit_log(result: dict) -> None:
     чтобы экспорт Excel/PDF работал для записей из истории)
     """
 
+    from core.auth import _normalize_url
+
     init_db()
-    conn = sqlite3.connect(_DB_PATH)
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
 
     details_df = result.get("details", pd.DataFrame())
@@ -426,6 +434,10 @@ def save_audit_log(result: dict) -> None:
     source_url = str((meta_payload or {}).get("url") or "") \
         or str(_source.get("url") or "") \
         or str(result.get("source_url") or "")
+    if source_url:
+        source_url = _normalize_url(source_url)
+    else:
+        source_url = None
 
     cursor.execute("""
         INSERT OR REPLACE INTO audits
@@ -467,7 +479,7 @@ def load_audit_history(
     """
 
     init_db()
-    conn = sqlite3.connect(_DB_PATH)
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
 
     params: list = []
