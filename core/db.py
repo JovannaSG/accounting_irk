@@ -30,8 +30,7 @@ def init_db():
     (миграция старых БД без findings_json/meta_json/user)
 
     Таблица `users` хранит роли и доступ к базам (ТЗ §11, доступ бухгалтеров
-    к назначенным базам). Если таблица пуста — засевается из конфига users.json
-    (или как запасной вариант — из AUDIT_USERS)
+    к назначенным базам). Если таблица пуста — засевается из конфига users.json.
     """
 
     conn = sqlite3.connect(_DB_PATH)
@@ -105,9 +104,7 @@ def load_users_config() -> dict:
 
 def _seed_users_from_config(cursor) -> None:
     """
-    Заполняет пустую таблицу users:
-    1) из users.json (приоритет);
-    2) если нет — как запасной вариант сеет первого админа из AUDIT_USERS
+    Заполняет пустую таблицу users из users.json
     """
 
     config = load_users_config()
@@ -116,6 +113,7 @@ def _seed_users_from_config(cursor) -> None:
         if not isinstance(spec, dict) or not login.strip():
             continue
         role = str(spec.get("role") or "accountant").strip().lower()
+
         pwd_hash = str(
             spec.get("password_hash")
             or spec.get("password")
@@ -123,6 +121,7 @@ def _seed_users_from_config(cursor) -> None:
         ).strip()
         if not pwd_hash:
             continue
+
         allowed = spec.get("allowed_urls") or []
         insert_user(
             cursor,
@@ -131,26 +130,6 @@ def _seed_users_from_config(cursor) -> None:
             password_hash=pwd_hash,
             allowed_urls=allowed if isinstance(allowed, list) else [],
         )
-
-    if not config:
-        # Запасной вариант: первый admin из AUDIT_USERS (обратная совместимость)
-        seed = os.environ.get("AUDIT_USERS") or ""
-        first_login = None
-        first_hash = None
-        for fragment in seed.split(","):
-            login, sep, stored = fragment.partition(":")
-            if sep and login.strip() and stored.strip():
-                first_login = login.strip().lower()
-                first_hash = stored.strip()
-                break
-        if first_login:
-            insert_user(
-                cursor,
-                login=first_login,
-                role="admin",
-                password_hash=first_hash,
-                allowed_urls=[],
-            )
 
 
 def insert_user(

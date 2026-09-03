@@ -5,7 +5,6 @@ __pycache__/
 *.egg-info/
 .git/
 .gitignore
-.env
 docs/
 backup_v1/
 tests/
@@ -20,4 +19,4 @@ client_databases.json
 users.json
 .ruff_cache
 t.py
-.opencode/
+.opencode

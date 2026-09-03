@@ -10,8 +10,8 @@ _APP_TEST_DB = os.path.join(_APP_TEST_DIR, "app_test.db")
 def pytest_configure(config):
     """Отключаем аутентификацию в тестах (иначе st.stop() блокирует sidebar).
 
-    load_dotenv(override=False) не перезаписывает уже заданные переменные,
-    поэтому достаточно установить AUDIT_USERS="" до запуска тестов.
+    Устанавливаем AUDIT_USERS="" и указываем изолированные пути для временной
+    БД и конфига пользователей.
 
     AppTest работает in-process, поэтому core.db._DB_PATH и USERS_CONFIG_PATH
     фиксируются при первом импорте. Чтобы тесты приложения не писали в реальную

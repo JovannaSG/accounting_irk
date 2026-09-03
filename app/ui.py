@@ -12,12 +12,6 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 _DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
 
-from core.appenv import load_project_env
-
-# .env из корня проекта — до первых чтений переменных окружения
-# (ONEC_*, AUDIT_DB_PATH, AUDIT_USERS) и до импорта core-модулей
-load_project_env()
-
 import streamlit as st
 
 from core.api_client import OneCClient
@@ -617,7 +611,7 @@ if st.session_state.get("user"):
 st.sidebar.header("📥 Загрузка данных")
 data_source = st.sidebar.radio(
     "Источник данных",
-    ["📁 Файл (CSV/XLS/XLSX/HTML)", "☁️ 1С:Фреш (OData)", "🚀 Аудит всех баз"],
+    ["📁 Файл (CSV/XLS/XLSX/HTML)", "☁️ 1С:Фреш (OData)", "📊 Аудит всех баз"],
     key="data_source",
 )
 use_mock = st.sidebar.button("Использовать тестовые данные", key="btn_mock")
@@ -677,11 +671,19 @@ elif data_source.startswith("☁️"):
             key="api_pass",
         )
     c1, c2 = st.sidebar.columns(2)
-    api_start = c1.date_input("Период с", value=date(date.today().year, 1, 1), key="api_start")
+    api_start = c1.date_input(
+        "Период с",
+        value=date(date.today().year, 1, 1),
+        key="api_start"
+    )
     api_end = c2.date_input("Период по", value=date.today(), key="api_end")
-    fetch_api = st.sidebar.button("📡 Загрузить ОСВ из 1С", type="primary", key="btn_fetch")
+    fetch_api = st.sidebar.button(
+        "📡 Загрузить ОСВ из 1С",
+        type="primary",
+        key="btn_fetch"
+    )
 
-elif data_source.startswith("🚀"):
+elif data_source.startswith("📊"):
     merge_mode = "Объединить в одну базу"
 
     _BATCH_JSON_PATH = os.path.join(_PROJECT_ROOT, "client_databases.json")
@@ -717,12 +719,17 @@ elif data_source.startswith("🚀"):
                     "Обратитесь к администратору."
                 )
 
-        # МЫ УДАЛИЛИ ВВОД БАЗОВОГО ЛОГИНА И ПАРОЛЯ ОТСЮДА!
-        # Оставляем только выбор дат.
-
         c1, c2 = st.sidebar.columns(2)
-        api_start = c1.date_input("Период с", value=date(date.today().year, 1, 1), key="api_start")
-        api_end = c2.date_input("Период по", value=date.today(), key="api_end")
+        api_start = c1.date_input(
+            "Период с",
+            value=date(date.today().year, 1, 1),
+            key="api_start"
+        )
+        api_end = c2.date_input(
+            "Период по",
+            value=date.today(),
+            key="api_end"
+        )
 
         fetch_batch = st.sidebar.button(
             "📡 Загрузить все базы",
@@ -744,7 +751,8 @@ with st.sidebar.expander("⚙️ Настройки проверок"):
     chk_group_balances = st.checkbox(
         "Контроль групп счетов (4.3)",
         value=False,
-        help="Авансы, РБП, товары, денежные средства, кредиты: незакрытые остатки на конец периода.",
+        help="Авансы, РБП, товары, денежные средства, кредиты: \
+            незакрытые остатки на конец периода.",
     )
     chk_stuck_balances = st.checkbox(
         "Зависшее сальдо между периодами",
@@ -777,7 +785,8 @@ with st.sidebar.expander("⚙️ Настройки проверок"):
         "План счетов: Тип (код:тип)",
         value="",
         placeholder="Например: 51:A, 60.01:AP",
-        help="Дополнительные типы счетов для определения красного сальдо. Формат: Код:Тип, через запятую.",
+        help="Дополнительные типы счетов для определения красного сальдо. \
+            Формат: Код:Тип, через запятую.",
     )
 
 with st.sidebar.expander("ML-проверки"):
@@ -785,12 +794,14 @@ with st.sidebar.expander("ML-проверки"):
     ml_amount_anomalies = st.checkbox(
         "Нетипичные суммы операций",
         value=True,
-        help="Поиск операций, чья сумма статистически выделяется по истории контрагента (медиана+MAD).",
+        help="Поиск операций, чья сумма статистически выделяется по истории \
+            контрагента (медиана+MAD).",
     )
     ml_turnover_jumps = st.checkbox(
         "Скачки оборотов между периодами",
         value=True,
-        help="Резкий рост/падение оборотов по счету между периодами (нужны данные за 2+ периода).",
+        help="Резкий рост/падение оборотов по счету между периодами \
+            (нужны данные за 2+ периода).",
     )
     ml_duplicates = st.checkbox(
         "Дубли контрагентов",
@@ -820,7 +831,7 @@ documents: pd.DataFrame | None = None
 source_info: dict = {}
 
 # Список баз для аудита: [{"name": str, "df": pd.DataFrame, "info": dict}]
-datasets_to_process = []
+datasets_to_process: list = []
 
 if fetch_api:
     user = st.session_state.get("user") or ""
@@ -1005,7 +1016,7 @@ try:
                 }
             )
 
-    elif data_source.startswith("🚀") and "batch_datasets" in st.session_state:
+    elif data_source.startswith("📊") and "batch_datasets" in st.session_state:
         datasets_to_process = st.session_state["batch_datasets"]
         balances = pd.concat(
             [ds["df"] for ds in datasets_to_process], ignore_index=True
@@ -1076,7 +1087,7 @@ except (ValueError, OSError) as exc:
 if not datasets_to_process:
     if data_source.startswith("☁️"):
         st.info("👈 Введите доступ к 1С:Фреш и нажмите «📡 Загрузить ОСВ из 1С» в панели слева.")
-    elif data_source.startswith("🚀"):
+    elif data_source.startswith("📊"):
         st.info("👈 Нажмите «📡 Загрузить все базы» в панели слева.")
     else:
         st.info("👈 Загрузите файл(ы) ОСВ (CSV/XLS/XLSX/HTML) или нажмите «Использовать тестовые данные» в панели слева.")

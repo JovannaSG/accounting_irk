@@ -7,11 +7,6 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from core.appenv import load_project_env
-
-# .env из корня проекта подхватывается до чтения любых переменных окружения
-load_project_env()
-
 
 def _port_in_use(host: str, port: int) -> bool:
     """True, если TCP-порт уже занят."""
