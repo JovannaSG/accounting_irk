@@ -14,9 +14,9 @@ _DB_PATH = os.environ.get(
     )
 )
 
-# Путь к конфигу пользователей (роли + доступ к базам). По умолчанию —
-# users.json в корне проекта. Опционально переопределяется переменной
-# окружения AUDIT_USERS_CONFIG
+# Путь к конфигу пользователей (роли + доступ к базам)
+# По умолчанию — users.json в корне проекта
+# Опционально переопределяется переменной окружения AUDIT_USERS_CONFIG
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 USERS_CONFIG_PATH = os.environ.get(
     "AUDIT_USERS_CONFIG",
@@ -31,11 +31,16 @@ def init_db():
 
     Таблица `users` хранит роли и доступ к базам (ТЗ §11, доступ бухгалтеров
     к назначенным базам). Если таблица пуста — засевается из конфига users.json
-    (или как запасной вариант — из AUDIT_USERS)
     """
 
-    conn = sqlite3.connect(_DB_PATH)
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
+    # WAL: многие читатели одновременно с одним писателем
+    # (несколько сессий Streamlit / процессов)
+    # synchronous=NORMAL безопасен в WAL-режиме и
+    # сильно снижает оверхед по диску.
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA synchronous=NORMAL;")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS audits (
             audit_id TEXT PRIMARY KEY,
@@ -105,9 +110,7 @@ def load_users_config() -> dict:
 
 def _seed_users_from_config(cursor) -> None:
     """
-    Заполняет пустую таблицу users:
-    1) из users.json (приоритет);
-    2) если нет — как запасной вариант сеет первого админа из AUDIT_USERS
+    Заполняет пустую таблицу users из users.json
     """
 
     config = load_users_config()
@@ -116,6 +119,7 @@ def _seed_users_from_config(cursor) -> None:
         if not isinstance(spec, dict) or not login.strip():
             continue
         role = str(spec.get("role") or "accountant").strip().lower()
+
         pwd_hash = str(
             spec.get("password_hash")
             or spec.get("password")
@@ -123,6 +127,7 @@ def _seed_users_from_config(cursor) -> None:
         ).strip()
         if not pwd_hash:
             continue
+
         allowed = spec.get("allowed_urls") or []
         insert_user(
             cursor,
@@ -131,26 +136,6 @@ def _seed_users_from_config(cursor) -> None:
             password_hash=pwd_hash,
             allowed_urls=allowed if isinstance(allowed, list) else [],
         )
-
-    if not config:
-        # Запасной вариант: первый admin из AUDIT_USERS (обратная совместимость)
-        seed = os.environ.get("AUDIT_USERS") or ""
-        first_login = None
-        first_hash = None
-        for fragment in seed.split(","):
-            login, sep, stored = fragment.partition(":")
-            if sep and login.strip() and stored.strip():
-                first_login = login.strip().lower()
-                first_hash = stored.strip()
-                break
-        if first_login:
-            insert_user(
-                cursor,
-                login=first_login,
-                role="admin",
-                password_hash=first_hash,
-                allowed_urls=[],
-            )
 
 
 def insert_user(
@@ -191,7 +176,7 @@ def upsert_user(
     """
 
     init_db()
-    conn = sqlite3.connect(_DB_PATH)
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO users (login, role, password_hash, allowed_urls, created_at, active) "
@@ -218,7 +203,7 @@ def get_user(login: str) -> dict | None:
     """
 
     init_db()
-    conn = sqlite3.connect(_DB_PATH)
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT login, role, password_hash, allowed_urls, active "
@@ -251,7 +236,7 @@ def list_users() -> list[dict]:
     """
 
     init_db()
-    conn = sqlite3.connect(_DB_PATH)
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
     cursor.execute("SELECT login, role, allowed_urls, active FROM users ORDER BY login")
     rows = cursor.fetchall()
@@ -414,8 +399,10 @@ def save_audit_log(result: dict) -> None:
     чтобы экспорт Excel/PDF работал для записей из истории)
     """
 
+    from core.auth import _normalize_url
+
     init_db()
-    conn = sqlite3.connect(_DB_PATH)
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
 
     details_df = result.get("details", pd.DataFrame())
@@ -447,6 +434,10 @@ def save_audit_log(result: dict) -> None:
     source_url = str((meta_payload or {}).get("url") or "") \
         or str(_source.get("url") or "") \
         or str(result.get("source_url") or "")
+    if source_url:
+        source_url = _normalize_url(source_url)
+    else:
+        source_url = None
 
     cursor.execute("""
         INSERT OR REPLACE INTO audits
@@ -488,7 +479,7 @@ def load_audit_history(
     """
 
     init_db()
-    conn = sqlite3.connect(_DB_PATH)
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     cursor = conn.cursor()
 
     params: list = []

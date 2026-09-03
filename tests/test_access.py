@@ -109,17 +109,3 @@ def test_seed_from_config_file(tmp_path, monkeypatch):
     assert auth.user_role("admin") == "admin"
     assert auth.user_role("ivanova") == "accountant"
     assert auth.user_can_access("ivanova", "https://1cfresh.com/a/ab/123")
-
-
-def test_seed_first_admin_from_env(tmp_path, monkeypatch):
-    # Без users.json сеем первого админа из AUDIT_USERS (обратная совместимость).
-    cfg_path = str(tmp_path / "users.json")
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        f.write("{}")
-    monkeypatch.setattr(db_mod, "USERS_CONFIG_PATH", cfg_path)
-    stored = auth.hash_password("pw123")
-    monkeypatch.setenv(auth.AUDIT_USERS_ENV, f"boss:{stored},other:{stored}")
-
-    db_mod.init_db()
-    assert auth.user_role("boss") == "admin"
-    assert auth.user_can_access("boss", "https://anything") is True

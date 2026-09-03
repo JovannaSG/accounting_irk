@@ -305,7 +305,7 @@ def test_batch_audit_loads_and_audits(tmp_path, monkeypatch):
         at.run()
         assert not at.exception
 
-        at.sidebar.radio(key="data_source").set_value("🚀 Аудит всех баз")
+        at.sidebar.radio(key="data_source").set_value("📊 Аудит всех баз")
         at.run()
         assert not at.exception
 
