@@ -112,6 +112,17 @@ DETAIL_COLUMNS: list[str] = [
 _LEVEL_ORDER: dict[str, int] = {"warning": 1, "error": 2}
 _LEVEL_RU: dict[str, str] = {"error": "Ошибка", "warning": "Предупреждение"}
 
+
+def _join_names(series) -> str:
+    """Собирает уникальные непустые названия (например, пары контрагентов
+    «ООО Ромашка ≈ Ромашка ООО») из серии в текст через «; »."""
+    seen: list[str] = []
+    for v in series.dropna():
+        s = str(v).strip()
+        if s and s != "-" and s not in seen:
+            seen.append(s)
+    return "; ".join(seen)
+
 SECTION_SPECS: list[tuple[str, tuple[str, ...]]] = [
     ("Закрытие месяца", (
         "Незакрытое сальдо на конец месяца (закрываемые счета)",
@@ -1105,22 +1116,31 @@ class AutoAuditor1C:
         return instance
 
     def summary_df(self) -> pd.DataFrame:
+        # Сводный отчёт схлопывает все месяцы периода в одну строку на проверку:
+        # детализация по месяцам остаётся в details_df() (лист «Детальный отчет»).
+        # Для ML-дублей контрагентов в отдельной колонке «Контрагенты» показываем
+        # найденные пары названий, иначе колонка пустая.
         columns: list[str] = [
             "Проверка", "Уровень",
-            "Период", "Строк",
+            "Строк",
             "Сумма", "Рекомендации"
         ]
         details = self.details_df()
         if details.empty:
-            return pd.DataFrame(columns=columns)
+            return pd.DataFrame(columns=columns + ["Контрагенты"])
         grouped = (
             details
-            .groupby(["Проверка", "Уровень", "Период"], sort=False)
-            .agg(Строк=("Сумма", "count"), Сумма=("Сумма", "sum"))
+            .groupby(["Проверка", "Уровень"], sort=False)
+            .agg(
+                Строк=("Сумма", "count"),
+                Сумма=("Сумма", "sum"),
+                Контрагенты=("Субконто", lambda s: _join_names(s)),
+            )
             .reset_index()
         )
+        grouped["Контрагенты"] = grouped["Контрагенты"].fillna("")
         grouped["Рекомендации"] = grouped["Проверка"].map(RECOMMENDATIONS).fillna("")
-        return grouped[columns]
+        return grouped[columns + ["Контрагенты"]]
 
     def details_df(self) -> pd.DataFrame:
         rows: list = []
@@ -1403,16 +1423,8 @@ class AutoAuditor1C:
 
         summary = self.summary_df()
         details = self.details_df()
-        details = details.drop(
-            columns=["Субконто", "Договор"],
-            errors="ignore"
-        )
         by_account = self.accounts_summary_df()
         top_findings = self.top_findings_df(TOP_FINDINGS_LIMIT)
-        top_findings = top_findings.drop(
-            columns=["Субконто"],
-            errors="ignore"
-        )
 
         pass_details = pd.DataFrame()
         if account_pass is not None:
@@ -1778,14 +1790,15 @@ class AutoAuditor1C:
                     _SHORT_PDF_LABELS.get(str(r["Проверка"]), str(r["Проверка"])),
                     _LEVEL_RU.get(str(r["Уровень"]), str(r["Уровень"])),
                     int(r["Строк"]), float(r["Сумма"]),
+                    str(r.get("Контрагенты") or ""),
                 ]
                 for _, r in summary.iterrows()
             ]
             self._pdf_table(
                 pdf,
-                ["Проверка", "Уровень", "Строк", "Сумма"],
+                ["Проверка", "Уровень", "Строк", "Сумма", "Контрагенты"],
                 sum_rows,
-                [64, 26, 14, 24],
+                [40, 22, 12, 18, 40],
                 has_bold=has_bold
             )
 
