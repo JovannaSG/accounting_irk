@@ -13,6 +13,7 @@ client_databases.json
 users.json
 t.py
 .opencode
+data/
 
 /*.xls
 /*.xlsx

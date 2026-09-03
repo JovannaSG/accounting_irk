@@ -41,6 +41,63 @@ def test_red_balance_passive_debit_only():
     assert set(red[0]["data"]["Счет"]) == {"68"}
 
 
+def test_red_balance_ap_subconto_opposite_to_account_net():
+    # Активно-пассивный счет (60) с одновременными дебиторами и кредиторами:
+    # субконто, «висящее» только по кредиту при общем дебетовом итоге по счету,
+    # помечается как красное сальдо (warning), но НЕ перебивает «Развернутое».
+    df = osv([
+        ["2026-01-31", "60.01", "ООО Ромашка", "AP", 0, 0, 0, 0, 45000, 30000],  # дебитор
+        ["2026-01-31", "60.01", "Ромашка ООО", "AP", 0, 0, 0, 0, 0, 10000],      # кредит-остаток
+        ["2026-01-31", "60.01", "ООО Лютик", "AP", 0, 0, 0, 0, 8000, 8000],       # двустороннее
+    ])
+    auditor = AutoAuditor1C(df, closing_accounts=["90"], checks={"red_balance", "expanded_balance"})
+    errors = auditor.run_audit()
+
+    red = [e for e in errors if "Красное сальдо" in e["title"]]
+    assert len(red) == 1
+    assert red[0]["level"] == "warning"
+    assert list(red[0]["data"]["Субконто"]) == ["Ромашка ООО"]
+
+    expanded = [e for e in errors if "Развернутое сальдо" in e["title"]]
+    assert len(expanded) == 1
+    assert "ООО Лютик" in set(expanded[0]["data"]["Субконто"])
+    # двустороннее субконто не должно задваиваться как красное сальдо
+    assert "ООО Лютик" not in set(red[0]["data"]["Субконто"])
+
+
+def test_red_balance_ap_single_subconto_not_red():
+    # Один субконто на счёт: не бывает «противоположного итогу» — ошибки нет.
+    df = osv([
+        ["2026-01-31", "73", "Иванов", "AP", 0, 0, 0, 0, 0, 360],
+    ])
+    auditor = AutoAuditor1C(df)
+    errors = auditor.run_audit()
+    assert not [e for e in errors if "Красное сальдо" in e["title"]]
+
+
+def test_red_balance_ap_grouped_to_parent():
+    # Субконто разных субсчетов одного родителя (60.01 + 60.02) схлопываются
+    # в родительский счёт: итог по 60 дебетовый, 60.02 «висит» по кредиту.
+    # Отчёт группирует по родителю, а accounts_with_errors не отдаёт субсчета.
+    df = osv([
+        ["2026-01-31", "60.01", "ООО Ромашка", "AP", 0, 0, 0, 0, 45000, 30000],
+        ["2026-02-28", "60.02", "Ромашка ООО", "AP", 0, 0, 0, 0, 0, 10000],
+    ])
+    auditor = AutoAuditor1C(df, closing_accounts=["90"], checks={"red_balance", "expanded_balance"})
+    auditor.run_audit()
+
+    red = [e for e in auditor.errors if "противоположно" in e.title]
+    assert len(red) == 1
+    assert set(red[0]["data"]["Счет"]) == {"60"}
+
+    details = auditor.details_df()
+    assert set(details["Счет"]) == {"60"}
+
+    accounts = auditor.accounts_with_errors()
+    assert accounts == ["60"]
+    assert not any("." in str(a) for a in accounts)
+
+
 def test_red_balance_net_value_not_raw_columns():
     # Активный счет с КД=1000 и КК=500 -> итог дебетовый, ошибки быть не должно
     df = osv([
@@ -84,6 +141,47 @@ def test_red_balance_period_of_occurrence():
     red = [e for e in errors if "Красное сальдо" in e["title"]]
     assert len(red) == 1
     assert "отрицательное сальдо с 28.02.2026" in red[0]["data"].iloc[0]["Комментарий"]
+
+
+def test_red_balance_negative_debit_ap_catches_real_73_xls():
+    from core.loaders import load_osv_file
+    with open("data/73.xls", "rb") as f:
+        data = f.read()
+    df, _ = load_osv_file("73.xls", data)
+    auditor = AutoAuditor1C(df, closing_accounts=["90"], checks={"red_balance"})
+    auditor.run_audit()
+    red = [e for e in auditor.errors if "Красное сальдо" in e.title]
+    assert len(red) >= 1
+    accounts = sorted(set(red[0]["data"]["Счет"]))
+    assert "73" in accounts
+    assert red[0]["level"] == "warning"
+
+
+def test_red_balance_negative_credit_active_flagged():
+    df = osv([
+        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 0, 0, 0, -100],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance"})
+    auditor.run_audit()
+    red = [e for e in auditor.errors if "Красное сальдо" in e.title]
+    assert len(red) == 1
+    assert red[0]["level"] == "error"
+
+
+def test_red_balance_negative_debit_19_xls():
+    from core.loaders import load_osv_file
+    with open("data/Оборотно-сальдовая ведомость по счету 19 за 1-st half year of 2026.xls", "rb") as f:
+        data = f.read()
+    df, _ = load_osv_file("19.xls", data)
+    auditor = AutoAuditor1C(df, closing_accounts=["90"], checks={"red_balance"})
+    auditor.run_audit()
+    red = [e for e in auditor.errors if "Красное сальдо" in e.title]
+    assert len(red) >= 1
+    accounts = sorted(set(red[0]["data"]["Счет"]))
+    assert "19" in accounts
+    assert red[0]["level"] == "error"
+    rows = red[0]["data"]
+    assert len(rows) >= 6
 
 
 # ---------------- 4.2 Развернутое сальдо ----------------

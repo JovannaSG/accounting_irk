@@ -440,6 +440,7 @@ class AutoAuditor1C:
         balance_checks: set = {
             "Красное сальдо: активный счет с кредитовым остатком",
             "Красное сальдо: пассивный счет с дебетовым остатком",
+            "Красное сальдо: субконто активно-пассивного счета противоположно итогу",
             "Развернутое сальдо по аналитике",
             "Незакрытое сальдо на конец месяца (закрываемые счета)",
             "Зависшее сальдо (не меняется между периодами)",
@@ -583,31 +584,77 @@ class AutoAuditor1C:
 
         net = b["КонецДебет"] - b["КонецКредит"]
 
-        # Активные счета с кредитовым сальдо
+        # 1. Активные счета с кредитовым сальдо ИЛИ любыми явными минусами
+        mask_active = (b["Тип"] == "A") & (
+            (net < -EPS) | (b["КонецДебет"] < -EPS) | (b["КонецКредит"] < -EPS)
+        )
         active = self._annotate_since(
-            b, (b["Тип"] == "A") & (net < -EPS),
+            b, mask_active,
             "Активный счет имеет кредитовое (отрицательное) сальдо",
             "отрицательное сальдо с"
         )
         if not active.empty:
-            self._add(
-                "error",
-                "Красное сальдо: активный счет с кредитовым остатком",
-                active
-            )
+            self._add("error", "Красное сальдо: активный счет с кредитовым остатком", active)
 
-        # Пассивные счета с дебетовым сальдо
+        # 2. Пассивные счета с дебетовым сальдо ИЛИ любыми явными минусами
+        mask_passive = (b["Тип"] == "P") & (
+            (net > EPS) | (b["КонецДебет"] < -EPS) | (b["КонецКредит"] < -EPS)
+        )
         passive = self._annotate_since(
-            b, (b["Тип"] == "P") & (net > EPS),
+            b, mask_passive,
             "Пассивный счет имеет дебетовое (отрицательное) сальдо",
             "отрицательное сальдо с"
         )
         if not passive.empty:
-            self._add(
-                "error",
-                "Красное сальдо: пассивный счет с дебетовым остатком",
-                passive
+            self._add("error", "Красное сальдо: пассивный счет с дебетовым остатком", passive)
+
+        # 3. Активно-пассивные счета (АП)
+        ap = b[b["Тип"] == "AP"].copy()
+        if not ap.empty:
+            # Сначала ловим явные физические минусы (отрицательное в колонке ОСВ)
+            mask_ap_negative = (ap["КонецДебет"] < -EPS) | (ap["КонецКредит"] < -EPS)
+            ap_negative = self._annotate_since(
+                ap, mask_ap_negative,
+                "Активно-пассивный счет имеет явный отрицательный остаток (минус в ОСВ)",
+                "минус с"
             )
+            if not ap_negative.empty:
+                self._add(
+                    "warning",
+                    "Красное сальдо: субконто активно-пассивного счета противоположно итогу",
+                    ap_negative
+                )
+
+            # Затем логика сверки субконто с родителем (без дублирования строк с минусами)
+            ap_typological = ap[~mask_ap_negative].copy()
+            if not ap_typological.empty:
+                parent = ap_typological["Счет"].map(account_group)
+                agg_net = (
+                    ap_typological.assign(_parent=parent)
+                    .groupby("_parent")[["КонецДебет", "КонецКредит"]]
+                    .sum()
+                    .eval("_net = КонецДебет - КонецКредит")["_net"]
+                )
+                ap_typological["_agg_net"] = parent.map(agg_net).where(
+                    parent.map(agg_net).notna(), 0.0
+                )
+
+                sub_net = ap_typological["КонецДебет"] - ap_typological["КонецКредит"]
+                ap_flag = (
+                    ((ap_typological["_agg_net"] > EPS) & (sub_net < -EPS))
+                    | ((ap_typological["_agg_net"] < -EPS) & (sub_net > EPS))
+                )
+                ap_red = self._annotate_since(
+                    ap_typological, ap_flag,
+                    "Активно-пассивный счет: сальдо субконто противоположно итогу по счету",
+                    "противоположное сальдо с"
+                )
+                if not ap_red.empty:
+                    self._add(
+                        "warning",
+                        "Красное сальдо: субконто активно-пассивного счета противоположно итогу",
+                        ap_red.drop(columns=["_agg_net"])
+                    )
 
     def check_expanded_balance(self) -> None:
         b = self.balances
