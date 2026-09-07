@@ -392,6 +392,63 @@ def test_account_000_detected_after_string_conversion():
     assert list(acc000[0]["data"]["Счет"]) == ["000"]
 
 
+# ---------------- Особое правило: счет 51 ----------------
+def test_account_51_no_turnover_error():
+    df = osv([
+        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 0, 0, 100000, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+    idle = [e for e in auditor.errors if "Отсутствие движений" in e.title]
+    assert len(idle) == 1
+    assert idle[0]["level"] == "error"
+    assert list(idle[0]["data"]["Счет"]) == ["51"]
+
+
+def test_account_51_with_turnover_no_error():
+    df = osv([
+        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 100000, 0, 100000, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+    idle = [e for e in auditor.errors if "Отсутствие движений" in e.title]
+    assert not idle
+
+
+def test_account_51_absent_no_error():
+    df = osv([
+        ["2026-01-31", "50", "Касса", "A", 0, 0, 5000, 0, 5000, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+    idle = [e for e in auditor.errors if "Отсутствие движений" in e.title]
+    assert not idle
+
+
+def test_account_51_subaccount_rolls_to_parent():
+    df = osv([
+        ["2026-01-31", "51.01", "Расчетный", "A", 0, 0, 0, 0, 100000, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+    idle = [e for e in auditor.errors if "Отсутствие движений" in e.title]
+    assert len(idle) == 1
+    assert set(idle[0]["data"]["Счет"]) == {"51"}
+
+
+def test_account_51_multi_org_flags_only_idle_org():
+    df = osv([
+        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 0, 0, 100000, 0],
+        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 100000, 0, 100000, 0],
+    ])
+    df["Организация"] = ["ООО А", "ООО Б"]
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+    idle = [e for e in auditor.errors if "Отсутствие движений" in e.title]
+    assert len(idle) == 1
+    assert set(idle[0]["data"]["Организация"]) == {"ООО А"}
+
+
 # ---------------- 4.5 Контрагенты ----------------
 def _docs(rows):
     return pd.DataFrame(rows, columns=["Дата", "Документ", "Контрагент", "Счет", "Вид", "Сумма"])
@@ -613,7 +670,7 @@ def test_report_structure_and_excel():
 
 def test_report_ok_when_no_errors():
     df = osv([
-        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 0, 0, 100000, 0],
+        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 100000, 0, 100000, 0],
     ])
     auditor = AutoAuditor1C(df)
     auditor.run_audit()
@@ -1232,3 +1289,134 @@ def test_comment_join_multiple_subaccounts_with_pipe():
     assert "(на субсчете 51.01)" in comments
     assert "(на субсчете 51.02)" in comments
     assert " | " in comments
+
+
+# ---------------- 4.6 Одинаковые суммы на разных договорах (60/62) ----------------
+
+_CROSS_COLS = ["Период", "Счет", "Субконто", "Тип", "Организация", "Договор",
+               "НачалоДебет", "НачалоКредит", "ОборотДебет", "ОборотКредит",
+               "КонецДебет", "КонецКредит"]
+
+_CROSS_TITLE = "Контрагенты: одинаковые суммы по разным договорам (счета 60, 62)"
+
+
+def _cross_find(errors):
+    return [e for e in errors if _CROSS_TITLE in e["title"]]
+
+
+def test_cross_contract_offsets_equal_amounts_error():
+    """Дебет 20 000 по Дог1 равен кредиту 20 000 по Дог2 (один контрагент) → ошибка."""
+    df = pd.DataFrame([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", "-",
+         "Дог1", 0, 0, 0, 0, 20000, 0],
+        ["2026-02-28", "60.02", "ООО Ромашка", "AP", "-",
+         "Дог2", 0, 0, 0, 0, 0, 20000],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    cross = _cross_find(errors)
+    assert len(cross) == 1
+    data = cross[0]["data"]
+    assert len(data) == 2
+    assert set(data["Счет"]) == {"60"}                     # субсчета схлопнуты в родителя
+    assert set(data["Договор"]) == {"Дог1", "Дог2"}
+    assert set(data["Сумма"]) == {20000.0}                 # по строке на каждый договор
+    assert cross[0]["amount"] == pytest.approx(40000)
+
+
+def test_cross_contract_offsets_unequal_amounts_ok():
+    """Разные суммы на разных договорах — не ошибка (в т.ч. прежняя логика)."""
+    df = pd.DataFrame([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", "-",
+         "Дог1", 0, 0, 0, 0, 20065, 0],
+        ["2026-02-28", "60.02", "ООО Ромашка", "AP", "-",
+         "Дог2", 0, 0, 0, 0, 0, 22378],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    assert not _cross_find(errors)
+
+
+def test_cross_contract_offsets_same_contract_ignored():
+    """Одинаковые суммы на одном договоре — не ошибка этой проверки
+    (ею занимается «аванс и долг по разным счетам»)."""
+    df = pd.DataFrame([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", "-",
+         "Дог1", 0, 0, 0, 0, 20000, 0],
+        ["2026-02-28", "60.02", "ООО Ромашка", "AP", "-",
+         "Дог1", 0, 0, 0, 0, 0, 20000],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    assert not _cross_find(errors)
+
+
+def test_cross_contract_offsets_different_counterparties_no_match():
+    """Одинаковые суммы, но у РАЗНЫХ контрагентов — не ошибка."""
+    df = pd.DataFrame([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", "-",
+         "Дог1", 0, 0, 0, 0, 20000, 0],
+        ["2026-02-28", "60.02", "ООО Вектор", "AP", "-",
+         "Дог2", 0, 0, 0, 0, 0, 20000],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    assert not _cross_find(errors)
+
+
+def test_cross_contract_offsets_no_cross_60_62():
+    """Счета 60 и 62 проверяются раздельно — совпадение между ними не флаг."""
+    df = pd.DataFrame([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", "-",
+         "Дог1", 0, 0, 0, 0, 20000, 0],
+        ["2026-02-28", "62.02", "ООО Ромашка", "AP", "-",
+         "Дог2", 0, 0, 0, 0, 0, 20000],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    assert not _cross_find(errors)
+
+
+def test_cross_contract_offsets_missing_contract_skipped():
+    """Договор '-' (файловая загрузка) — разные договоры не определить, не флаг."""
+    df = pd.DataFrame([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", "-",
+         "-", 0, 0, 0, 0, 20000, 0],
+        ["2026-02-28", "60.02", "ООО Ромашка", "AP", "-",
+         "-", 0, 0, 0, 0, 0, 20000],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    assert not _cross_find(errors)
+
+
+def test_cross_contract_offsets_org_separation():
+    """Совпадение дебета и кредита у разных организаций — не ошибка."""
+    df = pd.DataFrame([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", "ООО А",
+         "Дог1", 0, 0, 0, 0, 20000, 0],
+        ["2026-02-28", "60.02", "ООО Ромашка", "AP", "ООО Б",
+         "Дог2", 0, 0, 0, 0, 0, 20000],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    assert not _cross_find(errors)
+
+
+def test_cross_contract_offsets_period_separation():
+    """Совпадение дебета в январе и кредита в феврале — не ошибка (разные периоды)."""
+    df = pd.DataFrame([
+        ["2026-01-31", "60.01", "ООО Ромашка", "AP", "-",
+         "Дог1", 0, 0, 0, 0, 20000, 0],
+        ["2026-02-28", "60.02", "ООО Ромашка", "AP", "-",
+         "Дог2", 0, 0, 0, 0, 0, 20000],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    assert not _cross_find(errors)
+
+
+def test_cross_contract_offsets_account_62():
+    """Та же логика работает и для счета 62."""
+    df = pd.DataFrame([
+        ["2026-02-28", "62.01", "ИП Смирнов", "AP", "-",
+         "Дог3", 0, 0, 0, 0, 50000, 0],
+        ["2026-02-28", "62.02", "ИП Смирнов", "AP", "-",
+         "Дог4", 0, 0, 0, 0, 0, 50000],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    cross = _cross_find(errors)
+    assert len(cross) == 1
+    assert set(cross[0]["data"]["Счет"]) == {"62"}
