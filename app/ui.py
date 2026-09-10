@@ -550,6 +550,11 @@ def _render_dashboard(history: list[dict]) -> None:
         "расхождение документов и остатков ОСВ.",
         blocks.get("settlements"),
     )
+    _render_dashboard_block(
+        "🔴 Блок 5. Расчетный счет (нет движений по 51)",
+        "Проверка 4.6 по ТЗ: отсутствие операций по расчетному счету за период.",
+        blocks.get("cash"),
+    )
 
     dups = _dashboard_duplicates_df(result)
     with st.expander("🔎 ML-дубли контрагентов (поиск дублей)"):
@@ -564,6 +569,12 @@ def _render_dashboard(history: list[dict]) -> None:
 
     st.markdown("---")
     st.subheader("📄 Детализация по счетам")
+    search_q = (st.text_input(
+        "🔎 Поиск по счету или контрагенту",
+        key="accounts_search",
+        placeholder="Например: 60, АО ЦВ ПРОТЕК",
+    ) or "").strip().lower()
+
     # Счета берутся из accounts_with_errors (разбивает составные ячейки «60.01,
     # 60.02»), а не из сырых значений колонки «Счет».
     accounts = (
@@ -574,6 +585,67 @@ def _render_dashboard(history: list[dict]) -> None:
     if not accounts:
         st.info("По этой базе нет строк нарушений по счетам.")
         return
+
+    # Детальное (развернутое) сальдо по каждому счёту — из остатков аудитора
+    detail_by_account: dict[str, pd.DataFrame] = {}
+    if auditor is not None and getattr(auditor, "balances", None) is not None:
+        bals = auditor.balances
+        for acc in accounts:
+            acc_bals = bals[
+                (bals["Счет"].astype(str) == acc)
+                | (bals["Счет"].astype(str).str.startswith(acc + "."))
+            ]
+            if acc_bals.empty:
+                continue
+            det = acc_bals.groupby(
+                ["Счет", "Организация", "Субконто", "Договор"],
+                as_index=False,
+            )[["КонецДебет", "КонецКредит"]].sum()
+            det = det[
+                (det["КонецДебет"].abs() > 1e-6)
+                | (det["КонецКредит"].abs() > 1e-6)
+            ]
+            detail_by_account[acc] = det
+
+    # Поиск по счету или контрагенту
+    if search_q:
+        if auditor is not None and getattr(auditor, "balances", None) is not None:
+            search_sources = auditor.balances[
+                auditor.balances["Счет"].astype(str).str.lower().str.contains(search_q)
+                | auditor.balances["Субконто"].astype(str).str.lower().str.contains(search_q)
+            ]
+        else:
+            col_mask = pd.Series(False, index=details.index)
+            if "Счет" in details.columns:
+                col_mask = col_mask | details["Счет"].astype(str).str.lower().str.contains(search_q)
+            if "Субконто" in details.columns:
+                col_mask = col_mask | details["Субконто"].astype(str).str.lower().str.contains(search_q)
+            search_sources = details[col_mask]
+        if not search_sources.empty:
+            show_cols = [
+                c for c in (
+                    "Период", "Счет", "Субконто", "Договор",
+                    "КонецДебет", "КонецКредит",
+                ) if c in search_sources.columns
+            ]
+            st.markdown(f"**Результаты поиска «{search_q}» (детальное сальдо):**")
+            st.dataframe(
+                search_sources[show_cols], width="stretch", hide_index=True
+            )
+
+        def _has_hit(acc: str) -> bool:
+            det = detail_by_account.get(acc)
+            if det is not None and not det.empty:
+                if det["Субконто"].astype(str).str.lower().str.contains(
+                    search_q, na=False
+                ).any():
+                    return True
+            return search_q in acc.lower()
+
+        accounts = [a for a in accounts if _has_hit(a)]
+        if not accounts:
+            st.info(f"По запросу «{search_q}» счетов/контрагентов не найдено.")
+            return
 
     idx: int = 0
     while idx < len(accounts):
@@ -589,8 +661,12 @@ def _render_dashboard(history: list[dict]) -> None:
             if auditor is not None
             else pd.DataFrame()
         )
+        det = detail_by_account.get(acc)
         with st.expander(f"📄 Счёт {acc} — нарушений: {len(acc_rows)}"):
             st.dataframe(acc_rows, width="stretch", hide_index=True)
+            if det is not None and not det.empty:
+                st.markdown(f"**Детальное (развернутое) сальдо по счёту {acc}:**")
+                st.dataframe(det, width="stretch", hide_index=True)
             if subconto:
                 st.markdown(f"**Субконто / контрагенты по счёту {acc}:**")
                 st.dataframe(

@@ -116,6 +116,18 @@ def test_master_row_empty_details():
     assert row["Развернутое сальдо, счет"] == "—"
     assert row["Не закрыт период, счет, период"] == "—"
     assert row["Не закрыты документами, счет"] == "—"
+    assert row["Нет движений 51, счет"] == "—"
+
+
+def test_master_row_zero_turnover_51():
+    r = result(rows=[
+        ["51", "Отсутствие движений по расчетному счету (счет 51)", "2026-02-28", "error", 0.0],
+    ])
+    row = build_master_row(r)
+    assert row["Нет движений 51, счет"] == "51"
+    # Не перетекает в другие колонки
+    assert row["Сальдо красным, счет"] == "—"
+    assert row["Не закрыты документами, счет"] == "—"
 
 
 def test_dashboard_df_columns_and_rows():
@@ -157,6 +169,7 @@ def test_block_dfs_splits_by_check_type():
         ["000", "Незакрытое сальдо на счете 000", "2026-01-31", "error", 5.0],
         ["60.01", "Контрагенты: расчеты не закрыты документами", "2026-01-31", "error", 6.0],
         ["62.01, 62.02", "Контрагенты: аванс и долг одновременно по разным счетам (ОСВ)", "", "warning", 7.0],
+        ["51", "Отсутствие движений по расчетному счету (счет 51)", "2026-02-28", "error", 0.0],
         ["60.01", "ML: возможные дубли контрагентов", "2026-01-31", "warning", 0.0],
     ])
     blocks = block_dfs(d)
@@ -166,28 +179,32 @@ def test_block_dfs_splits_by_check_type():
     assert set(accounts_list(blocks["unclosed"])) == {"000", "20", "90.01"}
     # Блок 4 собирает все проверки 4.5 (составные ячейки дробит мастер-таблица)
     assert set(accounts_list(blocks["settlements"])) == {"60.01", "62.01, 62.02"}
+    # Блок 5 — отсутствие движений по расчетному счету
+    assert set(accounts_list(blocks["cash"])) == {"51"}
 
     # ML-дубли в блоки не попадают
     all_block_rows = (
         len(blocks["red"]) + len(blocks["expanded"])
         + len(blocks["unclosed"]) + len(blocks["settlements"])
+        + len(blocks["cash"])
     )
-    assert all_block_rows == 7
+    assert all_block_rows == 8
     assert len(blocks["red"]["Счет"]) == 1
     assert len(blocks["expanded"]["Счет"]) == 1
     assert len(blocks["unclosed"]["Счет"]) == 3
     assert len(blocks["settlements"]["Счет"]) == 2
+    assert len(blocks["cash"]["Счет"]) == 1
 
 
 def test_block_dfs_empty_details():
     blocks = block_dfs(pd.DataFrame(columns=["Счет", "Проверка", "Период"]))
-    for block in ("red", "unclosed", "expanded", "settlements"):
+    for block in ("red", "unclosed", "expanded", "settlements", "cash"):
         assert blocks[block].empty
 
 
 def test_block_dfs_missing_column():
     blocks = block_dfs(pd.DataFrame({"a": [1]}))
-    for block in ("red", "unclosed", "expanded", "settlements"):
+    for block in ("red", "unclosed", "expanded", "settlements", "cash"):
         assert blocks[block].empty
 
 
