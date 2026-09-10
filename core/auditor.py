@@ -1500,6 +1500,17 @@ class AutoAuditor1C:
                 idx += 1
         return sorted(sub)
 
+    def get_raw_balances(self, account_code: str) -> pd.DataFrame:
+        """Возвращает строки сырой ОСВ для счета (включая все субсчета).
+
+        Пустой DataFrame, если балансы не загружены (архивные записи,
+        восстановленные из находок без остатков).
+        """
+        if getattr(self, "balances", None) is None or self.balances.empty:
+            return pd.DataFrame()
+        subaccounts = self.account_subaccounts(account_code)
+        return self.balances[self.balances["Счет"].isin(subaccounts)]
+
     def account_report_df(self, account_code: str) -> pd.DataFrame:
         details = self.details_df()
         if details.empty:

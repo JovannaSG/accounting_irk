@@ -1568,3 +1568,30 @@ def test_cross_contract_offsets_account_62():
     cross = _cross_find(errors)
     assert len(cross) == 1
     assert set(cross[0]["data"]["Счет"]) == {"62"}
+
+
+# ---------------- get_raw_balances ----------------
+def test_get_raw_balances_returns_parent_plus_subaccounts():
+    df = osv([
+        ["2026-01-31", "60.01", "АО ЦВ ПРОТЕК", "AP", 0, 0, 0, 0, 1553.91, 0],
+        ["2026-01-31", "60.02", "Без договора", "AP", 0, 0, 0, 0, 0, 326276.89],
+        ["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+
+    raw = auditor.get_raw_balances("60")
+    assert set(raw["Счет"].astype(str)) == {"60.01", "60.02"}
+    assert set(auditor.get_raw_balances("60.01")["Счет"].astype(str)) == {"60.01"}
+
+    # Посторонние счета не попадают
+    other = auditor.get_raw_balances("50")
+    assert set(other["Счет"].astype(str)) == {"50"}
+
+
+def test_get_raw_balances_empty_without_balances():
+    df = osv([["2026-01-31", "60.01", "АО ЦВ ПРОТЕК", "AP", 0, 0, 0, 0, 0, 100]])
+    auditor = AutoAuditor1C(df)
+    auditor.balances = None
+    raw = auditor.get_raw_balances("60")
+    assert isinstance(raw, pd.DataFrame)
+    assert raw.empty

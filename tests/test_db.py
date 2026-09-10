@@ -234,3 +234,134 @@ def test_migration_adds_user_column(tmp_db):
     assert len(history) == 1
     assert history[0]["audit_id"] == "old-001"
     assert "user" not in history[0]
+
+
+# ── 10. Удаление старых записей (delete_audit_logs_before) ──
+
+def _save_with_viewed_at(audit_id: str, viewed_at: str, **extra) -> None:
+    result = _sample_result(audit_id)
+    result["viewed_at"] = viewed_at
+    for key, value in extra.items():
+        result[key] = value
+    db_mod.save_audit_log(result)
+
+
+def test_delete_removes_old_keeps_new_inclusive(tmp_db):
+    _save_with_viewed_at("old-001", "01.08.2026 09:00")
+    _save_with_viewed_at("cutoff-001", "10.08.2026 12:00")
+    _save_with_viewed_at("new-001", "20.08.2026 12:00")
+
+    deleted = db_mod.delete_audit_logs_before(__import__("datetime").date(2026, 8, 10))
+
+    assert deleted == 2
+    remaining = [e["audit_id"] for e in db_mod.load_audit_history()]
+    assert remaining == ["new-001"]
+
+
+def test_delete_none_without_matching(tmp_db):
+    _save_with_viewed_at("new-001", "20.08.2026 12:00")
+    deleted = db_mod.delete_audit_logs_before(__import__("datetime").date(2026, 8, 10))
+    assert deleted == 0
+    assert len(db_mod.load_audit_history()) == 1
+
+
+def test_delete_iso_date_format(tmp_db):
+    _save_with_viewed_at("iso-001", "2026-08-01 12:00:00")
+    deleted = db_mod.delete_audit_logs_before(__import__("datetime").date(2026, 8, 10))
+    assert deleted == 1
+
+
+def test_delete_skips_malformed_viewed_at(tmp_db):
+    _save_with_viewed_at("bad-001", "не дата")
+    deleted = db_mod.delete_audit_logs_before(__import__("datetime").date(2026, 12, 31))
+    assert deleted == 0
+    assert len(db_mod.load_audit_history()) == 1
+
+
+def test_delete_accountant_scoped_to_own_bases(tmp_db):
+    base_a = {"source": {"source_type": "odata", "url": "https://a.example"}}
+    base_b = {"source": {"source_type": "odata", "url": "https://b.example"}}
+
+    _save_with_viewed_at("a-alice", "01.08.2026", user="alice", **base_a)
+    _save_with_viewed_at("a-bob", "02.08.2026", user="bob", **base_a)
+    _save_with_viewed_at("b-alice", "03.08.2026", user="alice", **base_b)
+    _save_with_viewed_at("loc-alice", "04.08.2026", user="alice")
+    _save_with_viewed_at("loc-bob", "05.08.2026", user="bob")
+
+    deleted = db_mod.delete_audit_logs_before(
+        __import__("datetime").date(2026, 12, 31),
+        user="alice",
+        allowed_urls=["https://a.example"],
+    )
+
+    remaining = [e["audit_id"] for e in db_mod.load_audit_history()]
+    # Зеркало load_audit_history: удалимы «доступные базы + свои записи».
+    # loc-bob (чужая локальная запись) остаётся; b-alice (своя запись по
+    # недоступной базе) удалима ровно потому, что видима бухгалтеру в истории.
+    assert deleted == 4
+    assert remaining == ["loc-bob"]
+    assert db_mod.load_audit_history(
+        user="alice", allowed_urls=["https://a.example"]
+    ) == []
+
+
+def test_delete_admin_without_allowed_deletes_all(tmp_db):
+    _save_with_viewed_at("one", "01.08.2026", user="alice")
+    _save_with_viewed_at("two", "02.08.2026", user="bob")
+    deleted = db_mod.delete_audit_logs_before(
+        __import__("datetime").date(2026, 12, 31),
+        user="admin",
+        allowed_urls=[],
+        is_admin=True,
+    )
+    assert deleted == 2
+    assert db_mod.load_audit_history() == []
+
+
+def test_delete_without_user_deletes_all(tmp_db):
+    _save_with_viewed_at("one", "01.08.2026", user="alice")
+    _save_with_viewed_at("two", "02.08.2026", user="bob")
+    deleted = db_mod.delete_audit_logs_before(__import__("datetime").date(2026, 12, 31))
+    assert deleted == 2
+    assert db_mod.load_audit_history() == []
+
+
+def test_accountant_without_bases_sees_and_deletes_only_own(tmp_db):
+    _save_with_viewed_at("own", "01.08.2026", user="alice")
+    _save_with_viewed_at("other", "02.08.2026", user="bob")
+
+    # Чтение: бухгалтер без назначенных баз видит только свою историю
+    seen = [e["audit_id"] for e in db_mod.load_audit_history(
+        user="alice", allowed_urls=[]
+    )]
+    assert seen == ["own"]
+
+    # Удаление: только свои записи, чужие не трогаются
+    deleted = db_mod.delete_audit_logs_before(
+        __import__("datetime").date(2026, 12, 31),
+        user="alice",
+        allowed_urls=[],
+    )
+    assert deleted == 1
+    remaining = [e["audit_id"] for e in db_mod.load_audit_history()]
+    assert remaining == ["other"]
+
+
+def test_admin_flag_does_not_treat_empty_allowed_as_no_bases(tmp_db):
+    # У админа allowed_urls пуст, но через is_admin он видит всех
+    _save_with_viewed_at("own", "01.08.2026", user="alice")
+    _save_with_viewed_at("other", "02.08.2026", user="bob")
+    seen = db_mod.load_audit_history(user="admin", allowed_urls=[], is_admin=True)
+    assert len(seen) == 2
+
+
+def test_indexes_created(tmp_db):
+    db_mod.init_db()
+    conn = sqlite3.connect(tmp_db)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_audits_%'"
+    )
+    idx = {r[0] for r in cursor.fetchall()}
+    conn.close()
+    assert {"idx_audits_user", "idx_audits_source_url", "idx_audits_viewed_at"} <= idx

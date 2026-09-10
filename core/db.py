@@ -90,6 +90,17 @@ def init_db():
         _seed_users_from_config(cursor)
         conn.commit()
 
+    # Индексы: скоуп по пользователю/базе и дата-удаления сканируют эти колонки
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audits_user ON audits(user)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audits_source_url ON audits(source_url)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audits_viewed_at ON audits(viewed_at)"
+    )
+
     conn.close()
 
 
@@ -466,16 +477,18 @@ def save_audit_log(result: dict) -> None:
 
 def load_audit_history(
     user: str | None = None,
-    allowed_urls: list | None = None
+    allowed_urls: list | None = None,
+    is_admin: bool = False,
 ) -> list[dict]:
     """
     Загружает историю с жестко заданным порядком колонок.
 
-    Если задан `user`:
-      - для роли admin (allowed_urls пуст) — возвращаются все записи;
-      - для accountant — возвращаются только записи его баз (по source_url из
-        allowed_urls) плюс его собственные локальные/файловые прогоны
-        (record user == login)
+    Видимость (дискриминатор — роль, а не пустота списка доступов):
+      - is_admin=True (или user не задан) — все записи;
+      - бухгалтер с allowed_urls — записи его баз (source_url из allowed_urls)
+        плюс его собственные локальные/файловые прогоны (user == login);
+      - бухгалтер без назначенных баз — ТОЛЬКО свои записи (user == login),
+        чужие записи и чужие базы недоступны.
     """
 
     init_db()
@@ -484,21 +497,21 @@ def load_audit_history(
 
     params: list = []
     where = ""
-    if user:
-        if allowed_urls:
-            allow_urls = [u.rstrip("/") for u in allowed_urls if u]
-            placeholders = ",".join("?" for _ in allow_urls)
-            # accountant: свои локальные (source_url пуст/локальный тип) ИЛИ
-            # записи по доступным базам (source_url в списке) ИЛИ
-            # записи, созданные самим пользователем вне баз
+    if not is_admin and user:
+        from core.auth import _normalize_url
+
+        allow_urls = [_normalize_url(u) for u in (allowed_urls or []) if u]
+        placeholders = ",".join("?" for _ in allow_urls)
+        if allow_urls:
+            # accountant: свои записи ИЛИ записи по доступным базам
             where = (
-                " WHERE (source_url IN ({ph})"
-                " OR user = ?)"
+                " WHERE (user = ? OR source_url IN ({ph}))"
             ).format(ph=placeholders)
-            params = list(allow_urls) + [user]
+            params = [user] + allow_urls
         else:
-            # admin (allowed_urls пуст) — видит всё.
-            where = ""
+            # бухгалтер без назначенных баз: только собственная история
+            where = " WHERE user = ?"
+            params = [user]
 
     # Явно указываем колонки, чтобы row[7] всегда был details_json
     # user, source_type, source_url — в конце,
@@ -565,3 +578,86 @@ def load_audit_history(
 
     conn.close()
     return history
+
+
+def delete_audit_logs_before(
+    cutoff_date: date,
+    user: str | None = None,
+    allowed_urls: list | None = None,
+    is_admin: bool = False,
+) -> int:
+    """
+    Удаляет записи аудита, созданные до указанной даты (включительно).
+
+    Ограничение по видимости — зеркалит `load_audit_history`
+    (дискриминатор — роль, а не пустота списка доступов):
+    - `is_admin=True` (или без `user`) — удаляются все записи;
+    - `user` + непустой `allowed_urls` (бухгалтер) — только записи его баз
+      (по `source_url` из allowed_urls) плюс его собственные записи;
+    - `user` + пустой `allowed_urls` (бухгалтер без назначенных баз) —
+      только собственные записи (`user == login`).
+    Записи с некорректным форматом `viewed_at` пропускаются (не удаляются).
+
+    Возвращает количество удалённых записей.
+    """
+
+    init_db()
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
+    try:
+        cursor = conn.cursor()
+
+        params: list = []
+        where = ""
+        if not is_admin and user:
+            from core.auth import _normalize_url
+
+            allow_urls = [_normalize_url(u) for u in (allowed_urls or []) if u]
+            placeholders = ",".join("?" for _ in allow_urls)
+            if allow_urls:
+                # accountant: свои записи ИЛИ записи по доступным базам
+                where = (
+                    " WHERE (user = ? OR source_url IN ({ph}))"
+                ).format(ph=placeholders)
+                params = [user] + allow_urls
+            else:
+                # бухгалтер без назначенных баз: удаляет только свою историю
+                where = " WHERE user = ?"
+                params = [user]
+
+        cursor.execute(
+            "SELECT audit_id, viewed_at FROM audits" + where,
+            params,
+        )
+        rows = cursor.fetchall()
+
+        def _parse_date(value: str) -> date | None:
+            for fmt in (
+                "%d.%m.%Y %H:%M",
+                "%d.%m.%Y",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d",
+            ):
+                try:
+                    return datetime.strptime(str(value).strip(), fmt).date()
+                except ValueError:
+                    continue
+            return None
+
+        ids_to_delete: list = []
+        for audit_id, viewed_at_str in rows:
+            parsed = _parse_date(viewed_at_str or "")
+            if parsed is not None and parsed <= cutoff_date:
+                ids_to_delete.append(audit_id)
+
+        if not ids_to_delete:
+            return 0
+
+        placeholders = ",".join("?" * len(ids_to_delete))
+        cursor.execute(
+            f"DELETE FROM audits WHERE audit_id IN ({placeholders})",
+            ids_to_delete,
+        )
+        conn.commit()
+        return len(ids_to_delete)
+    finally:
+        conn.close()

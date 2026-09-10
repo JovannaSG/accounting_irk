@@ -82,7 +82,9 @@ def test_history_filtered_by_allowed_urls():
     )
     assert sorted(e["audit_id"] for e in acc) == ["a1", "loc1"]
 
-    admin = db_mod.load_audit_history(user="admin", allowed_urls=[])
+    admin = db_mod.load_audit_history(
+        user="admin", allowed_urls=[], is_admin=True
+    )
     assert sorted(e["audit_id"] for e in admin) == ["a1", "b1", "loc1"]
 
     all_h = db_mod.load_audit_history()

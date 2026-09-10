@@ -26,7 +26,7 @@ from core.auditor import (
     normalize_documents,
 )
 from core import db
-from core.db import save_audit_log, load_audit_history
+from core.db import save_audit_log, load_audit_history, delete_audit_logs_before, rebuild_auditor
 from core.comparator import compare_audits
 from core.dashboard import accounts_list, block_dfs, build_dashboard_df
 from core.loaders import load_osv_file
@@ -44,9 +44,8 @@ def _attach_api_integrity(df: pd.DataFrame, info: dict, db_name: str) -> None:
     info["integrity"] = validate_osv_integrity(df, meta)
 
 
-# Значения по умолчанию для подключения к 1С:Фреш (публичная демо-база).
-# Переопределяются переменными окружения ONEC_URL / ONEC_USER / ONEC_PASS.
-DEFAULT_ONEC_URL = os.environ.get("ONEC_URL", "https://msk1.1cfresh.com/a/ea/3418453")
+# Пользователь 1С по умолчанию для подключения к 1С:Фреш.
+# Переопределяется переменной окружения ONEC_USER.
 DEFAULT_ONEC_USER = os.environ.get("ONEC_USER", "odata.user")
 
 st.set_page_config(page_title="ИИ-Аудитор 1С", layout="wide")
@@ -141,20 +140,19 @@ def _visible_databases(entries: list) -> list:
 
 def _current_user_history() -> list[dict]:
     """
-    История аудита с учётом прав пользователя:
-
-    - без логина / admin (allowed_urls пуст) — все записи;
-    - бухгалтер — только записи своих баз (по source_url) + свои локальные прогоны.
+    История аудита с учётом прав текущего пользователя
+    (дискриминатор — роль, а не пустота списка доступов):
+    - без логина (аутентификация выключена) — все записи;
+    - admin — все записи;
+    - бухгалтер — записи своих баз (по source_url) + свои записи;
+      без назначенных баз — только собственные записи.
     """
     user = st.session_state.get("user") or ""
     if not user:
-        return load_audit_history()
+        return load_audit_history(is_admin=True)
+    is_admin = st.session_state.get("user_role") == "admin"
     allowed = st.session_state.get("user_allowed_urls") or []
-    if not allowed:
-        # admin (или пользователь без назначенных баз в старой схеме) — видит всё,
-        # т.к. пустой список означает «все базы».
-        return load_audit_history(user=user, allowed_urls=[])
-    return load_audit_history(user=user, allowed_urls=allowed)
+    return load_audit_history(user=user, allowed_urls=allowed, is_admin=is_admin)
 
 
 # Аутентификация включается переменной окружения AUDIT_USERS или наличием
@@ -469,6 +467,36 @@ def _render_dashboard(history: list[dict]) -> None:
             i += 1
         st.rerun()
 
+    # --- Управление историей: безопасное удаление старых записей из БД ---
+    # Ограничено видимостью текущего пользователя (как load_audit_history):
+    # бухгалтер удаляет только свои локальные прогоны и записи своих баз.
+    with st.expander("🗑️ Управление историей (удаление из БД)", expanded=False):
+        d_col1, d_col2 = st.columns([3, 1])
+        del_date = d_col1.date_input(
+            "Удалить проверки, выполненные до этой даты (включительно):"
+        )
+        if d_col2.button(
+            "⚠️ Удалить безвозвратно",
+            type="primary",
+            use_container_width=True,
+        ):
+            del_user = st.session_state.get("user") or ""
+            del_is_admin = st.session_state.get("user_role") == "admin"
+            del_allowed = st.session_state.get("user_allowed_urls") or []
+            deleted_count = delete_audit_logs_before(
+                del_date,
+                user=del_user or None,
+                allowed_urls=del_allowed or None,
+                is_admin=del_is_admin,
+            )
+
+            # Перечитываем историю: дашборд строится из неё автоматически
+            st.session_state["audit_history"] = _current_user_history()
+            st.session_state.pop("dashboard_df", None)
+            st.session_state.pop("audit", None)
+            st.success(f"Удалено старых проверок: {deleted_count}")
+            st.rerun()
+
     st.caption(
         "Мастер-вид: кликните по строке базы, чтобы увидеть ошибки по счетам "
         "этой базы в панели ниже."
@@ -510,11 +538,15 @@ def _render_dashboard(history: list[dict]) -> None:
         st.info("Для выбранной базы нет детального результата аудита")
         return
 
-    auditor = result.get("auditor")
     details = result.get("details")
     if details is None or getattr(details, "empty", True):
         st.info("По этой базе нарушений не найдено.")
         return
+
+    # Живая сессия возвращает auditor с балансами; архивные записи восстанавливаем
+    # из находок (rebuild_auditor) — остатки тогда пустые, но аналитика по счетам
+    # и поиск по детализации продолжают работать.
+    auditor = result.get("auditor") or rebuild_auditor(result)
 
     st.markdown(f"### 🗄️ База: {selected_base}")
     m1, m2, m3, m4 = st.columns(4)
@@ -538,20 +570,28 @@ def _render_dashboard(history: list[dict]) -> None:
         "счёт 000; зависшее сальдо — опционально.",
         blocks.get("unclosed"),
     )
-    _render_dashboard_block(
-        "🟠 Блок 3. Развёрнутое сальдо",
-        "Проверка 4.2 по ТЗ: одновременно дебиторка и кредиторка по одной "
-        "аналитике/контрагенту.",
-        blocks.get("expanded"),
+    # Блок 3 = Развёрнутое сальдо + Расчёты с контрагентами (обе проверки —
+    # про детализацию взаиморасчётов). Дубли не снимаем: если контрагент попал
+    # в обе проверки — бухгалтеру нужно видеть обе строки.
+    frames_3_4 = []
+    if blocks.get("expanded") is not None and not blocks["expanded"].empty:
+        frames_3_4.append(blocks["expanded"])
+    if blocks.get("settlements") is not None and not blocks["settlements"].empty:
+        frames_3_4.append(blocks["settlements"])
+    merged_3_4 = (
+        pd.concat(frames_3_4, ignore_index=True)
+        if frames_3_4
+        else pd.DataFrame()
     )
     _render_dashboard_block(
-        "🟢 Блок 4. Расчеты с контрагентами",
-        "Проверки 4.5 по ТЗ: незакрытые расчеты, аванс и долг одновременно, "
-        "расхождение документов и остатков ОСВ.",
-        blocks.get("settlements"),
+        "🟠 Блок 3. Развёрнутое сальдо и расчёты с контрагентами",
+        "Проверки 4.2 и 4.5 по ТЗ: дебиторка и кредиторка по одной аналитике, "
+        "незакрытые расчёты, аванс и долг одновременно, расхождение "
+        "документов и остатков ОСВ.",
+        merged_3_4,
     )
     _render_dashboard_block(
-        "🔴 Блок 5. Расчетный счет (нет движений по 51)",
+        "🔵 Блок 4. Расчётный счёт (нет движений по 51)",
         "Проверка 4.6 по ТЗ: отсутствие операций по расчетному счету за период.",
         blocks.get("cash"),
     )
@@ -586,40 +626,57 @@ def _render_dashboard(history: list[dict]) -> None:
         st.info("По этой базе нет строк нарушений по счетам.")
         return
 
-    # Детальное (развернутое) сальдо по каждому счёту — из остатков аудитора
+    # Детальное (развернутое) сальдо по каждому счёту — из сырых остатков аудитора
     detail_by_account: dict[str, pd.DataFrame] = {}
-    if auditor is not None and getattr(auditor, "balances", None) is not None:
-        bals = auditor.balances
+    if auditor is not None and hasattr(auditor, "get_raw_balances"):
         for acc in accounts:
-            acc_bals = bals[
-                (bals["Счет"].astype(str) == acc)
-                | (bals["Счет"].astype(str).str.startswith(acc + "."))
-            ]
-            if acc_bals.empty:
+            acc_bals = auditor.get_raw_balances(acc)
+            if acc_bals is None or acc_bals.empty:
                 continue
-            det = acc_bals.groupby(
-                ["Счет", "Организация", "Субконто", "Договор"],
-                as_index=False,
-            )[["КонецДебет", "КонецКредит"]].sum()
+            gcols = [
+                c for c in ("Счет", "Организация", "Субконто", "Договор")
+                if c in acc_bals.columns
+            ]
+            det = acc_bals.groupby(gcols, as_index=False)[
+                ["КонецДебет", "КонецКредит"]
+            ].sum()
             det = det[
                 (det["КонецДебет"].abs() > 1e-6)
                 | (det["КонецКредит"].abs() > 1e-6)
             ]
             detail_by_account[acc] = det
 
-    # Поиск по счету или контрагенту
+    # Поиск по счету, контрагенту, договору или комментарию.
+    # В комментариях после схлопывания субсчета хранится «(на субсчете 60.01)»,
+    # поэтому поиск вида «60.01» находит родительский счет и в архивных записях.
     if search_q:
-        if auditor is not None and getattr(auditor, "balances", None) is not None:
+        if (
+            auditor is not None
+            and getattr(auditor, "balances", None) is not None
+            and not auditor.balances.empty
+        ):
+            has_raw_bals = True
+        else:
+            has_raw_bals = False
+
+        search_cols = [
+            c for c in ("Счет", "Субконто", "Комментарий", "Договор")
+            if c in details.columns
+        ]
+        col_mask = pd.Series(False, index=details.index)
+        if search_cols:
+            for col in search_cols:
+                col_mask = col_mask | details[col].astype(str).str.lower().str.contains(
+                    search_q, na=False
+                )
+        hit_accounts = set(details.loc[col_mask, "Счет"].dropna().astype(str))
+
+        if has_raw_bals:
             search_sources = auditor.balances[
                 auditor.balances["Счет"].astype(str).str.lower().str.contains(search_q)
                 | auditor.balances["Субконто"].astype(str).str.lower().str.contains(search_q)
             ]
         else:
-            col_mask = pd.Series(False, index=details.index)
-            if "Счет" in details.columns:
-                col_mask = col_mask | details["Счет"].astype(str).str.lower().str.contains(search_q)
-            if "Субконто" in details.columns:
-                col_mask = col_mask | details["Субконто"].astype(str).str.lower().str.contains(search_q)
             search_sources = details[col_mask]
         if not search_sources.empty:
             show_cols = [
@@ -634,13 +691,19 @@ def _render_dashboard(history: list[dict]) -> None:
             )
 
         def _has_hit(acc: str) -> bool:
+            if acc in hit_accounts or search_q in acc.lower():
+                return True
             det = detail_by_account.get(acc)
             if det is not None and not det.empty:
-                if det["Субконто"].astype(str).str.lower().str.contains(
-                    search_q, na=False
-                ).any():
-                    return True
-            return search_q in acc.lower()
+                for col in ("Счет", "Субконто", "Договор"):
+                    if (
+                        col in det.columns
+                        and det[col].astype(str).str.lower().str.contains(
+                            search_q, na=False
+                        ).any()
+                    ):
+                        return True
+            return False
 
         accounts = [a for a in accounts if _has_hit(a)]
         if not accounts:
@@ -730,10 +793,28 @@ if data_source.startswith("📁"):
 elif data_source.startswith("☁️"):
     # Источник 1С:Фреш всегда один аудит — режим нескольких файлов не применяется
     merge_mode = "Объединить в одну базу"
+
+    # Дефолтный URL зависит от роли: бухгалтеру не подсовываем чужую базу.
+    # - бухгалтер с одной назначенной базой — она и подставляется;
+    # - админ / без логина — env ONEC_URL, если задан;
+    # - иначе поле пустое (ввод вручную).
+    _user_role = st.session_state.get("user_role")
+    _allowed_urls = st.session_state.get("user_allowed_urls") or []
+    default_url = ""
+    if _user_role == "accountant" and len(_allowed_urls) == 1:
+        default_url = _allowed_urls[0]
+    elif _user_role in ("admin", None) and os.environ.get("ONEC_URL"):
+        default_url = os.environ["ONEC_URL"]
+
+    _url_placeholder = (
+        "Выберите назначенную базу..." if _user_role == "accountant"
+        else "https://msk1.1cfresh.com/a/ea/..."
+    )
     with st.sidebar.expander("🔑 Доступ к 1С:Фреш", expanded=True):
         api_url = st.text_input(
             "URL базы",
-            value=DEFAULT_ONEC_URL,
+            value=default_url,
+            placeholder=_url_placeholder,
             key="api_url",
         )
         api_user = st.text_input(
