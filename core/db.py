@@ -434,7 +434,7 @@ def save_audit_log(result: dict) -> None:
     )
 
     # Происхождение записи (для фильтрации доступа по базам):
-    # source_type: file | mock | odata | batch;
+    # source_type: file | odata | batch;
     # source_url — URL базы (для odata/batch)
     _source = result.get("source") or {}
     if not isinstance(_source, dict):

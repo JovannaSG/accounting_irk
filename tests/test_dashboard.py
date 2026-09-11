@@ -1,3 +1,5 @@
+import os
+
 import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -9,10 +11,18 @@ from core.dashboard import (
     build_dashboard_df,
     build_master_row,
     find_result,
+    split_base_number,
 )
 import core.db
 
 APP = "app/ui.py"
+
+
+def _sample_bytes(name: str) -> bytes:
+    """Читает файл из data/ для загрузки через file_uploader (AppTest)."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "data", name), "rb") as f:
+        return f.read()
 
 
 def details(rows):
@@ -160,6 +170,36 @@ def test_find_result():
     assert find_result(history, "Нет такой базы") is None
 
 
+def test_split_base_number():
+    assert split_base_number("12;ИП Иванов") == ("12", "ИП Иванов")
+    assert split_base_number(" 7 ; База   ") == ("7", "База")
+    assert split_base_number("База 1") == ("", "База 1")
+    assert split_base_number("A;База") == ("", "A;База")
+    assert split_base_number("") == ("", "")
+    assert split_base_number(None) == ("", "")
+
+
+def test_master_row_number_in_first_column():
+    r = result(db="12;ИП Иванов", accountant="Иванова И.И.", rows=[])
+    row = build_master_row(r)
+    assert row["Бухгалтер"] == "12"
+    assert row["База"] == "ИП Иванов"
+
+
+def test_master_row_numbered_base_with_period():
+    r = result(db="7;База Новая", accountant="Иванова И.И.", rows=[])
+    r["period"] = "2026-01"
+    row = build_master_row(r)
+    assert row["Бухгалтер"] == "7"
+    assert row["База"] == "База Новая (2026-01)"
+
+
+def test_find_result_matches_clean_name():
+    history = [result(db="База 1"), result(db="12;ИП Иванов")]
+    assert find_result(history, "ИП Иванов")["db_name"] == "12;ИП Иванов"
+    assert find_result(history, "12;ИП Иванов")["db_name"] == "12;ИП Иванов"
+
+
 def test_block_dfs_splits_by_check_type():
     d = details([
         ["51", "Красное сальдо: активный счет с кредитовым остатком", "2026-01-31", "error", 1.0],
@@ -225,7 +265,9 @@ def test_accounts_list_empty():
 def test_dashboard_renders_master_and_detail():
     at = AppTest.from_file(APP, default_timeout=30)
     at.run()
-    at.sidebar.button(key="btn_mock").click()
+    at.sidebar.file_uploader(key="osv").set_value(
+        ("sample_data.csv", _sample_bytes("sample_data.csv"), "text/csv")
+    )
     at.run()
     at.button(key="btn_audit").click()
     at.run()
@@ -237,7 +279,7 @@ def test_dashboard_renders_master_and_detail():
     master = dash_els[0].value
     assert list(master.columns) == DASHBOARD_COLUMNS
     assert len(master) == 1
-    assert master.iloc[0]["База"] == "Тестовая база"
+    assert master.iloc[0]["База"] == "sample_data.csv"
 
     headers = [h.value for h in at.header]
     assert any("Сводный дашборд" in h for h in headers)
@@ -255,7 +297,7 @@ def test_dashboard_renders_master_and_detail():
 
     expands = [e.label for e in at.expander]
     assert any("Счёт" in e for e in expands)
-    assert any("База: Тестовая база" in m for m in (m.value for m in at.markdown))
+    assert any("База: sample_data.csv" in m for m in (m.value for m in at.markdown))
 
 
 def test_dashboard_detail_blocks_dups_and_exports(tmp_path, monkeypatch):
@@ -266,7 +308,9 @@ def test_dashboard_detail_blocks_dups_and_exports(tmp_path, monkeypatch):
     # 2. Запускаем приложение
     at = AppTest.from_file(APP, default_timeout=30)
     at.run()
-    at.sidebar.button(key="btn_mock").click()
+    at.sidebar.file_uploader(key="osv").set_value(
+        ("sample_data.csv", _sample_bytes("sample_data.csv"), "text/csv")
+    )
     at.run()
     at.button(key="btn_audit").click()
     at.run()
@@ -282,7 +326,7 @@ def test_dashboard_detail_blocks_dups_and_exports(tmp_path, monkeypatch):
     # 4. Проверяем заголовок базы
     # Используем any() и in, чтобы тест не упал из-за лишних пробелов в Markdown
     markdowns = [m.value for m in at.markdown]
-    assert any("### 🗄️ База: Тестовая база" in m for m in markdowns)
+    assert any("### 🗄️ База: sample_data.csv" in m for m in markdowns)
 
     # 5. Кнопки выгрузки Excel/PDF (Правильное API AppTest)
     # AppTest позволяет искать элементы по key напрямую!

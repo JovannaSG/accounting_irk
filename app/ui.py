@@ -10,7 +10,6 @@ import pandas as pd
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
-_DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
 
 import streamlit as st
 
@@ -22,13 +21,17 @@ from core.auditor import (
     AUDIT_LOGIC_VERSION,
     AutoAuditor1C,
     DEFAULT_CLOSING_ACCOUNTS,
-    normalize_balances,
     normalize_documents,
 )
 from core import db
 from core.db import save_audit_log, load_audit_history, delete_audit_logs_before, rebuild_auditor
 from core.comparator import compare_audits
-from core.dashboard import accounts_list, block_dfs, build_dashboard_df
+from core.dashboard import (
+    accounts_list,
+    block_dfs,
+    build_dashboard_df,
+    split_base_number,
+)
 from core.loaders import load_osv_file
 from core.integrity import validate_osv_integrity
 
@@ -426,7 +429,12 @@ def find_result_safe(
     while i >= 0:
         res = history[i]
 
-        if res.get("db_name") == target_base:
+        # Имя базы может иметь вид «12;ИП Иванов» — в мастер-таблице номер
+        # уходит в первую колонку, а здесь сравниваем по чистому имени.
+        entry_base = str(res.get("db_name") or "")
+        _, clean_base = split_base_number(entry_base)
+
+        if entry_base == target_base or clean_base == target_base:
 
             if target_period is not None and target_period != "—":
                 res_period = str(res.get("period", ""))
@@ -753,7 +761,6 @@ data_source = st.sidebar.radio(
     ["📁 Файл (CSV/XLS/XLSX/HTML)", "☁️ 1С:Фреш (OData)", "📊 Аудит всех баз"],
     key="data_source",
 )
-use_mock = st.sidebar.button("Использовать тестовые данные", key="btn_mock")
 
 osv_files: list = []
 docs_file = None
@@ -868,7 +875,9 @@ elif data_source.startswith("📊"):
             with st.sidebar.expander("Список баз", expanded=False):
                 i = 0
                 while i < len(_batch_entries):
-                    st.write(f"{i + 1}. {_batch_entries[i].get('name', '?')}")
+                    entry_name = _batch_entries[i].get("name", "?")
+                    _, clean_name = split_base_number(entry_name)
+                    st.write(f"{i + 1}. {clean_name}")
                     i += 1
             if not _batch_entries:
                 st.sidebar.info(
@@ -1019,7 +1028,7 @@ if fetch_api:
             st.session_state["api_meta"]["integrity"] = fetched_info["integrity"]
         st.session_state["api_db_name"] = api_url.strip()
 
-        keys_to_del = ["osv", "docs", "audit", "mock_data"]
+        keys_to_del = ["osv", "docs", "audit"]
         i = 0
         while i < len(keys_to_del):
             st.session_state.pop(keys_to_del[i], None)
@@ -1122,33 +1131,7 @@ if fetch_batch and _batch_entries:
         st.success(f"Загружено датасетов: {len(batch_loaded)} (из {total} баз)")
 
 try:
-    if use_mock:
-        st.session_state["mock_data"] = {
-            "balances": normalize_balances(pd.read_csv(
-                os.path.join(_DATA_DIR, "sample_data.csv"), dtype=str
-            )),
-            "documents": normalize_documents(pd.read_csv(
-                os.path.join(_DATA_DIR, "sample_documents.csv"), dtype=str
-            )),
-        }
-        keys_to_del = ["osv", "docs", "api_balances"]
-        i = 0
-        while i < len(keys_to_del):
-            if keys_to_del[i] in st.session_state:
-                del st.session_state[keys_to_del[i]]
-            i += 1
-
-        balances = st.session_state["mock_data"]["balances"]
-        documents = st.session_state["mock_data"]["documents"]
-        datasets_to_process.append(
-            {
-                "name": "Тестовая база",
-                "df": balances,
-                "info": {}
-            }
-        )
-
-    elif data_source.startswith("☁️") and "api_balances" in st.session_state:
+    if data_source.startswith("☁️") and "api_balances" in st.session_state:
         balances = st.session_state["api_balances"]
         documents = None
         source_info = st.session_state.get("api_meta", {})
@@ -1225,18 +1208,6 @@ try:
         if docs_file is not None:
             documents = normalize_documents(pd.read_csv(docs_file, dtype=str))
 
-    elif "mock_data" in st.session_state:
-        balances = st.session_state["mock_data"]["balances"]
-        documents = st.session_state["mock_data"]["documents"]
-        if not datasets_to_process:
-            datasets_to_process.append(
-                {
-                    "name": "Тестовая база",
-                    "df": balances,
-                    "info": {}
-                }
-            )
-
 except (ValueError, OSError) as exc:
     st.sidebar.error(str(exc))
     st.stop()
@@ -1247,7 +1218,7 @@ if not datasets_to_process:
     elif data_source.startswith("📊"):
         st.info("👈 Нажмите «📡 Загрузить все базы» в панели слева.")
     else:
-        st.info("👈 Загрузите файл(ы) ОСВ (CSV/XLS/XLSX/HTML) или нажмите «Использовать тестовые данные» в панели слева.")
+        st.info("👈 Загрузите файл(ы) ОСВ (CSV/XLS/XLSX/HTML) или подключитесь к 1С:Фреш в панели слева.")
     st.stop()
 
 # Предупреждения о целостности данных: только advisory, аудит не блокируют.

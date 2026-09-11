@@ -8,6 +8,25 @@ from streamlit.testing.v1 import AppTest
 APP = "app/ui.py"
 
 
+def _sample_bytes(name: str) -> bytes:
+    """Читает файл из data/ для загрузки через file_uploader (AppTest)."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "data", name), "rb") as f:
+        return f.read()
+
+
+def _upload_osv(at, name="sample_data.csv"):
+    at.sidebar.file_uploader(key="osv").set_value(
+        (name, _sample_bytes(name), "text/csv")
+    )
+
+
+def _upload_docs(at, name="sample_documents.csv"):
+    at.sidebar.file_uploader(key="docs").set_value(
+        (name, _sample_bytes(name), "text/csv")
+    )
+
+
 @pytest.fixture(autouse=True)
 def _mock_subconto_1c(monkeypatch):
     """Для 1С-источника подменяем OData-запросы (локального аудита это не касается).
@@ -37,30 +56,30 @@ def _mock_subconto_1c(monkeypatch):
     yield
 
 
-def test_mock_audit_works():
+def test_file_audit_works():
     at = AppTest.from_file(APP, default_timeout=30)
     at.run()
     assert not at.exception
 
-    at.sidebar.button(key="btn_mock").click()
+    _upload_osv(at)
     at.run()
     assert not at.exception
-    assert "mock_data" in at.session_state
 
     at.button(key="btn_audit").click()
     at.run()
     assert not at.exception
     assert "audit" in at.session_state
     audit = at.session_state["audit"]
-    assert audit["db_name"] == "Тестовая база"
+    assert audit["db_name"] == "sample_data.csv"
     assert audit["status"] in ("ok", "warning", "error")
     assert audit["status_label"]
 
 
-def test_mock_audit_results_rendered():
+def test_file_audit_results_rendered():
     at = AppTest.from_file(APP, default_timeout=30)
     at.run()
-    at.sidebar.button(key="btn_mock").click()
+    _upload_osv(at)
+    _upload_docs(at)
     at.run()
     at.button(key="btn_audit").click()
     at.run()
@@ -74,10 +93,10 @@ def test_mock_audit_results_rendered():
     assert any("Сводный дашборд" in h for h in headers)
 
 
-def test_drill_down_after_mock_audit():
+def test_drill_down_after_file_audit():
     at = AppTest.from_file(APP, default_timeout=30)
     at.run()
-    at.sidebar.button(key="btn_mock").click()
+    _upload_osv(at)
     at.run()
     at.button(key="btn_audit").click()
     at.run()
@@ -155,7 +174,7 @@ def test_api_source_error_is_shown(monkeypatch):
 def test_account_report_detail_rendered():
     at = AppTest.from_file(APP, default_timeout=30)
     at.run()
-    at.sidebar.button(key="btn_mock").click()
+    _upload_osv(at)
     at.run()
     at.button(key="btn_audit").click()
     at.run()
@@ -181,7 +200,7 @@ def test_no_data_message_when_source_empty():
     assert not at.exception
 
     info_texts = [i.value for i in at.info]
-    assert any("тестовые данные" in t.lower() for t in info_texts)
+    assert any("загрузите файл(ы) осв" in t.lower() for t in info_texts)
     assert "audit" not in at.session_state
 
 
@@ -222,7 +241,7 @@ def test_login_gate_passes_then_audits_with_user(monkeypatch):
     assert not at.exception
     assert at.session_state["user"] == "Tester"
 
-    at.sidebar.button(key="btn_mock").click()
+    _upload_osv(at)
     at.run()
     at.button(key="btn_audit").click()
     at.run()

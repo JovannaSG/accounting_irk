@@ -149,6 +149,24 @@ def _collect_accounts(details: pd.DataFrame) -> dict[str, list[str]]:
     return result
 
 
+def split_base_number(db_name) -> tuple[str, str]:
+    """
+    Разделяет имя базы вида «12;ИП Иванов» на номер и собственно имя.
+
+    Возвращает (номер, имя). Если перед первой «;» нет целого числа —
+    ("", исходное имя без изменений). Имена без «;» (файлы, одиночный 1С)
+    не затрагиваются.
+    """
+
+    s = str(db_name or "").strip()
+    if ";" in s:
+        head, _, tail = s.partition(";")
+        head = head.strip()
+        if head.isdigit():
+            return head, tail.strip()
+    return "", s
+
+
 def build_master_row(result: dict) -> dict:
     """
     Сводная строка одной базы для мастер-таблицы дашборда.
@@ -159,9 +177,13 @@ def build_master_row(result: dict) -> dict:
     if details is not None and not getattr(details, "empty", True):
         collected = _collect_accounts(details)
 
+    # Имя базы может иметь вид «12;ИП Иванов»: номер уходит в первую колонку
+    # («Бухгалтер»), имя — в колонку «База». Без номера — как раньше.
+    db_num, clean_name = split_base_number(result.get("db_name"))
+
     row: dict[str, str] = {
-        "Бухгалтер": str(result.get("accountant") or "") or _DASH,
-        "База": str(result.get("db_name") or "") or _DASH,
+        "Бухгалтер": db_num or (str(result.get("accountant") or "") or _DASH),
+        "База": str(clean_name or "") or _DASH,
         "Дата просмотра": str(result.get("viewed_at") or "") or _DASH,
     }
 
@@ -205,10 +227,15 @@ def find_result(history: list[dict], db_name: str) -> dict | None:
     while idx < len(history):
         entry = history[idx]
         base = str(entry.get("db_name") or "")
+        _, clean = split_base_number(base)
         period = str(entry.get("period") or "").strip()
-        candidates = {base}
+        candidates = {base, clean}
+        if clean and clean != base:
+            candidates.add(clean)
         if period:
             candidates.add(f"{base} ({period})")
+            if clean and clean != base:
+                candidates.add(f"{clean} ({period})")
         if db_name in candidates:
             return entry
         idx += 1
