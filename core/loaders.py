@@ -289,6 +289,23 @@ def _looks_like_account(v) -> bool:
     return bool(v) and bool(ACCOUNT_CODE_RE.match(v))
 
 
+def _number_start_column(rows: list, start: int) -> int:
+    """Определяет колонку, с которой начинаются числовые показатели в ОСВ.
+
+    Стандартная ведомость печатает кроме «Счет/Субконто» ещё колонку
+    «Наименование счета» — тогда числа начинаются со 2-й колонки. Сокращённый
+    отчёт по отдельному счёту колонку наименования не выводит, и числа идут
+    сразу с 1-й колонки. Ищем первый заголовок «Дебет»/«Кредит» в служебных
+    строках: 2 для ведомостей с наименованием, иначе 1.
+    """
+    for row in rows[:start + 1]:
+        for ci in (1, 2):
+            head = _cell(row, ci)
+            if head in ("Дебет", "Кредит"):
+                return ci
+    return 2
+
+
 def _has_indicator_column(rows: list, start: int) -> bool:
     """
     Определяет, выведена ли ОСВ с колонкой «Показатели» (БУ/НУ/БУ-НУ).
@@ -339,7 +356,13 @@ def extract_osv(
         raise ValueError("Не удалось найти строки счетов в таблице ОСВ")
 
     indicator_mode = _has_indicator_column(rows, start)
-    num_range = range(3, 9) if indicator_mode else range(2, 8)
+    if indicator_mode:
+        # Колонка «Показатели» (БУ/НУ/БУ-НУ) — данные начинаются с 3-й колонки.
+        num_range = range(3, 9)
+    else:
+        # Количество колонок до чисел зависит от наличия «Наименования счета».
+        num_start = _number_start_column(rows, start)
+        num_range = range(num_start, num_start + 6)
 
     recs: list = []
     current_code = None

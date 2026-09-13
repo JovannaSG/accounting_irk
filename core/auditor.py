@@ -87,11 +87,13 @@ RECOMMENDATIONS: dict[str, str] = {
     "Контрагенты: развернутое сальдо на счетах расчетов (без реестра документов)": "По контрагенту есть дебетовый и кредитовый остаток.",
     "Контрагенты: расчеты не закрыты документами": "По контрагенту остались незакрытые расчеты: непогашенный долг или переплата.",
     "Контрагенты: расхождение документов и остатков ОСВ": "Сумма документов не сходится с остатком ОСВ.",
+    "Контрагенты: одинаковые суммы по разным договорам (счета 60, 62)": "Дебет и кредит равны, но привязаны к разным договорам. Проведите зачет аванса или корректировку задолженности.",
     "ML: нетипичная сумма операции": "Сумма операции сильно отклоняется от обычных сумм по контрагенту.",
     "ML: резкий скачок оборотов между периодами": "Обороты по счету резко изменились.",
     "ML: возможные дубли контрагентов": "Обнаружены похожие названия контрагентов. Рекомендуется объединить дубли.",
     "NLP: подозрительные назначения платежей (115-ФЗ)": "Назначение платежа содержит формулировки с повышенным риском.",
     "Контроль групп счетов: незакрытые остатки": "Группа счетов не закрыта на конец периода.",
+    "Отсутствие движений по расчетному счету (счет 51)": "Проверьте, загружена ли банковская выписка. Отсутствие операций по расчетному счету за период нетипично.",
 }
 
 GROUP_PRESETS: dict[str, list[str]] = {
@@ -140,6 +142,10 @@ SECTION_SPECS: list[tuple[str, tuple[str, ...]]] = [
         "Контрагенты: развернутое сальдо на счетах расчетов (без реестра документов)",
         "Контрагенты: расчеты не закрыты документами",
         "Контрагенты: расхождение документов и остатков ОСВ",
+        "Контрагенты: одинаковые суммы по разным договорам (счета 60, 62)",
+    )),
+    ("Расчетный счет (счет 51)", (
+        "Отсутствие движений по расчетному счету (счет 51)",
     )),
     ("ML: нетипичные суммы операций", ("ML: нетипичная сумма операции",)),
     ("ML: скачки оборотов между периодами", ("ML: резкий скачок оборотов между периодами",)),
@@ -204,6 +210,8 @@ _SHORT_PDF_LABELS: dict[str, str] = {
     "Контрагенты: развернутое сальдо на счетах расчетов (без реестра документов)": "Аванс и долг (без реестра)",
     "Контрагенты: расчеты не закрыты документами": "Расчеты не закрыты",
     "Контрагенты: расхождение документов и остатков ОСВ": "Расхождение с ОСВ",
+    "Контрагенты: одинаковые суммы по разным договорам (счета 60, 62)": "Одинаковые суммы по договорам",
+    "Отсутствие движений по расчетному счету (счет 51)": "Нет движений (51)",
 }
 
 
@@ -263,6 +271,46 @@ def _rename_by_aliases(df: pd.DataFrame, aliases: dict) -> pd.DataFrame:
     return df.rename(columns=rename)
 
 
+FOLD_SETTLEMENT_GROUPS: tuple[str, ...] = ("60", "62")
+
+
+def _fold_settlement_balances(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Разворачивает сальдо расчетов (60, 62) в классическое «развернутое сальдо»:
+    отрицательное значение в одной колонке остатка переносится положительным
+    в противоположную колонку того же остатка. 1C отдает свернутые остатки по
+    аналитике со знаком минус (например, КонецДебет = -20104.61), что не является
+    ошибкой учёта. Инвариант «Дебет − Кредит» по каждой строке сохраняется,
+    обороты не затрагиваются.
+    """
+
+    mask = df["Счет"].map(account_group).isin(FOLD_SETTLEMENT_GROUPS)
+    if not mask.any():
+        return df
+
+    settle_balance_cols = [
+        c for c in ("КонецДебет", "КонецКредит", "НачалоДебет", "НачалоКредит")
+        if c in df.columns
+    ]
+    df = df.copy()
+    for col in settle_balance_cols:
+        df[col] = df[col].astype("float64")
+
+    for debit_col, credit_col in (
+        ("КонецДебет", "КонецКредит"),
+        ("НачалоДебет", "НачалоКредит"),
+    ):
+        if debit_col not in df.columns or credit_col not in df.columns:
+            continue
+        neg_debit = mask & (df[debit_col] < -EPS)
+        df.loc[neg_debit, credit_col] += -df.loc[neg_debit, debit_col]
+        df.loc[neg_debit, debit_col] = 0.0
+        neg_credit = mask & (df[credit_col] < -EPS)
+        df.loc[neg_credit, debit_col] += -df.loc[neg_credit, credit_col]
+        df.loc[neg_credit, credit_col] = 0.0
+    return df
+
+
 def normalize_balances(df: pd.DataFrame) -> pd.DataFrame:
     df = _rename_by_aliases(df, COLUMN_ALIASES).copy()
 
@@ -308,6 +356,8 @@ def normalize_balances(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = coerced.fillna(0.0)
         else:
             df[col] = 0.0
+
+    df = _fold_settlement_balances(df)
 
     if df.empty:
         raise ValueError("Файл ОСВ пуст")
@@ -440,6 +490,7 @@ class AutoAuditor1C:
         balance_checks: set = {
             "Красное сальдо: активный счет с кредитовым остатком",
             "Красное сальдо: пассивный счет с дебетовым остатком",
+            "Красное сальдо: субконто активно-пассивного счета противоположно итогу",
             "Развернутое сальдо по аналитике",
             "Незакрытое сальдо на конец месяца (закрываемые счета)",
             "Зависшее сальдо (не меняется между периодами)",
@@ -449,6 +500,8 @@ class AutoAuditor1C:
             "Контрагенты: развернутое сальдо на счетах расчетов (без реестра документов)",
             "Контрагенты: расчеты не закрыты документами",
             "Контрагенты: расхождение документов и остатков ОСВ",
+            "Контрагенты: одинаковые суммы по разным договорам (счета 60, 62)",
+            "Отсутствие движений по расчетному счету (счет 51)",
         }
 
         if title in balance_checks:
@@ -583,38 +636,73 @@ class AutoAuditor1C:
 
         net = b["КонецДебет"] - b["КонецКредит"]
 
-        # Активные счета с кредитовым сальдо
+        # 1. Активные счета с кредитовым сальдо ИЛИ любыми явными минусами
+        mask_active = (b["Тип"] == "A") & (
+            (net < -EPS) | (b["КонецДебет"] < -EPS) | (b["КонецКредит"] < -EPS)
+        )
         active = self._annotate_since(
-            b, (b["Тип"] == "A") & (net < -EPS),
+            b, mask_active,
             "Активный счет имеет кредитовое (отрицательное) сальдо",
             "отрицательное сальдо с"
         )
         if not active.empty:
-            self._add(
-                "error",
-                "Красное сальдо: активный счет с кредитовым остатком",
-                active
-            )
+            self._add("error", "Красное сальдо: активный счет с кредитовым остатком", active)
 
-        # Пассивные счета с дебетовым сальдо
+        # 2. Пассивные счета с дебетовым сальдо ИЛИ любыми явными минусами
+        mask_passive = (b["Тип"] == "P") & (
+            (net > EPS) | (b["КонецДебет"] < -EPS) | (b["КонецКредит"] < -EPS)
+        )
         passive = self._annotate_since(
-            b, (b["Тип"] == "P") & (net > EPS),
+            b, mask_passive,
             "Пассивный счет имеет дебетовое (отрицательное) сальдо",
             "отрицательное сальдо с"
         )
         if not passive.empty:
-            self._add(
-                "error",
-                "Красное сальдо: пассивный счет с дебетовым остатком",
-                passive
+            self._add("error", "Красное сальдо: пассивный счет с дебетовым остатком", passive)
+
+        # 3. Активно-пассивные счета (АП): флагаем только реальные минусы
+        # в колонках ОСВ (КонецДебет < 0 или КонецКредит < 0). Положительные
+        # остатки, висящие на стороне, противоположной итогу счета, — это
+        # обычное развернутое сальдо, а не красное, поэтому не флагаются.
+        ap = b[b["Тип"] == "AP"].copy()
+        if not ap.empty:
+            mask_ap_negative = (ap["КонецДебет"] < -EPS) | (ap["КонецКредит"] < -EPS)
+            ap_negative = self._annotate_since(
+                ap, mask_ap_negative,
+                "Активно-пассивный счет имеет явный отрицательный остаток (минус в ОСВ)",
+                "минус с"
             )
+            if not ap_negative.empty:
+                self._add(
+                    "error",
+                    "Красное сальдо: субконто активно-пассивного счета противоположно итогу",
+                    ap_negative
+                )
 
     def check_expanded_balance(self) -> None:
         b = self.balances
-        both = b[
-            (b["Субконто"] != "-")
-            & (b["КонецДебет"] > 0)
-            & (b["КонецКредит"] > 0)
+        # Развернутое сальдо: у одной аналитики (контрагента) по субсчету
+        # одновременно дебетовые и кредитовые остатки (по разным договорам).
+        # После свертки 1C отдельные строки односторонние, поэтому ищем группы
+        # (Счет, Организация, Субконто), где есть и дебетовая, и кредитовая строка.
+        analytical = b[b["Субконто"] != "-"]
+        if analytical.empty:
+            return
+
+        positive_debit = analytical.groupby(
+            ["Счет", "Организация", "Субконто"]
+        )["КонецДебет"].apply(lambda s: (s > EPS).any())
+        positive_credit = analytical.groupby(
+            ["Счет", "Организация", "Субконто"]
+        )["КонецКредит"].apply(lambda s: (s > EPS).any())
+        flags = positive_debit & positive_credit
+        if not flags.any():
+            return
+
+        both = analytical[
+            analytical.set_index(["Счет", "Организация", "Субконто"]).index.isin(
+                flags[flags].index
+            )
         ].copy()
         both["Комментарий"] = "По контрагенту/аналитике одновременно \
             дебетовое и кредитовое сальдо"
@@ -810,6 +898,120 @@ class AutoAuditor1C:
         ].copy()
         acc["Комментарий"] = "Незакрытый остаток на служебном счете 000"
         self._add("error", "Незакрытое сальдо на счете 000", acc)
+
+    def check_zero_turnover_51(self) -> None:
+        """Проверка: отсутствие оборотов по расчетному счету (51 счет).
+
+        Движение оценивается по колонкам «Обороты за период» (ОборотДебет /
+        ОборотКредит) за ВЕСЬ выбранный период: обороты по строкам счета 51
+        суммируются по всем периодам (аналог итоговой строки ОСВ на последнюю
+        дату периода). Ошибка возникает только когда пусто одновременно и по
+        дебету, и по кредиту.
+        """
+        df = self.balances
+        if df.empty:
+            return
+
+        # Отбираем только 51 счет (включая возможные субсчета, если они есть)
+        df_51 = df[df["Счет"].astype(str).str.startswith("51")].copy()
+        if df_51.empty:
+            return
+
+        for col in ("ОборотДебет", "ОборотКредит"):
+            if col not in df_51.columns:
+                df_51[col] = 0.0
+            else:
+                df_51[col] = pd.to_numeric(df_51[col], errors="coerce").fillna(0.0)
+
+        # Группируем по аналитике счета (полный период целиком)
+        group_cols = [
+            c for c in ("Организация", "Счет", "Субконто")
+            if c in df_51.columns
+        ]
+        if "Период" in df_51.columns:
+            df_51["_pkey"] = period_sort_series(df_51["Период"])
+            df_51 = df_51.sort_values("_pkey", kind="stable", na_position="last")
+            df_51 = df_51.drop(columns="_pkey")
+
+        # Обороты за период = сумма строк по всем периодам (итог на последнюю дату)
+        turnover_total = df_51.groupby(group_cols, dropna=False)[
+            ["ОборотДебет", "ОборотКредит"]
+        ].sum()
+
+        # Эталонная строка находки — строка за последнюю дату периода
+        last_rows = df_51.drop_duplicates(subset=group_cols, keep="last")
+        last_rows = last_rows.set_index(group_cols)
+        last_rows["ОборотДебет"] = turnover_total["ОборотДебет"]
+        last_rows["ОборотКредит"] = turnover_total["ОборотКредит"]
+
+        # Пусто и по дебету, и по кредиту за весь период — движения нет
+        mask_zero = (
+            (last_rows["ОборотДебет"].abs() < EPS)
+            & (last_rows["ОборотКредит"].abs() < EPS)
+        )
+        zero_rows = last_rows[mask_zero].reset_index()
+
+        if not zero_rows.empty:
+            zero_rows["Комментарий"] = "За период нет движений по расчетному счету"
+            self._add(
+                "error",
+                "Отсутствие движений по расчетному счету (счет 51)",
+                zero_rows
+            )
+
+    def check_cross_contract_offsets(self) -> None:
+        """Проверка: одинаковые дебетовые и кредитовые суммы на разных договорах
+        (счета 60 и 62). Если по одному контрагенту на одном договоре сумма по дебету,
+        а на другом — та же сумма по кредиту, расчеты «висят» на разных договорах."""
+        if (
+            self.balances.empty
+            or "Субконто" not in self.balances.columns
+            or "Договор" not in self.balances.columns
+        ):
+            return
+
+        df60 = self.balances[
+            self.balances["Счет"].astype(str).str.startswith(("60", "62"))
+        ].copy()
+        if df60.empty:
+            return
+
+        # Сворачиваем субсчета в родительские (60.01 и 60.02 проверяем вместе)
+        df60["Счет_группа"] = df60["Счет"].map(account_group)
+
+        grouped = df60.groupby(["Период", "Организация", "Счет_группа", "Субконто"])
+
+        flag: list[int] = []
+        for _, group_rows in grouped:
+            if len(group_rows) < 2 or str(group_rows["Субконто"].iloc[0]).strip() in ("-", ""):
+                continue
+
+            debits = group_rows[group_rows["КонецДебет"] > EPS]
+            credits = group_rows[group_rows["КонецКредит"] > EPS]
+
+            for d_idx, d_row in debits.iterrows():
+                d_val = float(d_row["КонецДебет"])
+                matching = credits[(credits["КонецКредит"] - d_val).abs() < EPS]
+                for c_idx, c_row in matching.iterrows():
+                    # Ошибка — только если суммы разнесены на РАЗНЫЕ договоры
+                    if str(d_row["Договор"]).strip() != str(c_row["Договор"]).strip():
+                        flag.extend([d_idx, c_idx])
+                        break
+
+        if not flag:
+            return
+
+        err_df = self.balances.loc[sorted(set(flag))].copy()
+        err_df["Сумма"] = err_df["КонецДебет"] + err_df["КонецКредит"]
+        err_df["Комментарий"] = (
+            "Дебет и кредит совпадают, но разнесены на разные договоры — "
+            "проверьте зачет аванса/корректировку задолженности"
+        )
+        self._add(
+            "error",
+            "Контрагенты: одинаковые суммы по разным договорам (счета 60, 62)",
+            err_df
+        )
 
     def _osv_settlement_balance(self) -> pd.Series:
         b = self.balances
@@ -1086,6 +1288,12 @@ class AutoAuditor1C:
             self.check_account_000()
         if self._check_enabled("settlements"):
             self.check_unclosed_settlements()
+
+        # --- НОВЫЕ ПРОВЕРКИ ---
+        self.check_zero_turnover_51()
+        self.check_cross_contract_offsets()
+        # -----------------------
+
         self.run_ml_checks()
         if self.nlp_enabled:
             self.check_payment_purpose_risks()
@@ -1291,6 +1499,17 @@ class AutoAuditor1C:
                     sub.add(item)
                 idx += 1
         return sorted(sub)
+
+    def get_raw_balances(self, account_code: str) -> pd.DataFrame:
+        """Возвращает строки сырой ОСВ для счета (включая все субсчета).
+
+        Пустой DataFrame, если балансы не загружены (архивные записи,
+        восстановленные из находок без остатков).
+        """
+        if getattr(self, "balances", None) is None or self.balances.empty:
+            return pd.DataFrame()
+        subaccounts = self.account_subaccounts(account_code)
+        return self.balances[self.balances["Счет"].isin(subaccounts)]
 
     def account_report_df(self, account_code: str) -> pd.DataFrame:
         details = self.details_df()

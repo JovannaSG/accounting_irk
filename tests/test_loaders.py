@@ -248,6 +248,45 @@ def test_unknown_account_type_by_heuristic():
     assert df.iloc[0]["Тип"] == "A"  # только дебетовый остаток -> активный
 
 
+def test_number_start_column_detects_no_name_column():
+    # Отчёт по отдельному счёту (без колонки «Наименование счета»): числа
+    # начинаются сразу с 1-й колонки после «Счет/Субконто». Отсчёт по отсутствию
+    # имени не должен сдвигать числа и обнулять красное сальдо.
+    grid = pd.DataFrame([
+        ["Оборотно-сальдовая ведомость по счету 19", None, None, None, None, None, None],
+        ["Счет", "СНД", "СНК", "ОД", "ОК", "СКД", "СКК"],
+        ["Контрагенты", "Дебет", "Кредит", "Дебет", "Кредит", "Дебет", "Кредит"],
+        ["19.03", "272,321.25", None, "175,636.36", None, "-481,40", None],
+    ])
+    df, _ = extract_osv(grid)
+    row = df[df["Счет"] == "19.03"].iloc[0]
+    assert row["КонецДебет"] == pytest.approx(-481.40)  # красное сальдо сохранено
+    assert row["КонецКредит"] == pytest.approx(0.0)
+    assert row["НачалоДебет"] == pytest.approx(272321.25)
+
+
+def test_load_no_name_column_real_report_keeps_red_balance():
+    # Реальный отчёт «Оборотно-сальдовая ведомость по счету 19» без наименования —
+    # красные (отрицательные) остатки по контрагентам не должны теряться.
+    from pathlib import Path
+    src = Path("data") / "Оборотно-сальдовая ведомость по счету 19 за 1-st half year of 2026.xls"
+    if not src.exists():
+        pytest.skip("Файл отчёта по счету 19 не найден в data/")
+    df, _ = load_osv_file(src.name, src.read_bytes())
+    neg = df[df["КонецДебет"] < -1e-9]
+    assert len(neg) >= 6
+    assert set(neg["Субконто"]) >= {
+        "ЕРМАТЕЛЬ ЗАО", "СОЮЗ-ПОЛИМЕР ООО ПТК", "ИРКУТСКИЙ ЦСМ ФБУ",
+    }
+
+    auditor = AutoAuditor1C(df, closing_accounts=["90"], checks={"red_balance"})
+    auditor.run_audit()
+    assert any(
+        "Красное сальдо" in e.title
+        for e in auditor.errors
+    )
+
+
 def test_plan_override():
     data = open(REAL_XLS, "rb").read()
     df, _ = load_osv_file(REAL_XLS.name, data, plan_override="71:P, 999:A")

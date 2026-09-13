@@ -21,16 +21,18 @@ DASHBOARD_COLUMNS: list[str] = [
     "Развернутое сальдо, счет",
     "Не закрыт период, счет, период",
     "Не закрыты документами, счет",
+    "Нет движений 51, счет",
 ]
 
 _DASH: str = "—"  # пустая ячейка вместо пустого списка
 
-# Четыре блока детальной панели дашборда: маркеры заголовков проверок.
+# Блоки детальной панели дашборда: маркеры заголовков проверок.
 BLOCK_RULES: dict[str, list[str]] = {
     "red": ["Красное сальдо"],
     "unclosed": ["Незакрытое сальдо", "Зависшее сальдо", "Контроль групп"],
     "expanded": ["Развернутое сальдо"],
     "settlements": ["Контрагенты"],
+    "cash": ["Отсутствие движений"],
 }
 
 
@@ -108,7 +110,8 @@ def _collect_accounts(details: pd.DataFrame) -> dict[str, list[str]]:
       "Сальдо красным, счет"          -> счета (красное сальдо);
       "Развернутое сальдо, счет"      -> счета (развернутое сальдо);
       "Не закрыт период, счет, период"-> "счет, период";
-      "Не закрыты документами, счет"  -> счета (все проверки по контрагентам).
+      "Не закрыты документами, счет"  -> счета (все проверки по контрагентам);
+      "Нет движений 51, счет"         -> счета (отсутствие движений по 51).
     """
 
     result: dict[str, list[str]] = {}
@@ -129,6 +132,8 @@ def _collect_accounts(details: pd.DataFrame) -> dict[str, list[str]]:
                 result["Сальдо красным, счет"].append(acc)
             elif "Развернутое сальдо" in title:
                 result["Развернутое сальдо, счет"].append(acc)
+            elif "Отсутствие движений" in title:
+                result["Нет движений 51, счет"].append(acc)
             elif "Контрагенты" in title:
                 # Все проверки раздела 4.5 (аванс+долг, незакрытые расчеты,
                 # расхождение документов и ОСВ); составные ячейки дробим
@@ -144,6 +149,24 @@ def _collect_accounts(details: pd.DataFrame) -> dict[str, list[str]]:
     return result
 
 
+def split_base_number(db_name) -> tuple[str, str]:
+    """
+    Разделяет имя базы вида «12;ИП Иванов» на номер и собственно имя.
+
+    Возвращает (номер, имя). Если перед первой «;» нет целого числа —
+    ("", исходное имя без изменений). Имена без «;» (файлы, одиночный 1С)
+    не затрагиваются.
+    """
+
+    s = str(db_name or "").strip()
+    if ";" in s:
+        head, _, tail = s.partition(";")
+        head = head.strip()
+        if head.isdigit():
+            return head, tail.strip()
+    return "", s
+
+
 def build_master_row(result: dict) -> dict:
     """
     Сводная строка одной базы для мастер-таблицы дашборда.
@@ -154,9 +177,13 @@ def build_master_row(result: dict) -> dict:
     if details is not None and not getattr(details, "empty", True):
         collected = _collect_accounts(details)
 
+    # Имя базы может иметь вид «12;ИП Иванов»: номер уходит в первую колонку
+    # («Бухгалтер»), имя — в колонку «База». Без номера — как раньше.
+    db_num, clean_name = split_base_number(result.get("db_name"))
+
     row: dict[str, str] = {
-        "Бухгалтер": str(result.get("accountant") or "") or _DASH,
-        "База": str(result.get("db_name") or "") or _DASH,
+        "Бухгалтер": db_num or (str(result.get("accountant") or "") or _DASH),
+        "База": str(clean_name or "") or _DASH,
         "Дата просмотра": str(result.get("viewed_at") or "") or _DASH,
     }
 
@@ -200,10 +227,15 @@ def find_result(history: list[dict], db_name: str) -> dict | None:
     while idx < len(history):
         entry = history[idx]
         base = str(entry.get("db_name") or "")
+        _, clean = split_base_number(base)
         period = str(entry.get("period") or "").strip()
-        candidates = {base}
+        candidates = {base, clean}
+        if clean and clean != base:
+            candidates.add(clean)
         if period:
             candidates.add(f"{base} ({period})")
+            if clean and clean != base:
+                candidates.add(f"{clean} ({period})")
         if db_name in candidates:
             return entry
         idx += 1

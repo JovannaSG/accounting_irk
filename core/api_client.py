@@ -92,7 +92,7 @@ class OneCClient:
         if self._catalogs_loaded:
             return
 
-        catalogs = [
+        catalogs: list[str] = [
             "Catalog_Контрагенты",
             "Catalog_ДоговорыКонтрагентов",
             "Catalog_ФизическиеЛица",
@@ -400,7 +400,7 @@ class OneCClient:
         метаданными и проверками целостности `integrity`).
         """
 
-        _DETAILED_ACCOUNTS = ("60", "62", "76", "71", "73", "58", "66", "67")
+        _DETAILED_ACCOUNTS = ("60", "62", "76", "71", "73", "58", "66", "67", "19")
         if pd.to_datetime(period_start) > pd.to_datetime(period_end):
             raise ValueError("Некорректный диапазон дат.")
 

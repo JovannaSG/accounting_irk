@@ -20,3 +20,4 @@ users.json
 .ruff_cache
 t.py
 .opencode
+login_data_for_users.txt

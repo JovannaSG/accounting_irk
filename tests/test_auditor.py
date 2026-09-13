@@ -41,6 +41,71 @@ def test_red_balance_passive_debit_only():
     assert set(red[0]["data"]["Счет"]) == {"68"}
 
 
+def test_red_balance_ap_positive_side_not_red():
+    # Активно-пассивный счет (60) с одновременными дебиторами и кредиторами:
+    # субконто «Ромашка ООО» висит только по кредиту при общем дебетовом итоге
+    # по счету — это НЕ минус, развернутое сальдо. Красным флагаются только
+    # реальные отрицательные числа в колонках ОСВ.
+    df = osv([
+        ["2026-01-31", "60.01", "ООО Ромашка", "AP", 0, 0, 0, 0, 45000, 30000],  # дебитор
+        ["2026-01-31", "60.01", "Ромашка ООО", "AP", 0, 0, 0, 0, 0, 10000],      # кредит-остаток
+        ["2026-01-31", "60.01", "ООО Лютик", "AP", 0, 0, 0, 0, 8000, 8000],       # двустороннее
+    ])
+    auditor = AutoAuditor1C(df, closing_accounts=["90"], checks={"red_balance", "expanded_balance"})
+    errors = auditor.run_audit()
+
+    red = [e for e in errors if "Красное сальдо" in e["title"]]
+    assert not red
+
+    expanded = [e for e in errors if "Развернутое сальдо" in e["title"]]
+    assert len(expanded) == 1
+    assert set(expanded[0]["data"]["Субконто"]) == {"ООО Ромашка", "ООО Лютик"}
+
+
+def test_red_balance_ap_single_subconto_not_red():
+    # Один субконто на счёт: не бывает «противоположного итогу» — ошибки нет.
+    df = osv([
+        ["2026-01-31", "73", "Иванов", "AP", 0, 0, 0, 0, 0, 360],
+    ])
+    auditor = AutoAuditor1C(df)
+    errors = auditor.run_audit()
+    assert not [e for e in errors if "Красное сальдо" in e["title"]]
+
+
+def test_red_balance_ap_positive_side_across_subaccounts_not_red():
+    # Субсчета 60.01 (дебет) и 60.02 (кредит) одного родителя 60:
+    # положительные остатки на стороне, противоположной нетто счета, —
+    # не красное сальдо (это развернутое сальдо). Флагаются только минусы.
+    df = osv([
+        ["2026-01-31", "60.01", "ООО Ромашка", "AP", 0, 0, 0, 0, 45000, 30000],
+        ["2026-02-28", "60.02", "Ромашка ООО", "AP", 0, 0, 0, 0, 0, 10000],
+    ])
+    auditor = AutoAuditor1C(df, closing_accounts=["90"], checks={"red_balance", "expanded_balance"})
+    auditor.run_audit()
+
+    red = [e for e in auditor.errors if "Красное сальдо" in e["title"]]
+    assert not red
+
+    # Развернутое сальдо (двусторонние остатки) при этом продолжает работать
+    expanded = [e for e in auditor.errors if "Развернутое сальдо" in e["title"]]
+    assert len(expanded) == 1
+    assert set(expanded[0]["data"]["Счет"]) == {"60"}
+
+
+def test_red_balance_ap_real_negative_is_error():
+    # Реальный минус в колонке АП-счета (76.АВ, КонецДебет = -1223.82) —
+    # красное сальдо уровня error, после схлопывания субсчет -> родитель 76.
+    df = osv([
+        ["2026-01-31", "76.АВ", "Минфин Иркутской области", "AP", 0, 0, 0, 0, -1223.82, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    errors = auditor.run_audit()
+    ap = [e for e in errors if "Красное сальдо" in e["title"]]
+    assert len(ap) == 1
+    assert ap[0]["level"] == "error"
+    assert set(ap[0]["data"]["Счет"]) == {"76"}
+
+
 def test_red_balance_net_value_not_raw_columns():
     # Активный счет с КД=1000 и КК=500 -> итог дебетовый, ошибки быть не должно
     df = osv([
@@ -86,6 +151,47 @@ def test_red_balance_period_of_occurrence():
     assert "отрицательное сальдо с 28.02.2026" in red[0]["data"].iloc[0]["Комментарий"]
 
 
+def test_red_balance_negative_debit_ap_catches_real_73_xls():
+    from core.loaders import load_osv_file
+    with open("data/73.xls", "rb") as f:
+        data = f.read()
+    df, _ = load_osv_file("73.xls", data)
+    auditor = AutoAuditor1C(df, closing_accounts=["90"], checks={"red_balance"})
+    auditor.run_audit()
+    red = [e for e in auditor.errors if "Красное сальдо" in e.title]
+    assert len(red) >= 1
+    accounts = sorted(set(red[0]["data"]["Счет"]))
+    assert "73" in accounts
+    assert red[0]["level"] == "error"
+
+
+def test_red_balance_negative_credit_active_flagged():
+    df = osv([
+        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 0, 0, 0, -100],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance"})
+    auditor.run_audit()
+    red = [e for e in auditor.errors if "Красное сальдо" in e.title]
+    assert len(red) == 1
+    assert red[0]["level"] == "error"
+
+
+def test_red_balance_negative_debit_19_xls():
+    from core.loaders import load_osv_file
+    with open("data/Оборотно-сальдовая ведомость по счету 19 за 1-st half year of 2026.xls", "rb") as f:
+        data = f.read()
+    df, _ = load_osv_file("19.xls", data)
+    auditor = AutoAuditor1C(df, closing_accounts=["90"], checks={"red_balance"})
+    auditor.run_audit()
+    red = [e for e in auditor.errors if "Красное сальдо" in e.title]
+    assert len(red) >= 1
+    accounts = sorted(set(red[0]["data"]["Счет"]))
+    assert "19" in accounts
+    assert red[0]["level"] == "error"
+    rows = red[0]["data"]
+    assert len(rows) >= 6
+
+
 # ---------------- 4.2 Развернутое сальдо ----------------
 def test_expanded_balance():
     df = osv([
@@ -107,6 +213,95 @@ def test_expanded_balance_ignores_account_level_ap():
     auditor = AutoAuditor1C(df)
     errors = auditor.run_audit()
     assert not [e for e in errors if "Развернутое сальдо" in e["title"]]
+
+
+def test_expanded_balance_across_documents_same_subconto():
+    # Развернутое сальдо по контрагенту: дебет в одном договоре, кредит — в другом
+    df = osv([
+        ["2026-01-31", "60.01", "ООО Ромашка", "AP", 0, 0, 0, 0, 45000, 0],
+        ["2026-01-31", "60.01", "ООО Ромашка", "AP", 0, 0, 0, 0, 0, 30000],
+    ])
+    auditor = AutoAuditor1C(df, closing_accounts=["90"], checks={"expanded_balance"})
+    errors = auditor.run_audit()
+    exp = [e for e in errors if "Развернутое сальдо" in e["title"]]
+    assert len(exp) == 1
+    assert list(exp[0]["data"]["Счет"]) == ["60"]
+    assert set(exp[0]["data"]["Субконто"]) == {"ООО Ромашка"}
+
+
+def test_expanded_balance_single_sided_subconto_no_flag():
+    # Односторонний контрагент (только дебет) — не развернутое сальдо
+    df = osv([
+        ["2026-01-31", "60.01", "ООО Ромашка", "AP", 0, 0, 0, 0, 45000, 0],
+        ["2026-01-31", "60.01", "ООО Лютик", "AP", 0, 0, 0, 0, 0, 30000],
+    ])
+    auditor = AutoAuditor1C(df, closing_accounts=["90"], checks={"expanded_balance"})
+    errors = auditor.run_audit()
+    assert not [e for e in errors if "Развернутое сальдо" in e["title"]]
+
+
+# ---------------- Свертка сальдо расчетов (60/62) ----------------
+def test_fold_settlement_negative_debit_to_credit():
+    # 1C отдает свернутое сальдо 60.02 со знаком минус в дебете —
+    # разворачиваем в кредит, в красное сальдо не попадает
+    df = osv([
+        ["2026-01-31", "60.02", "СТРОЙ ДОМ ООО", "AP", 0, 0, 0, 0, -20104.61, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    row = auditor.balances[(auditor.balances["Счет"] == "60.02")]
+    assert abs(float(row["КонецДебет"].iloc[0])) < 1e-6
+    assert abs(float(row["КонецКредит"].iloc[0]) - 20104.61) < 1e-6
+    errors = auditor.run_audit()
+    red = [e for e in errors if "Красное сальдо" in e["title"]]
+    assert not red
+
+
+def test_fold_settlement_negative_credit_to_debit():
+    # Отрицательный кредит 60.01 (аванс поставщику) разворачивается в дебет
+    df = osv([
+        ["2026-01-31", "60.01", "АО ЦВ ПРОТЕК", "AP", 0, 0, 0, 0, 0, -1553.91],
+    ])
+    auditor = AutoAuditor1C(df)
+    row = auditor.balances[(auditor.balances["Счет"] == "60.01")]
+    assert abs(float(row["КонецКредит"].iloc[0])) < 1e-6
+    assert abs(float(row["КонецДебет"].iloc[0]) - 1553.91) < 1e-6
+    errors = auditor.run_audit()
+    red = [e for e in errors if "Красное сальдо" in e["title"]]
+    assert not red
+
+
+def test_fold_preserves_net_per_account():
+    # Инвариант «Дт − Кт» по счёту не меняется при свертке
+    df = osv([
+        ["2026-01-31", "60.01", "АО ЦВ ПРОТЕК", "AP", 0, 0, 0, 0, 0, -1553.91],
+        ["2026-01-31", "60.01", "АО ЦВ ПРОТЕК", "AP", 0, 0, 0, 0, 0, 326276.89],
+        ["2026-01-31", "60.02", "СТРОЙ ДОМ ООО", "AP", 0, 0, 0, 0, -20104.61, 0],
+    ])
+    raw = df[["КонецДебет", "КонецКредит"]].sum()
+    net_raw = float(raw["КонецДебет"] - raw["КонецКредит"])
+    auditor = AutoAuditor1C(df)
+    folded = auditor.balances[["КонецДебет", "КонецКредит"]].sum()
+    net_folded = float(folded["КонецДебет"] - folded["КонецКредит"])
+    assert abs(net_raw - net_folded) < 1e-6
+    assert (auditor.balances["КонецДебет"] >= -1e-6).all()
+    assert (auditor.balances["КонецКредит"] >= -1e-6).all()
+
+
+def test_fold_keeps_negative_for_non_settlement():
+    # Счета вне 60/62 (например 73.x) свертку не задевают — минус остается красным
+    df = osv([
+        ["2026-01-31", "73.02", "Работник Иванов", "AP", 0, 0, 0, 0, -5000, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    row = auditor.balances[(auditor.balances["Счет"] == "73.02")]
+    assert abs(float(row["КонецДебет"].iloc[0]) + 5000) < 1e-6
+    errors = auditor.run_audit()
+    ap = [
+        e for e in errors
+        if e["title"]
+        == "Красное сальдо: субконто активно-пассивного счета противоположно итогу"
+    ]
+    assert any((e["data"]["Счет"] == "73").any() for e in ap)
 
 
 # ---------------- 4.3 Незакрытое сальдо на конец месяца ----------------
@@ -292,6 +487,114 @@ def test_account_000_detected_after_string_conversion():
     acc000 = [e for e in errors if "счете 000" in e["title"]]
     assert len(acc000) == 1
     assert list(acc000[0]["data"]["Счет"]) == ["000"]
+
+
+# ---------------- Особое правило: счет 51 ----------------
+def test_account_51_no_turnover_error():
+    df = osv([
+        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 0, 0, 100000, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+    idle = [e for e in auditor.errors if "Отсутствие движений" in e.title]
+    assert len(idle) == 1
+    assert idle[0]["level"] == "error"
+    assert list(idle[0]["data"]["Счет"]) == ["51"]
+
+
+def test_account_51_with_turnover_no_error():
+    df = osv([
+        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 100000, 0, 100000, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+    idle = [e for e in auditor.errors if "Отсутствие движений" in e.title]
+    assert not idle
+
+
+def test_account_51_absent_no_error():
+    df = osv([
+        ["2026-01-31", "50", "Касса", "A", 0, 0, 5000, 0, 5000, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+    idle = [e for e in auditor.errors if "Отсутствие движений" in e.title]
+    assert not idle
+
+
+def test_account_51_subaccount_rolls_to_parent():
+    df = osv([
+        ["2026-01-31", "51.01", "Расчетный", "A", 0, 0, 0, 0, 100000, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+    idle = [e for e in auditor.errors if "Отсутствие движений" in e.title]
+    assert len(idle) == 1
+    assert set(idle[0]["data"]["Счет"]) == {"51"}
+
+
+def test_account_51_multi_org_flags_only_idle_org():
+    df = osv([
+        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 0, 0, 100000, 0],
+        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 100000, 0, 100000, 0],
+    ])
+    df["Организация"] = ["ООО А", "ООО Б"]
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+    idle = [e for e in auditor.errors if "Отсутствие движений" in e.title]
+    assert len(idle) == 1
+    assert set(idle[0]["data"]["Организация"]) == {"ООО А"}
+
+
+def test_account_51_activity_in_early_slice_whole_period_ok():
+    # Баг: несколько периодов в одном аудите, активность в начале периода,
+    # далее ноль. Движение надо оценивать за ВЕСЬ период (сумму «Оборотов за
+    # период»), а не по последнему срезу («сегодня»).
+    df = osv([
+        ["2026-06-30", "51", "Расчетный", "A", 0, 0, 13955467.49, 11818542.03, 2477375.69, 0],
+        ["2026-07-31", "51", "Расчетный", "A", 0, 0, 0, 0, 2477375.69, 0],
+        ["2026-08-31", "51", "Расчетный", "A", 0, 0, 0, 0, 2477375.69, 0],
+        ["2026-09-09", "51", "Расчетный", "A", 0, 0, 0, 0, 2477375.69, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+    idle = [e for e in auditor.errors if "Отсутствие движений" in e.title]
+    assert not idle
+
+
+def test_account_51_no_turnover_any_period_single_error():
+    df = osv([
+        ["2026-07-31", "51", "Расчетный", "A", 0, 0, 0, 0, 2477375.69, 0],
+        ["2026-08-31", "51", "Расчетный", "A", 0, 0, 0, 0, 2477375.69, 0],
+        ["2026-09-09", "51", "Расчетный", "A", 0, 0, 0, 0, 2477375.69, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+    idle = [e for e in auditor.errors if "Отсутствие движений" in e.title]
+    assert len(idle) == 1
+    assert list(idle[0]["data"]["Период"]) == ["2026-09-09"]
+
+
+def test_account_51_empty_turnover_columns_treated_as_zero():
+    df = osv([
+        ["2026-09-09", "51", "Расчетный", "A", 0, 0, None, None, 100000, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+    idle = [e for e in auditor.errors if "Отсутствие движений" in e.title]
+    assert len(idle) == 1
+
+
+def test_account_51_activity_in_last_slice_whole_period_ok():
+    df = osv([
+        ["2026-06-30", "51", "Расчетный", "A", 0, 0, 0, 0, 500000, 0],
+        ["2026-07-31", "51", "Расчетный", "A", 0, 0, 0, 0, 500000, 0],
+        ["2026-08-31", "51", "Расчетный", "A", 0, 0, 120000, 50000, 500000, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+    idle = [e for e in auditor.errors if "Отсутствие движений" in e.title]
+    assert not idle
 
 
 # ---------------- 4.5 Контрагенты ----------------
@@ -515,7 +818,7 @@ def test_report_structure_and_excel():
 
 def test_report_ok_when_no_errors():
     df = osv([
-        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 0, 0, 100000, 0],
+        ["2026-01-31", "51", "Расчетный", "A", 0, 0, 100000, 0, 100000, 0],
     ])
     auditor = AutoAuditor1C(df)
     auditor.run_audit()
@@ -1134,3 +1437,161 @@ def test_comment_join_multiple_subaccounts_with_pipe():
     assert "(на субсчете 51.01)" in comments
     assert "(на субсчете 51.02)" in comments
     assert " | " in comments
+
+
+# ---------------- 4.6 Одинаковые суммы на разных договорах (60/62) ----------------
+
+_CROSS_COLS = ["Период", "Счет", "Субконто", "Тип", "Организация", "Договор",
+               "НачалоДебет", "НачалоКредит", "ОборотДебет", "ОборотКредит",
+               "КонецДебет", "КонецКредит"]
+
+_CROSS_TITLE = "Контрагенты: одинаковые суммы по разным договорам (счета 60, 62)"
+
+
+def _cross_find(errors):
+    return [e for e in errors if _CROSS_TITLE in e["title"]]
+
+
+def test_cross_contract_offsets_equal_amounts_error():
+    """Дебет 20 000 по Дог1 равен кредиту 20 000 по Дог2 (один контрагент) → ошибка."""
+    df = pd.DataFrame([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", "-",
+         "Дог1", 0, 0, 0, 0, 20000, 0],
+        ["2026-02-28", "60.02", "ООО Ромашка", "AP", "-",
+         "Дог2", 0, 0, 0, 0, 0, 20000],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    cross = _cross_find(errors)
+    assert len(cross) == 1
+    data = cross[0]["data"]
+    assert len(data) == 2
+    assert set(data["Счет"]) == {"60"}                     # субсчета схлопнуты в родителя
+    assert set(data["Договор"]) == {"Дог1", "Дог2"}
+    assert set(data["Сумма"]) == {20000.0}                 # по строке на каждый договор
+    assert cross[0]["amount"] == pytest.approx(40000)
+
+
+def test_cross_contract_offsets_unequal_amounts_ok():
+    """Разные суммы на разных договорах — не ошибка (в т.ч. прежняя логика)."""
+    df = pd.DataFrame([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", "-",
+         "Дог1", 0, 0, 0, 0, 20065, 0],
+        ["2026-02-28", "60.02", "ООО Ромашка", "AP", "-",
+         "Дог2", 0, 0, 0, 0, 0, 22378],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    assert not _cross_find(errors)
+
+
+def test_cross_contract_offsets_same_contract_ignored():
+    """Одинаковые суммы на одном договоре — не ошибка этой проверки
+    (ею занимается «аванс и долг по разным счетам»)."""
+    df = pd.DataFrame([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", "-",
+         "Дог1", 0, 0, 0, 0, 20000, 0],
+        ["2026-02-28", "60.02", "ООО Ромашка", "AP", "-",
+         "Дог1", 0, 0, 0, 0, 0, 20000],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    assert not _cross_find(errors)
+
+
+def test_cross_contract_offsets_different_counterparties_no_match():
+    """Одинаковые суммы, но у РАЗНЫХ контрагентов — не ошибка."""
+    df = pd.DataFrame([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", "-",
+         "Дог1", 0, 0, 0, 0, 20000, 0],
+        ["2026-02-28", "60.02", "ООО Вектор", "AP", "-",
+         "Дог2", 0, 0, 0, 0, 0, 20000],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    assert not _cross_find(errors)
+
+
+def test_cross_contract_offsets_no_cross_60_62():
+    """Счета 60 и 62 проверяются раздельно — совпадение между ними не флаг."""
+    df = pd.DataFrame([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", "-",
+         "Дог1", 0, 0, 0, 0, 20000, 0],
+        ["2026-02-28", "62.02", "ООО Ромашка", "AP", "-",
+         "Дог2", 0, 0, 0, 0, 0, 20000],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    assert not _cross_find(errors)
+
+
+def test_cross_contract_offsets_missing_contract_skipped():
+    """Договор '-' (файловая загрузка) — разные договоры не определить, не флаг."""
+    df = pd.DataFrame([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", "-",
+         "-", 0, 0, 0, 0, 20000, 0],
+        ["2026-02-28", "60.02", "ООО Ромашка", "AP", "-",
+         "-", 0, 0, 0, 0, 0, 20000],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    assert not _cross_find(errors)
+
+
+def test_cross_contract_offsets_org_separation():
+    """Совпадение дебета и кредита у разных организаций — не ошибка."""
+    df = pd.DataFrame([
+        ["2026-02-28", "60.01", "ООО Ромашка", "AP", "ООО А",
+         "Дог1", 0, 0, 0, 0, 20000, 0],
+        ["2026-02-28", "60.02", "ООО Ромашка", "AP", "ООО Б",
+         "Дог2", 0, 0, 0, 0, 0, 20000],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    assert not _cross_find(errors)
+
+
+def test_cross_contract_offsets_period_separation():
+    """Совпадение дебета в январе и кредита в феврале — не ошибка (разные периоды)."""
+    df = pd.DataFrame([
+        ["2026-01-31", "60.01", "ООО Ромашка", "AP", "-",
+         "Дог1", 0, 0, 0, 0, 20000, 0],
+        ["2026-02-28", "60.02", "ООО Ромашка", "AP", "-",
+         "Дог2", 0, 0, 0, 0, 0, 20000],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    assert not _cross_find(errors)
+
+
+def test_cross_contract_offsets_account_62():
+    """Та же логика работает и для счета 62."""
+    df = pd.DataFrame([
+        ["2026-02-28", "62.01", "ИП Смирнов", "AP", "-",
+         "Дог3", 0, 0, 0, 0, 50000, 0],
+        ["2026-02-28", "62.02", "ИП Смирнов", "AP", "-",
+         "Дог4", 0, 0, 0, 0, 0, 50000],
+    ], columns=_CROSS_COLS)
+    errors = AutoAuditor1C(df).run_audit()
+    cross = _cross_find(errors)
+    assert len(cross) == 1
+    assert set(cross[0]["data"]["Счет"]) == {"62"}
+
+
+# ---------------- get_raw_balances ----------------
+def test_get_raw_balances_returns_parent_plus_subaccounts():
+    df = osv([
+        ["2026-01-31", "60.01", "АО ЦВ ПРОТЕК", "AP", 0, 0, 0, 0, 1553.91, 0],
+        ["2026-01-31", "60.02", "Без договора", "AP", 0, 0, 0, 0, 0, 326276.89],
+        ["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+
+    raw = auditor.get_raw_balances("60")
+    assert set(raw["Счет"].astype(str)) == {"60.01", "60.02"}
+    assert set(auditor.get_raw_balances("60.01")["Счет"].astype(str)) == {"60.01"}
+
+    # Посторонние счета не попадают
+    other = auditor.get_raw_balances("50")
+    assert set(other["Счет"].astype(str)) == {"50"}
+
+
+def test_get_raw_balances_empty_without_balances():
+    df = osv([["2026-01-31", "60.01", "АО ЦВ ПРОТЕК", "AP", 0, 0, 0, 0, 0, 100]])
+    auditor = AutoAuditor1C(df)
+    auditor.balances = None
+    raw = auditor.get_raw_balances("60")
+    assert isinstance(raw, pd.DataFrame)
+    assert raw.empty

@@ -1,3 +1,5 @@
+import os
+
 import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -9,10 +11,18 @@ from core.dashboard import (
     build_dashboard_df,
     build_master_row,
     find_result,
+    split_base_number,
 )
 import core.db
 
 APP = "app/ui.py"
+
+
+def _sample_bytes(name: str) -> bytes:
+    """Читает файл из data/ для загрузки через file_uploader (AppTest)."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "data", name), "rb") as f:
+        return f.read()
 
 
 def details(rows):
@@ -116,6 +126,18 @@ def test_master_row_empty_details():
     assert row["Развернутое сальдо, счет"] == "—"
     assert row["Не закрыт период, счет, период"] == "—"
     assert row["Не закрыты документами, счет"] == "—"
+    assert row["Нет движений 51, счет"] == "—"
+
+
+def test_master_row_zero_turnover_51():
+    r = result(rows=[
+        ["51", "Отсутствие движений по расчетному счету (счет 51)", "2026-02-28", "error", 0.0],
+    ])
+    row = build_master_row(r)
+    assert row["Нет движений 51, счет"] == "51"
+    # Не перетекает в другие колонки
+    assert row["Сальдо красным, счет"] == "—"
+    assert row["Не закрыты документами, счет"] == "—"
 
 
 def test_dashboard_df_columns_and_rows():
@@ -148,6 +170,36 @@ def test_find_result():
     assert find_result(history, "Нет такой базы") is None
 
 
+def test_split_base_number():
+    assert split_base_number("12;ИП Иванов") == ("12", "ИП Иванов")
+    assert split_base_number(" 7 ; База   ") == ("7", "База")
+    assert split_base_number("База 1") == ("", "База 1")
+    assert split_base_number("A;База") == ("", "A;База")
+    assert split_base_number("") == ("", "")
+    assert split_base_number(None) == ("", "")
+
+
+def test_master_row_number_in_first_column():
+    r = result(db="12;ИП Иванов", accountant="Иванова И.И.", rows=[])
+    row = build_master_row(r)
+    assert row["Бухгалтер"] == "12"
+    assert row["База"] == "ИП Иванов"
+
+
+def test_master_row_numbered_base_with_period():
+    r = result(db="7;База Новая", accountant="Иванова И.И.", rows=[])
+    r["period"] = "2026-01"
+    row = build_master_row(r)
+    assert row["Бухгалтер"] == "7"
+    assert row["База"] == "База Новая (2026-01)"
+
+
+def test_find_result_matches_clean_name():
+    history = [result(db="База 1"), result(db="12;ИП Иванов")]
+    assert find_result(history, "ИП Иванов")["db_name"] == "12;ИП Иванов"
+    assert find_result(history, "12;ИП Иванов")["db_name"] == "12;ИП Иванов"
+
+
 def test_block_dfs_splits_by_check_type():
     d = details([
         ["51", "Красное сальдо: активный счет с кредитовым остатком", "2026-01-31", "error", 1.0],
@@ -157,6 +209,7 @@ def test_block_dfs_splits_by_check_type():
         ["000", "Незакрытое сальдо на счете 000", "2026-01-31", "error", 5.0],
         ["60.01", "Контрагенты: расчеты не закрыты документами", "2026-01-31", "error", 6.0],
         ["62.01, 62.02", "Контрагенты: аванс и долг одновременно по разным счетам (ОСВ)", "", "warning", 7.0],
+        ["51", "Отсутствие движений по расчетному счету (счет 51)", "2026-02-28", "error", 0.0],
         ["60.01", "ML: возможные дубли контрагентов", "2026-01-31", "warning", 0.0],
     ])
     blocks = block_dfs(d)
@@ -166,28 +219,32 @@ def test_block_dfs_splits_by_check_type():
     assert set(accounts_list(blocks["unclosed"])) == {"000", "20", "90.01"}
     # Блок 4 собирает все проверки 4.5 (составные ячейки дробит мастер-таблица)
     assert set(accounts_list(blocks["settlements"])) == {"60.01", "62.01, 62.02"}
+    # Блок 5 — отсутствие движений по расчетному счету
+    assert set(accounts_list(blocks["cash"])) == {"51"}
 
     # ML-дубли в блоки не попадают
     all_block_rows = (
         len(blocks["red"]) + len(blocks["expanded"])
         + len(blocks["unclosed"]) + len(blocks["settlements"])
+        + len(blocks["cash"])
     )
-    assert all_block_rows == 7
+    assert all_block_rows == 8
     assert len(blocks["red"]["Счет"]) == 1
     assert len(blocks["expanded"]["Счет"]) == 1
     assert len(blocks["unclosed"]["Счет"]) == 3
     assert len(blocks["settlements"]["Счет"]) == 2
+    assert len(blocks["cash"]["Счет"]) == 1
 
 
 def test_block_dfs_empty_details():
     blocks = block_dfs(pd.DataFrame(columns=["Счет", "Проверка", "Период"]))
-    for block in ("red", "unclosed", "expanded", "settlements"):
+    for block in ("red", "unclosed", "expanded", "settlements", "cash"):
         assert blocks[block].empty
 
 
 def test_block_dfs_missing_column():
     blocks = block_dfs(pd.DataFrame({"a": [1]}))
-    for block in ("red", "unclosed", "expanded", "settlements"):
+    for block in ("red", "unclosed", "expanded", "settlements", "cash"):
         assert blocks[block].empty
 
 
@@ -208,7 +265,9 @@ def test_accounts_list_empty():
 def test_dashboard_renders_master_and_detail():
     at = AppTest.from_file(APP, default_timeout=30)
     at.run()
-    at.sidebar.button(key="btn_mock").click()
+    at.sidebar.file_uploader(key="osv").set_value(
+        ("sample_data.csv", _sample_bytes("sample_data.csv"), "text/csv")
+    )
     at.run()
     at.button(key="btn_audit").click()
     at.run()
@@ -220,7 +279,7 @@ def test_dashboard_renders_master_and_detail():
     master = dash_els[0].value
     assert list(master.columns) == DASHBOARD_COLUMNS
     assert len(master) == 1
-    assert master.iloc[0]["База"] == "Тестовая база"
+    assert master.iloc[0]["База"] == "sample_data.csv"
 
     headers = [h.value for h in at.header]
     assert any("Сводный дашборд" in h for h in headers)
@@ -238,7 +297,7 @@ def test_dashboard_renders_master_and_detail():
 
     expands = [e.label for e in at.expander]
     assert any("Счёт" in e for e in expands)
-    assert any("База: Тестовая база" in m for m in (m.value for m in at.markdown))
+    assert any("База: sample_data.csv" in m for m in (m.value for m in at.markdown))
 
 
 def test_dashboard_detail_blocks_dups_and_exports(tmp_path, monkeypatch):
@@ -249,7 +308,9 @@ def test_dashboard_detail_blocks_dups_and_exports(tmp_path, monkeypatch):
     # 2. Запускаем приложение
     at = AppTest.from_file(APP, default_timeout=30)
     at.run()
-    at.sidebar.button(key="btn_mock").click()
+    at.sidebar.file_uploader(key="osv").set_value(
+        ("sample_data.csv", _sample_bytes("sample_data.csv"), "text/csv")
+    )
     at.run()
     at.button(key="btn_audit").click()
     at.run()
@@ -265,7 +326,7 @@ def test_dashboard_detail_blocks_dups_and_exports(tmp_path, monkeypatch):
     # 4. Проверяем заголовок базы
     # Используем any() и in, чтобы тест не упал из-за лишних пробелов в Markdown
     markdowns = [m.value for m in at.markdown]
-    assert any("### 🗄️ База: Тестовая база" in m for m in markdowns)
+    assert any("### 🗄️ База: sample_data.csv" in m for m in markdowns)
 
     # 5. Кнопки выгрузки Excel/PDF (Правильное API AppTest)
     # AppTest позволяет искать элементы по key напрямую!
