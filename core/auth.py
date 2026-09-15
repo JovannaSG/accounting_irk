@@ -126,6 +126,8 @@ def verify(login: str, password: str) -> bool:
 
     user = db.get_user(login)
     if user is not None:
+        if not user.get("active", True):
+            return False
         return _verify_stored_hash(user.get("password_hash"), password)
 
     # Фолбэк на env (старые развёртывания без users.json/БД-пользователей)

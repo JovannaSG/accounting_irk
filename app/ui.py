@@ -30,6 +30,8 @@ from core.dashboard import (
     accounts_list,
     block_dfs,
     build_dashboard_df,
+    dashboard_to_csv,
+    dashboard_to_excel,
     split_base_number,
 )
 from core.loaders import load_osv_file
@@ -72,8 +74,8 @@ def _render_login_form() -> None:
 
     st.subheader("🔐 Вход в приложение")
     st.caption(
-        "Доступ ограничен. Учетные записи задает администратор "
-        "в переменной окружения AUDIT_USERS."
+        "Доступ ограничен. Учётные записи задаёт администратор "
+        "в панели «👥 Управление пользователями»."
     )
     with st.form("login_form"):
         login_input = st.text_input("Логин", key="login_user")
@@ -122,6 +124,168 @@ def _render_logout_button() -> None:
         for key in ("user", "user_role", "user_allowed_urls", "audit_history"):
             st.session_state.pop(key, None)
         st.rerun()
+
+
+def _active_admins(users: list) -> list:
+    """Действующие администраторы из списка пользователей."""
+    return [u for u in users if u["role"] == "admin" and u.get("active", True)]
+
+
+def _render_user_management() -> None:
+    """
+    Панель администратора в сайдбаре: создание, изменение, отключение и
+    удаление пользователей. Пишет напрямую в таблицу `users` — источник
+    истины для входа (users.json используется только как первичный сид).
+    """
+    st.sidebar.divider()
+    with st.sidebar.expander("👥 Управление пользователями", expanded=False):
+        users = db.list_users()
+        current = st.session_state.get("user") or ""
+
+        st.markdown("**➕ Добавить пользователя**")
+        with st.form("users_add_form"):
+            add_login = st.text_input("Логин", key="um_add_login")
+            add_role = st.selectbox(
+                "Роль",
+                ("accountant", "admin"),
+                key="um_add_role",
+                format_func=lambda r: "Администратор" if r == "admin" else "Бухгалтер",
+            )
+            add_pass = st.text_input("Пароль", type="password", key="um_add_pass")
+            add_pass2 = st.text_input("Повтор пароля", type="password", key="um_add_pass2")
+            add_urls = st.text_area(
+                "Доступные базы (URL, по одному на строку)",
+                key="um_add_urls",
+                placeholder="https://msk1.1cfresh.com/a/ea/3418453",
+            )
+            add_submitted = st.form_submit_button("Добавить", type="primary", key="um_add_submit")
+
+        if add_submitted:
+            login_norm = add_login.strip().lower()
+            if not add_login.strip():
+                st.error("Введите логин.")
+            elif db.get_user(login_norm):
+                st.error(f"Пользователь «{add_login.strip()}» уже существует.")
+            elif not add_pass or add_pass != add_pass2:
+                st.error("Пароль не заполнен или пароли не совпадают.")
+            else:
+                urls = [u.strip() for u in add_urls.splitlines() if u.strip()]
+                db.upsert_user(
+                    login_norm,
+                    add_role,
+                    auth.hash_password(add_pass),
+                    urls,
+                    active=True,
+                )
+                st.success(f"Пользователь «{add_login.strip()}» добавлен.")
+                st.session_state.pop("audit_history", None)
+                st.rerun()
+
+        st.markdown("**✏️ Изменить пользователя**")
+        if users:
+            sel_login = st.selectbox(
+                "Пользователь",
+                [u["login"] for u in users],
+                key="um_edit_sel",
+            )
+            sel = next((u for u in users if u["login"] == sel_login), None)
+            if sel is not None:
+                with st.form("users_edit_form"):
+                    edit_role = st.selectbox(
+                        "Роль",
+                        ("accountant", "admin"),
+                        index=0 if sel["role"] != "admin" else 1,
+                        key="um_edit_role",
+                        format_func=lambda r: "Администратор" if r == "admin" else "Бухгалтер",
+                    )
+                    edit_active = st.checkbox(
+                        "Учётная запись активна",
+                        value=sel.get("active", True),
+                        key="um_edit_active",
+                    )
+                    edit_pass = st.text_input(
+                        "Новый пароль (пусто = оставить прежний)",
+                        type="password",
+                        key="um_edit_pass",
+                    )
+                    edit_pass2 = st.text_input(
+                        "Повтор нового пароля",
+                        type="password",
+                        key="um_edit_pass2",
+                    )
+                    edit_urls = st.text_area(
+                        "Доступные базы (URL, по одному на строку)",
+                        value="\n".join(sel.get("allowed_urls") or []),
+                        key="um_edit_urls",
+                    )
+                    edit_submitted = st.form_submit_button(
+                        "Сохранить", type="primary", key="um_edit_submit"
+                    )
+
+                if edit_submitted:
+                    err = None
+                    if edit_pass or edit_pass2:
+                        if edit_pass != edit_pass2:
+                            err = "Пароли не совпадают."
+                    if err is None and sel_login == current and not edit_active:
+                        err = "Нельзя отключить собственную учётную запись."
+                    if err is None:
+                        admins = _active_admins(users)
+                        if (
+                            sel_login in {a["login"] for a in admins}
+                            and len(admins) == 1
+                            and (edit_role != "admin" or not edit_active)
+                        ):
+                            err = "Нельзя изменить или отключить последнего действующего администратора."
+                    if err:
+                        st.error(err)
+                    else:
+                        current_row = db.get_user(sel_login)
+                        new_hash = (current_row or {}).get("password_hash") or ""
+                        if edit_pass:
+                            new_hash = auth.hash_password(edit_pass)
+                        urls = [u.strip() for u in edit_urls.splitlines() if u.strip()]
+                        db.upsert_user(
+                            sel_login, edit_role, new_hash, urls, active=edit_active
+                        )
+                        st.success(f"Пользователь «{sel_login}» обновлён.")
+                        st.session_state.pop("audit_history", None)
+                        if sel_login == current:
+                            _store_access_ctx()
+                        st.rerun()
+        else:
+            st.caption("Пользователей пока нет.")
+
+        st.markdown("**🗑️ Удалить пользователя**")
+        if users:
+            del_login = st.selectbox(
+                "Пользователь",
+                [u["login"] for u in users],
+                key="um_del_sel",
+            )
+            del_confirm = st.checkbox(
+                "Подтверждаю безвозвратное удаление", key="um_del_confirm"
+            )
+            del_clicked = st.button("Удалить", key="um_del_btn")
+            if del_clicked:
+                err = None
+                if del_login == current:
+                    err = "Нельзя удалить собственную учётную запись."
+                elif not del_confirm:
+                    err = "Подтвердите удаление флажком."
+                else:
+                    admins = _active_admins(users)
+                    if del_login in {a["login"] for a in admins} and len(admins) == 1:
+                        err = "Нельзя удалить последнего действующего администратора."
+                if err:
+                    st.error(err)
+                else:
+                    db.delete_user(del_login)
+                    st.success(f"Пользователь «{del_login}» удалён.")
+                    st.session_state.pop("audit_history", None)
+                    st.rerun()
+        else:
+            st.caption("Удалять пока некого.")
 
 
 def _visible_databases(entries: list) -> list:
@@ -515,6 +679,22 @@ def _render_dashboard(history: list[dict]) -> None:
         st.info("Пока нет результатов аудита для сводного дашборда.")
         return
 
+    c_dl_x, c_dl_c = st.columns(2)
+    c_dl_x.download_button(
+        "💾 Скачать сводку (Excel)",
+        data=dashboard_to_excel(dash),
+        file_name="dashboard_summary.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="btn_download_dashboard_excel",
+    )
+    c_dl_c.download_button(
+        "💾 Скачать сводку (CSV)",
+        data=dashboard_to_csv(dash),
+        file_name="dashboard_summary.csv",
+        mime="text/csv",
+        key="btn_download_dashboard_csv",
+    )
+
     st.dataframe(
         dash,
         on_select="rerun",
@@ -754,6 +934,8 @@ def _render_dashboard(history: list[dict]) -> None:
 # ============ Боковая панель ============
 if st.session_state.get("user"):
     _render_logout_button()
+    if st.session_state.get("user_role") == "admin":
+        _render_user_management()
 
 st.sidebar.header("📥 Загрузка данных")
 data_source = st.sidebar.radio(

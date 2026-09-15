@@ -10,6 +10,8 @@ from core.dashboard import (
     block_dfs,
     build_dashboard_df,
     build_master_row,
+    dashboard_to_csv,
+    dashboard_to_excel,
     find_result,
     split_base_number,
 )
@@ -164,6 +166,44 @@ def test_dashboard_df_empty():
     assert list(df.columns) == DASHBOARD_COLUMNS
 
 
+def test_dashboard_to_excel_wide_columns(tmp_path):
+    df = build_dashboard_df([
+        result(db="База 1", rows=[
+            ["51", "Красное сальдо: активный счет с кредитовым остатком",
+             "2026-01-31", "error", 5.0],
+        ]),
+        result(db="База 2", accountant="Петров П.П.", rows=[]),
+    ])
+    blob = dashboard_to_excel(df)
+    assert blob[:2] == b"PK"  # XLSX — zip-архив
+
+    out = tmp_path / "dash.xlsx"
+    out.write_bytes(blob)
+    import openpyxl
+    wb = openpyxl.load_workbook(out)
+    ws = wb["Сводка"]
+    headers = [c.value for c in ws[1]]
+    assert headers == DASHBOARD_COLUMNS
+    assert ws.max_row == 3  # шапка + 2 базы
+    assert ws.max_column == len(DASHBOARD_COLUMNS)
+
+
+def test_dashboard_to_csv_utf8_bom():
+    import csv as _csv
+
+    df = build_dashboard_df([
+        result(db="База 1", accountant="Иванова И.И.", rows=[]),
+        result(db="12;ИП Иванов", accountant="Иванова И.И.", rows=[]),
+    ])
+    blob = dashboard_to_csv(df)
+    text = blob.decode("utf-8-sig")  # BOM снимается декодом
+    assert blob.startswith(b"\xef\xbb\xbf")
+    parsed = list(_csv.reader(text.splitlines()))
+    assert parsed[0] == DASHBOARD_COLUMNS
+    assert "ИП Иванов" in parsed[2]
+    assert len(parsed) == 3  # шапка + 2 базы
+
+
 def test_find_result():
     history = [result(db="База 1"), result(db="База 2")]
     assert find_result(history, "База 2")["db_name"] == "База 2"
@@ -285,6 +325,10 @@ def test_dashboard_renders_master_and_detail():
     assert any("Сводный дашборд" in h for h in headers)
     subtitles = [s.value for s in at.subheader]
     assert any("Детализация по счетам" in s for s in subtitles)
+
+    # Кнопки выгрузки сводного дашборда (Excel + CSV)
+    assert at.download_button(key="btn_download_dashboard_excel")
+    assert at.download_button(key="btn_download_dashboard_csv")
 
     # До выбора строки — подсказка
     info_texts = [i.value for i in at.info]

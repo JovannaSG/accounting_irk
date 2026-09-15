@@ -61,6 +61,17 @@ def test_verify_tolerates_broken_hash(monkeypatch):
     assert not auth.verify("b", "любой")
 
 
+def test_verify_blocks_inactive_db_user(monkeypatch):
+    stored = auth.hash_password("пароль")
+    db_mod.upsert_user("ibox", "accountant", stored, [], active=True)
+    assert auth.verify("ibox", "пароль")
+
+    db_mod.upsert_user("iboff", "accountant", stored, [], active=False)
+    # Даже правильный пароль не пускает отключённого пользователя
+    assert not auth.verify("iboff", "пароль")
+    assert db_mod.get_user("iboff")["active"] is False
+
+
 # ── 3. Включение аутентификации ──
 
 def test_auth_enabled(monkeypatch):

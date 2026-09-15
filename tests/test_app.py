@@ -357,4 +357,179 @@ def test_batch_audit_loads_and_audits(tmp_path, monkeypatch):
             os.remove(json_path)
 
 
+# ── Панель управления пользователями (ТЗ §11, админ) ──
+
+def _seed_user(login: str, role: str, password: str,
+               urls=None, active: bool = True) -> None:
+    """Заводит пользователя прямо в БД (источник истины для входа). Сид нужно
+    делать ДО первого run(): auth_enabled() смотрит на содержимое БД."""
+    from core import auth as auth_mod
+    from core import db as db_mod
+
+    db_mod.upsert_user(
+        login, role, auth_mod.hash_password(password), urls or [], active=active
+    )
+
+
+def _login_as(at, login: str, password: str) -> None:
+    assert at.button(key="btn_login")
+    at.text_input(key="login_user").set_value(login)
+    at.text_input(key="login_pass").set_value(password)
+    at.button(key="btn_login").click()
+    at.run()
+
+
+def test_admin_sees_user_management_panel():
+    """Админ видит панель управления пользователями в сайдбаре."""
+    _seed_user("boss", "admin", "pw")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.run()
+    _login_as(at, "boss", "pw")
+    assert not at.exception
+    assert at.session_state["user_role"] == "admin"
+    assert at.sidebar.button(key="um_del_btn")
+    assert at.sidebar.text_input(key="um_add_login")
+
+
+def test_accountant_does_not_see_user_management_panel():
+    """Бухгалтер панели управления пользователями не видит."""
+    _seed_user("worker", "accountant", "p")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.run()
+    _login_as(at, "worker", "p")
+    assert not at.exception
+    assert at.session_state["user_role"] == "accountant"
+    assert not [b for b in at.sidebar.button if b.key == "um_del_btn"]
+    assert not [i for i in at.sidebar.text_input if i.key == "um_add_login"]
+
+
+def test_admin_adds_new_user_via_panel():
+    """Админ добавляет пользователя: пишется в БД, доступен для входа."""
+    from core import db as db_mod
+
+    _seed_user("boss", "admin", "pw")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.run()
+    _login_as(at, "boss", "pw")
+
+    at.sidebar.text_input(key="um_add_login").set_value("newbie")
+    at.sidebar.selectbox(key="um_add_role").set_value("accountant")
+    at.sidebar.text_input(key="um_add_pass").set_value("qq")
+    at.sidebar.text_input(key="um_add_pass2").set_value("qq")
+    at.sidebar.text_area(key="um_add_urls").set_value(
+        "https://msk1.1cfresh.com/a/ea/3418453"
+    )
+    at.sidebar.button(key="um_add_submit").click()
+    at.run()
+    assert not at.exception
+
+    row = db_mod.get_user("newbie")
+    assert row is not None
+    assert row["role"] == "accountant"
+    assert row["allowed_urls"] == ["https://msk1.1cfresh.com/a/ea/3418453"]
+    assert row["active"] is True
+
+
+def test_admin_edit_updates_role_urls_and_password():
+    """Админ редактирует пользователя: роль, базы и пароль."""
+    from core import auth as auth_mod
+    from core import db as db_mod
+
+    _seed_user(
+        "newbie", "accountant", "old",
+        urls=["https://msk1.1cfresh.com/a/ea/1"],
+    )
+    _seed_user("boss", "admin", "pw")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.run()
+    _login_as(at, "boss", "pw")
+
+    at.sidebar.selectbox(key="um_edit_sel").set_value("newbie")
+    at.run()
+    at.sidebar.selectbox(key="um_edit_role").set_value("admin")
+    at.sidebar.text_area(key="um_edit_urls").set_value(
+        "https://msk1.1cfresh.com/a/ea/2"
+    )
+    at.sidebar.text_input(key="um_edit_pass").set_value("newpass")
+    at.sidebar.text_input(key="um_edit_pass2").set_value("newpass")
+    at.sidebar.button(key="um_edit_submit").click()
+    at.run()
+    assert not at.exception
+
+    row = db_mod.get_user("newbie")
+    assert row["role"] == "admin"
+    assert row["allowed_urls"] == ["https://msk1.1cfresh.com/a/ea/2"]
+    assert row["active"] is True
+    assert auth_mod.verify("newbie", "newpass")
+    assert not auth_mod.verify("newbie", "old")
+
+
+def test_admin_cannot_delete_self():
+    """Удаление самого админа через панель заблокировано."""
+    from core import db as db_mod
+
+    _seed_user("boss", "admin", "pw")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.run()
+    _login_as(at, "boss", "pw")
+
+    at.sidebar.selectbox(key="um_del_sel").set_value("boss")
+    at.sidebar.checkbox(key="um_del_confirm").set_value(True)
+    at.sidebar.button(key="um_del_btn").click()
+    at.run()
+    assert any(
+        "Нельзя удалить собственную" in e.value for e in at.error
+    )
+    assert db_mod.get_user("boss") is not None
+
+
+def test_admin_cannot_remove_last_admin():
+    """Нельзя отключить/изменить роль последнего действующего админа."""
+    from core import db as db_mod
+
+    _seed_user("other", "accountant", "p")
+    _seed_user("boss", "admin", "pw")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.run()
+    _login_as(at, "boss", "pw")
+
+    # Снижаем роль единственного админа — заблокировано
+    at.sidebar.selectbox(key="um_edit_sel").set_value("boss")
+    at.run()
+    at.sidebar.selectbox(key="um_edit_role").set_value("accountant")
+    at.sidebar.button(key="um_edit_submit").click()
+    at.run()
+    assert any(
+        "последнего действующего администратора" in e.value for e in at.error
+    )
+    assert db_mod.get_user("boss")["role"] == "admin"
+
+    # И отключить себя нельзя
+    at.sidebar.checkbox(key="um_edit_active").set_value(False)
+    at.sidebar.button(key="um_edit_submit").click()
+    at.run()
+    assert any(
+        "Нельзя отключить собственную" in e.value for e in at.error
+    )
+
+
+def test_admin_deletes_other_user():
+    """Удаление другого пользователя через панель выполняется."""
+    from core import db as db_mod
+
+    _seed_user("victim", "accountant", "p")
+    _seed_user("boss", "admin", "pw")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.run()
+    _login_as(at, "boss", "pw")
+
+    at.sidebar.selectbox(key="um_del_sel").set_value("victim")
+    at.sidebar.checkbox(key="um_del_confirm").set_value(True)
+    at.sidebar.button(key="um_del_btn").click()
+    at.run()
+    assert not at.exception
+    assert db_mod.get_user("victim") is None
+    assert db_mod.get_user("boss") is not None
+
+
 

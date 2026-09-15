@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import io
+
 import pandas as pd
 
 # Столбцы мастер-таблицы (строго по образцу).
@@ -216,6 +218,25 @@ def build_dashboard_df(history: list[dict]) -> pd.DataFrame:
         return pd.DataFrame(columns=DASHBOARD_COLUMNS)
 
     return pd.DataFrame(rows, columns=DASHBOARD_COLUMNS)
+
+
+def dashboard_to_excel(df: pd.DataFrame, sheet_name: str = "Сводка") -> bytes:
+    """
+    Мастер-таблица дашборда в бинарном виде (XLSX) — колонки широкие, без индекса.
+    """
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    return buf.getvalue()
+
+
+def dashboard_to_csv(df: pd.DataFrame) -> bytes:
+    """
+    Мастер-таблица дашборда в CSV (utf-8-sig с BOM — кириллица открывается в Excel).
+    """
+
+    return df.to_csv(index=False).encode("utf-8-sig")
 
 
 def find_result(history: list[dict], db_name: str) -> dict | None:

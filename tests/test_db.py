@@ -365,3 +365,24 @@ def test_indexes_created(tmp_db):
     idx = {r[0] for r in cursor.fetchall()}
     conn.close()
     assert {"idx_audits_user", "idx_audits_source_url", "idx_audits_viewed_at"} <= idx
+
+
+# ── Управление пользователями ──
+
+def test_upsert_and_delete_user_roundtrip(tmp_db):
+    db_mod.upsert_user("ivanova", "accountant", "200000$aa$bb", [], active=True)
+    row = db_mod.get_user("ivanova")
+    assert row is not None
+    assert row["role"] == "accountant"
+    assert row["allowed_urls"] == []
+    assert row["active"] is True
+
+    assert db_mod.delete_user("ivanova") is True
+    assert db_mod.get_user("ivanova") is None
+    assert db_mod.delete_user("ivanova") is False
+
+
+def test_delete_user_lowercases_login(tmp_db):
+    db_mod.upsert_user("Boss", "admin", "200000$aa$bb", [], active=True)
+    assert db_mod.delete_user("boss") is True
+    assert db_mod.get_user("BOSS") is None

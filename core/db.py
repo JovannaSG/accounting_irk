@@ -263,6 +263,22 @@ def list_users() -> list[dict]:
     ]
 
 
+def delete_user(login: str) -> bool:
+    """
+    Удаляет пользователя из БД. Возвращает True, если запись существовала.
+    """
+
+    login = str(login).strip().lower()
+    init_db()
+    conn = sqlite3.connect(_DB_PATH, timeout=30.0)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM users WHERE login = ?", (login,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
 def _parse_urls(raw) -> list:
     try:
         parsed = json.loads(raw) if raw else []
