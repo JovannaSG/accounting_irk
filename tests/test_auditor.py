@@ -243,7 +243,8 @@ def test_expanded_balance_single_sided_subconto_no_flag():
 # ---------------- Свертка сальдо расчетов (60/62) ----------------
 def test_fold_settlement_negative_debit_to_credit():
     # 1C отдает свернутое сальдо 60.02 со знаком минус в дебете —
-    # разворачиваем в кредит, но красное сальдо флагаем по сохраненному минусу
+    # разворачиваем в кредит, но красное сальдо флагаем (строка помечена
+    # _is_folded) наравне с реальным минусом
     df = osv([
         ["2026-01-31", "60.02", "СТРОЙ ДОМ ООО", "AP", 0, 0, 0, 0, -20104.61, 0],
     ])
@@ -251,7 +252,7 @@ def test_fold_settlement_negative_debit_to_credit():
     row = auditor.balances[(auditor.balances["Счет"] == "60.02")]
     assert abs(float(row["КонецДебет"].iloc[0])) < 1e-6
     assert abs(float(row["КонецКредит"].iloc[0]) - 20104.61) < 1e-6
-    assert abs(float(row["КрасноДебет"].iloc[0]) + 20104.61) < 1e-6
+    assert bool(row["_is_folded"].iloc[0])
     errors = auditor.run_audit()
     red = [e for e in errors if "Красное сальдо" in e["title"]]
     assert any("субконто активно-пассивного счета" in e["title"] for e in red)
@@ -262,7 +263,7 @@ def test_fold_settlement_negative_debit_to_credit():
 
 def test_fold_settlement_negative_credit_to_debit():
     # Отрицательный кредит 60.01 (аванс поставщику) разворачивается в дебет,
-    # но исходный минус сохраняется и попадает в красное сальдо
+    # но исходный минус помечается и попадает в красное сальдо
     df = osv([
         ["2026-01-31", "60.01", "АО ЦВ ПРОТЕК", "AP", 0, 0, 0, 0, 0, -1553.91],
     ])
@@ -270,7 +271,7 @@ def test_fold_settlement_negative_credit_to_debit():
     row = auditor.balances[(auditor.balances["Счет"] == "60.01")]
     assert abs(float(row["КонецКредит"].iloc[0])) < 1e-6
     assert abs(float(row["КонецДебет"].iloc[0]) - 1553.91) < 1e-6
-    assert abs(float(row["КрасноКредит"].iloc[0]) + 1553.91) < 1e-6
+    assert bool(row["_is_folded"].iloc[0])
     errors = auditor.run_audit()
     red = [e for e in errors if "Красное сальдо" in e["title"]]
     assert any("субконто активно-пассивного счета" in e["title"] for e in red)
@@ -294,9 +295,8 @@ def test_fold_settlement_red_62_subaccounts():
     # субсчета 62.01/62.02 схлопнуты в 62 и просуммированы без сальдирования
     assert rows["Счет"].to_list() == ["62"]
     assert rows["Сумма"].to_list() == [13000.0]
-    # внутренние колонки сырого минуса не должны протекать в находку
-    assert "КрасноДебет" not in rows.columns
-    assert "КрасноКредит" not in rows.columns
+    # внутренний флаг свёртки не должен протекать в находку
+    assert "_is_folded" not in rows.columns
 
 
 def test_fold_settlement_red_multi_period():
@@ -317,6 +317,72 @@ def test_fold_settlement_red_multi_period():
     rows = ap_red[0]["data"]
     assert rows["Сумма"].to_list() == [88000.0]
     assert "с 28.02.2026" in rows["Комментарий"].iloc[0]
+
+
+def test_fold_settlement_not_double_counted_as_expanded():
+    # Свернутый минус (артефакт 1С) НЕ формирует «Развернутое сальдо»:
+    # красный остаток 62 флагается в 4.1, а фантомный кредит не входит в 4.2
+    df = osv([
+        ["2026-01-31", "62.01", "БОХАНСКИЙ РАЙОН ОКС", "AP", 0, 0, 0, 0, 597482.12, 0],
+        ["2026-01-31", "62.01", "БОХАНСКИЙ РАЙОН ОКС", "AP", 0, 0, 0, 0, -88000, 0],
+    ])
+    auditor = AutoAuditor1C(df)
+    errors = auditor.run_audit()
+    expanded = [e for e in errors if "Развернутое сальдо" in e["title"]]
+    assert not expanded
+    ap_red = [e for e in errors if "субконто активно-пассивного счета" in e["title"]]
+    assert len(ap_red) == 1
+    assert ap_red[0]["data"]["Сумма"].to_list() == [88000.0]
+
+
+def test_expanded_balance_real_still_flagged():
+    # Настоящее развернутое сальдо (без свёртки) продолжает флагаться
+    df = osv([
+        ["2026-01-31", "62.01", "АО ИСТОК", "AP", 0, 0, 0, 0, 5000, 0],
+        ["2026-01-31", "62.01", "АО ИСТОК", "AP", 0, 0, 0, 0, 0, 3000],
+    ])
+    auditor = AutoAuditor1C(df)
+    errors = auditor.run_audit()
+    expanded = [e for e in errors if "Развернутое сальдо по аналитике" in e["title"]]
+    assert len(expanded) == 1
+    assert (expanded[0]["data"]["Сумма"] > 0).all()
+
+
+def test_fold_settlement_not_advance_debt_phantom():
+    # Свернутые минусы по 62.01/62.02 (артефакт) не дают фантомный
+    # «аванс и долг одновременно», а становятся одним красным сальдо
+    df = osv([
+        ["2026-01-31", "62.01", "А+Б ИМПОРТ ООО", "AP", 0, 0, 0, 0, -9000, 0],
+        ["2026-01-31", "62.02", "А+Б ИМПОРТ ООО", "AP", 0, 0, 0, 0, 0, -9000],
+    ])
+    auditor = AutoAuditor1C(df)
+    errors = auditor.run_audit()
+    adv_debt = [
+        e for e in errors
+        if e["title"] == "Контрагенты: аванс и долг одновременно по разным счетам (ОСВ)"
+    ]
+    assert not adv_debt
+    ap_red = [e for e in errors if "субконто активно-пассивного счета" in e["title"]]
+    assert len(ap_red) == 1
+    assert ap_red[0]["data"]["Сумма"].to_list() == [18000.0]
+
+
+def test_settlement_advance_debt_real_pair_still_flagged():
+    # Настоящая пара «аванс и долг» (без свёртки) продолжает флагаться
+    df = osv([
+        ["2026-01-31", "60.01", "СпецТрансКомплект ООО", "AP", 0, 0, 0, 0, 12300, 0],
+        ["2026-01-31", "60.02", "СпецТрансКомплект ООО", "AP", 0, 0, 0, 0, 0, 5000],
+    ])
+    auditor = AutoAuditor1C(df)
+    errors = auditor.run_audit()
+    adv_debt = [
+        e for e in errors
+        if e["title"] == "Контрагенты: аванс и долг одновременно по разным счетам (ОСВ)"
+    ]
+    assert len(adv_debt) == 1
+    rows = adv_debt[0]["data"]
+    assert rows["Субконто"].to_list() == ["СпецТрансКомплект ООО"]
+    assert rows["Сумма"].to_list() == [17300.0]
 
 
 def test_fold_preserves_net_per_account():

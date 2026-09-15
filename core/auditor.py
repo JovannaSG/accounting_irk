@@ -282,10 +282,14 @@ def _fold_settlement_balances(df: pd.DataFrame) -> pd.DataFrame:
     аналитике со знаком минус (например, КонецДебет = -20104.61). Инвариант
     «Дебет − Кредит» по каждой строке сохраняется, обороты не затрагиваются.
 
-    Свернутые отрицательные остатки при этом НЕ теряются: исходный минус
-    фиксируется в колонках КрасноДебет / КрасноКредит (0.0, если минуса не было),
-    чтобы проверка «Красное сальдо» могла отличать реальное отрицательное сальдо
-    от обычной противоположной стороны развернутого остатка.
+    Исходный минус (реальное отрицательное сальдо) при этом НЕ теряется:
+    сроки, где произошла свёртка концевого остатка, помечаются флагом
+    `_is_folded`. Проверка «Красное сальдо» флагает такие строки как ошибку
+    (минус в ОСВ по активно-пассивному счету), а проверки «развернутого
+    сальдо» и контрагентских расчётов (4.2, 4.5) изолируют их, не превращая
+    свёрнутый минус в искусственную «противоположную сторону».
+    Флаг ставится только по КОНЦЕВЫМ остаткам: сворачивание стартового остатка
+    (Начало) не делает строку красной — важен остаток на конец периода.
     """
 
     mask = df["Счет"].map(account_group).isin(FOLD_SETTLEMENT_GROUPS)
@@ -300,14 +304,7 @@ def _fold_settlement_balances(df: pd.DataFrame) -> pd.DataFrame:
     for col in settle_balance_cols:
         df[col] = df[col].astype("float64")
 
-    df["КрасноДебет"] = 0.0
-    df["КрасноКредит"] = 0.0
-    if "КонецДебет" in df.columns:
-        neg_debit = mask & (df["КонецДебет"] < -EPS)
-        df.loc[neg_debit, "КрасноДебет"] = df.loc[neg_debit, "КонецДебет"]
-    if "КонецКредит" in df.columns:
-        neg_credit = mask & (df["КонецКредит"] < -EPS)
-        df.loc[neg_credit, "КрасноКредит"] = df.loc[neg_credit, "КонецКредит"]
+    df["_is_folded"] = False
 
     for debit_col, credit_col in (
         ("КонецДебет", "КонецКредит"),
@@ -316,11 +313,17 @@ def _fold_settlement_balances(df: pd.DataFrame) -> pd.DataFrame:
         if debit_col not in df.columns or credit_col not in df.columns:
             continue
         neg_debit = mask & (df[debit_col] < -EPS)
-        df.loc[neg_debit, credit_col] += -df.loc[neg_debit, debit_col]
-        df.loc[neg_debit, debit_col] = 0.0
+        if neg_debit.any():
+            if debit_col == "КонецДебет":
+                df.loc[neg_debit, "_is_folded"] = True
+            df.loc[neg_debit, credit_col] += -df.loc[neg_debit, debit_col]
+            df.loc[neg_debit, debit_col] = 0.0
         neg_credit = mask & (df[credit_col] < -EPS)
-        df.loc[neg_credit, debit_col] += -df.loc[neg_credit, credit_col]
-        df.loc[neg_credit, credit_col] = 0.0
+        if neg_credit.any():
+            if credit_col == "КонецКредит":
+                df.loc[neg_credit, "_is_folded"] = True
+            df.loc[neg_credit, debit_col] += -df.loc[neg_credit, credit_col]
+            df.loc[neg_credit, credit_col] = 0.0
     return df
 
 
@@ -375,7 +378,7 @@ def normalize_balances(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         raise ValueError("Файл ОСВ пуст")
 
-    return df[[c for c in [*OSV_COLUMNS, "КрасноДебет", "КрасноКредит"] if c in df.columns]]
+    return df[[c for c in [*OSV_COLUMNS, "_is_folded"] if c in df.columns]]
 
 
 def normalize_documents(df: pd.DataFrame) -> pd.DataFrame:
@@ -675,24 +678,21 @@ class AutoAuditor1C:
 
         # 3. Активно-пассивные счета (АП): флагаем только реальные минусы
         # в колонках ОСВ (КонецДебет < 0 или КонецКредит < 0). Для счетов 60/62
-        # минусы переносятся сверткой на противоположную сторону, поэтому их
-        # исходные значения сохранены в КрасноДебет / КрасноКредит и флагаются
-        # здесь наравне с явными минусами других АП-счетов (73, 76, 84...).
-        # Положительные остатки, висящие на стороне, противоположной итогу
-        # счета, — это обычное развернутое сальдо, а не красное.
+        # минусы переносятся сверткой на противоположную сторону, поэтому такие
+        # строки помечены флагом _is_folded и флагаются здесь наравне с явными
+        # минусами других АП-счетов (73, 76, 84...). Положительные остатки,
+        # висящие на стороне, противоположной итогу счета, — это обычное
+        # развернутое сальдо, а не красное.
         ap = b[b["Тип"] == "AP"].copy()
         if not ap.empty:
-            red_debit = (
-                ap["КрасноДебет"] if "КрасноДебет" in ap.columns else ap["КонецДебет"]
-            )
-            red_credit = (
-                ap["КрасноКредит"] if "КрасноКредит" in ap.columns else ap["КонецКредит"]
-            )
             mask_ap_negative = (
                 (ap["КонецДебет"] < -EPS)
                 | (ap["КонецКредит"] < -EPS)
-                | (red_debit < -EPS)
-                | (red_credit < -EPS)
+                | (
+                    ap["_is_folded"].astype(bool)
+                    if "_is_folded" in ap.columns
+                    else False
+                )
             )
             ap_negative = self._annotate_since(
                 ap, mask_ap_negative,
@@ -701,7 +701,7 @@ class AutoAuditor1C:
             )
             if not ap_negative.empty:
                 ap_negative = ap_negative.drop(
-                    columns=["КрасноДебет", "КрасноКредит"], errors="ignore"
+                    columns=["_is_folded"], errors="ignore"
                 )
                 self._add(
                     "error",
@@ -715,7 +715,13 @@ class AutoAuditor1C:
         # одновременно дебетовые и кредитовые остатки (по разным договорам).
         # После свертки 1C отдельные строки односторонние, поэтому ищем группы
         # (Счет, Организация, Субконто), где есть и дебетовая, и кредитовая строка.
-        analytical = b[b["Субконто"] != "-"]
+        # Строки, помеченные _is_folded (свернутый отрицательный остаток 60/62),
+        # изолируем: их «противоположная сторона» — артефакт, это красное сальдо,
+        # а не развернутое.
+        valid_mask = b["Субконто"] != "-"
+        if "_is_folded" in b.columns:
+            valid_mask = valid_mask & (~b["_is_folded"].astype(bool))
+        analytical = b[valid_mask]
         if analytical.empty:
             return
 
@@ -1102,10 +1108,16 @@ class AutoAuditor1C:
 
     def _check_settlement_advance_vs_debt(self) -> None:
         b = self.balances
-        sett = b[
-            (b["Счет"].map(account_group).isin(SETTLEMENT_GROUPS))
+        # Свернутые отрицательные остатки 60/62 (флаг _is_folded) — это красное
+        # сальдо, а не настоящий аванс/долг: исключаем их, чтобы не создавать
+        # фантомные пары «долг и аванс на разных счетах».
+        valid_mask = (
+            b["Счет"].map(account_group).isin(SETTLEMENT_GROUPS)
             & (b["Субконто"] != "-")
-        ]
+        )
+        if "_is_folded" in b.columns:
+            valid_mask = valid_mask & (~b["_is_folded"].astype(bool))
+        sett = b[valid_mask]
         rows: list = []
 
         # Группируем не только по Субконто (контрагенту), но и по ДОГОВОРУ:
@@ -1168,8 +1180,15 @@ class AutoAuditor1C:
         self._check_settlement_advance_vs_debt()
 
         if self.documents is None:
-            sett = self.balances[self.balances["Счет"].map(account_group).isin(SETTLEMENT_GROUPS)]
-            dup = sett[(sett["Субконто"] != "-") & (sett["КонецДебет"] > 0) & (sett["КонецКредит"] > 0)].copy()
+            b = self.balances
+            valid_mask = (
+                b["Счет"].map(account_group).isin(SETTLEMENT_GROUPS)
+                & (b["Субконто"] != "-")
+            )
+            if "_is_folded" in b.columns:
+                valid_mask = valid_mask & (~b["_is_folded"].astype(bool))
+            sett = b[valid_mask]
+            dup = sett[(sett["КонецДебет"] > 0) & (sett["КонецКредит"] > 0)].copy()
             dup["Комментарий"] = "Возможные незакрытые расчеты: аванс и долг по одному контрагенту"
             self._add("warning", "Контрагенты: развернутое сальдо на счетах расчетов (без реестра документов)", dup)
             return
