@@ -15,7 +15,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY core ./core
 COPY app ./app
-COPY data ./data
 
 EXPOSE 8501
 

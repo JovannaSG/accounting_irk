@@ -21,9 +21,9 @@ APP = "app/ui.py"
 
 
 def _sample_bytes(name: str) -> bytes:
-    """Читает файл из data/ для загрузки через file_uploader (AppTest)."""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    with open(os.path.join(root, "data", name), "rb") as f:
+    """Читает файл из tests/fixtures/ для загрузки через file_uploader (AppTest)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", name)
+    with open(path, "rb") as f:
         return f.read()
 
 

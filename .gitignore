@@ -5,7 +5,6 @@ __pycache__/
 *.egg-info/
 login_data.txt
 scratch/
-data/examples/
 .app.lock
 audit_history.db
 .ruff_cache
@@ -13,7 +12,6 @@ client_databases.json
 users.json
 t.py
 .opencode
-data/
 login_data_for_users.txt
 
 /*.xls

@@ -650,12 +650,87 @@ class AutoAuditor1C:
         if b.empty:
             return
 
+        # Красное сальдо определяется по состоянию НА КОНЕЦ аудируемого диапазона:
+        # группа (Организация, Счет, Субконто, Договор) флагается, только если на
+        # её последнем периоде в диапазоне есть отрицательный остаток. Минусы,
+        # закрытые внутри периода, из отчета за весь период уходят — их видно
+        # в помесячном режиме, где границей является конец каждого месяца.
+        # «Последний период по группе» (а не глобальный максимум даты): если после
+        # ухода в минус по группе не было движений, сальдо и сейчас красное.
+        # Если период не распознан (NaN) — берутся все строки группы (один период).
+        key_cols = ["Организация", "Счет", "Субконто", "Договор"]
+
+        pkey = period_sort_series(b["Период"])
+        group_max = (
+            b.assign(_pkey=pkey)
+            .groupby(key_cols, dropna=False)["_pkey"]
+            .transform("max")
+        )
+        unparsed_period = pd.isna(group_max)
+        end_rows = b[unparsed_period | (pkey == group_max)]
+
+        net_end = end_rows["КонецДебет"] - end_rows["КонецКредит"]
+
+        # Множества групп, красных на конец периода, по каждому типу маски.
+        def _end_keys(frame: pd.DataFrame, mask: pd.Series) -> set[tuple]:
+            if not mask.any():
+                return set()
+            return set(
+                map(
+                    tuple,
+                    frame.loc[mask, key_cols].itertuples(index=False, name=None),
+                )
+            )
+
+        active_end_keys = _end_keys(
+            end_rows,
+            (end_rows["Тип"] == "A")
+            & (
+                (net_end < -EPS)
+                | (end_rows["КонецДебет"] < -EPS)
+                | (end_rows["КонецКредит"] < -EPS)
+            ),
+        )
+        passive_end_keys = _end_keys(
+            end_rows,
+            (end_rows["Тип"] == "P")
+            & (
+                (net_end > EPS)
+                | (end_rows["КонецДебет"] < -EPS)
+                | (end_rows["КонецКредит"] < -EPS)
+            ),
+        )
+        ap_end = end_rows[end_rows["Тип"] == "AP"]
+        if ap_end.empty:
+            ap_end_keys: set[tuple] = set()
+        else:
+            ap_end_keys = _end_keys(
+                ap_end,
+                (ap_end["КонецДебет"] < -EPS)
+                | (ap_end["КонецКредит"] < -EPS)
+                | (
+                    ap_end["_is_folded"].astype(bool)
+                    if "_is_folded" in ap_end.columns
+                    else False
+                ),
+            )
+
+        def _key_mask(keys: set[tuple]) -> pd.Series:
+            if not keys:
+                return pd.Series(False, index=b.index)
+            key = pd.Series(
+                list(zip(b["Организация"], b["Счет"], b["Субконто"], b["Договор"])),
+                index=b.index,
+            )
+            return key.isin(keys)
+
         net = b["КонецДебет"] - b["КонецКредит"]
 
         # 1. Активные счета с кредитовым сальдо ИЛИ любыми явными минусами
         mask_active = (b["Тип"] == "A") & (
             (net < -EPS) | (b["КонецДебет"] < -EPS) | (b["КонецКредит"] < -EPS)
         )
+        mask_active &= _key_mask(active_end_keys)
         active = self._annotate_since(
             b, mask_active,
             "Активный счет имеет кредитовое (отрицательное) сальдо",
@@ -668,6 +743,7 @@ class AutoAuditor1C:
         mask_passive = (b["Тип"] == "P") & (
             (net > EPS) | (b["КонецДебет"] < -EPS) | (b["КонецКредит"] < -EPS)
         )
+        mask_passive &= _key_mask(passive_end_keys)
         passive = self._annotate_since(
             b, mask_passive,
             "Пассивный счет имеет дебетовое (отрицательное) сальдо",
@@ -694,6 +770,7 @@ class AutoAuditor1C:
                     else False
                 )
             )
+            mask_ap_negative &= _key_mask(ap_end_keys)
             ap_negative = self._annotate_since(
                 ap, mask_ap_negative,
                 "Активно-пассивный счет имеет явный отрицательный остаток (минус в ОСВ)",

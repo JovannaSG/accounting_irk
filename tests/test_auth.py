@@ -94,3 +94,47 @@ def test_cli_hash_prints_storable_hash(capsys):
 def test_cli_usage_error(capsys):
     assert auth.main([]) == 2
     assert auth.main(["hash"]) == 2
+
+
+# ── 5. Нормализация URL баз ──
+
+def test_normalize_url_basics():
+    assert auth._normalize_url(None) == ""
+    assert auth._normalize_url("") == ""
+    assert auth._normalize_url("  ") == ""
+    assert auth._normalize_url("https://a.example") == "https://a.example/"
+    assert auth._normalize_url("https://a.example/") == "https://a.example/"
+
+
+def test_normalize_url_case_host_scheme():
+    assert (
+        auth._normalize_url("HTTPS://Msk1.1cFresh.com/a/ea/3418453")
+        == "https://msk1.1cfresh.com/a/ea/3418453"
+    )
+
+
+def test_normalize_url_strips_trailing_en_segment():
+    # /en — английская версия интерфейса 1С:Фреш, а не часть адреса базы:
+    # OData по такому URL данные не отдаёт, обе записи — одна база.
+    assert (
+        auth._normalize_url("https://1cfresh.com/a/ea/452786/en")
+        == "https://1cfresh.com/a/ea/452786"
+    )
+    assert (
+        auth._normalize_url(
+            "https://msk1.1cfresh.com/a/ea/3418453/en"
+        )
+        == "https://msk1.1cfresh.com/a/ea/3418453"
+    )
+    assert (
+        auth._normalize_url("https://1cfresh.com/a/ea/452786/en/")
+        == "https://1cfresh.com/a/ea/452786"
+    )
+
+
+def test_normalize_url_keeps_en_internal_segment():
+    # Сегмент /en не в конце пути — не трогаем (это не суффикс интерфейса).
+    assert (
+        auth._normalize_url("https://host/en/bases/1")
+        == "https://host/en/bases/1"
+    )

@@ -151,9 +151,74 @@ def test_red_balance_period_of_occurrence():
     assert "отрицательное сальдо с 28.02.2026" in red[0]["data"].iloc[0]["Комментарий"]
 
 
+def test_red_balance_resolved_within_period_not_flagged():
+    # Минус был только в январе и закрыт к концу диапазона: за весь период
+    # красное сальдо не флагается (его видно в помесячном режиме).
+    df = osv([
+        ["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 5000],       # красное в январе
+        ["2026-02-28", "50", "Касса", "A", 0, 5000, 0, 5000, 5000, 0], # февраль в норме
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance"})
+    errors = auditor.run_audit()
+    assert not [e for e in errors if "Красное сальдо" in e["title"]]
+
+
+def test_red_balance_folded_settlement_resolved_by_end_not_flagged():
+    # Свернутый минус 60.02 (артефакт 1С) был в начале периода и закрыт к концу:
+    # последняя строка ОСВ по группе не красная — находки нет.
+    df = osv([
+        ["2026-01-31", "60.02", "ВИТИМ АО", "AP", 0, 0, 0, 0, -23277.59, 0],
+        ["2026-02-28", "60.02", "ВИТИМ АО", "AP", 0, 0, 0, 0, -18799.82, 0],
+        ["2026-03-31", "60.02", "ВИТИМ АО", "AP", 0, 0, 0, 0, 0, 0],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance"})
+    errors = auditor.run_audit()
+    ap_red = [
+        e for e in errors
+        if "субконто активно-пассивного счета" in e["title"]
+    ]
+    assert not ap_red
+
+
+def test_red_balance_current_with_first_occurrence_comment():
+    # Красное длится с января по февраль (конец диапазона): одна находка,
+    # строка — последний период, комментарий указывает первое появление.
+    df = osv([
+        ["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 5000],
+        ["2026-02-28", "50", "Касса", "A", 0, 5000, 0, 0, 0, 5000],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance"})
+    errors = auditor.run_audit()
+    red = [e for e in errors if "Красное сальдо" in e["title"]]
+    assert len(red) == 1
+    rows = red[0]["data"]
+    assert len(rows) == 1
+    assert list(rows["Период"]) == ["2026-02-28"]
+    assert red[0]["amount"] == pytest.approx(5000)
+    assert "с 31.01.2026" in rows["Комментарий"].iloc[0]
+
+
+def test_red_balance_no_later_rows_kept_as_current():
+    # После января по группе больше строк нет (не было движений), хотя глобальный
+    # максимум даты — февраль (другой счет): последняя строка группы красная,
+    # сальдо не изменилось — обязаны флагать.
+    df = osv([
+        ["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 5000],
+        ["2026-02-28", "51", "Расчетный", "A", 0, 0, 0, 0, 100, 0],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance"})
+    errors = auditor.run_audit()
+    red = [e for e in errors if "Красное сальдо" in e["title"]]
+    assert len(red) == 1
+    rows = red[0]["data"]
+    assert list(rows["Счет"]) == ["50"]
+    assert list(rows["Период"]) == ["2026-01-31"]
+    assert red[0]["amount"] == pytest.approx(5000)
+
+
 def test_red_balance_negative_debit_ap_catches_real_73_xls():
     from core.loaders import load_osv_file
-    with open("data/73.xls", "rb") as f:
+    with open("tests/fixtures/73.xls", "rb") as f:
         data = f.read()
     df, _ = load_osv_file("73.xls", data)
     auditor = AutoAuditor1C(df, closing_accounts=["90"], checks={"red_balance"})
@@ -178,7 +243,7 @@ def test_red_balance_negative_credit_active_flagged():
 
 def test_red_balance_negative_debit_19_xls():
     from core.loaders import load_osv_file
-    with open("data/Оборотно-сальдовая ведомость по счету 19 за 1-st half year of 2026.xls", "rb") as f:
+    with open("tests/fixtures/Оборотно-сальдовая ведомость по счету 19 за 1-st half year of 2026.xls", "rb") as f:
         data = f.read()
     df, _ = load_osv_file("19.xls", data)
     auditor = AutoAuditor1C(df, closing_accounts=["90"], checks={"red_balance"})
@@ -1151,7 +1216,7 @@ def test_top_findings_sorted_by_amount():
 
 
 def test_normalize_balances_keeps_zero_string_account():
-    df = pd.read_csv("data/sample_data.csv", dtype=str)
+    df = pd.read_csv("tests/fixtures/sample_data.csv", dtype=str)
     norm = normalize_balances(df)
     assert "000" in set(norm["Счет"])
     assert set(norm["Тип"]) <= {"A", "P", "AP"}

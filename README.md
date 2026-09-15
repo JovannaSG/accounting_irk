@@ -273,9 +273,10 @@ pytest
 
 Ядро проверок (`core/auditor.py`) и загрузчики (`core/loaders.py`) не зависят от Streamlit
 и покрыты тестами (`tests/`), включая реальные выгрузки 1С
-(`tests/fixtures/osv_real.xls` — ОСВ по БУ, `tests/fixtures/osv_indicators.xls` — ОСВ с БУ/НУ/БУ-НУ).
+(`tests/fixtures/osv_real.xls` — ОСВ по БУ, `tests/fixtures/osv_indicators.xls` — ОСВ с БУ/НУ/БУ-НУ,
+`tests/fixtures/73.xls` и `tests/fixtures/Оборотно-сальдовая ведомость по счету 19….xls` — ОСВ по конкретным счетам).
 Структура: `core/` — ядро аудита, `app/` — приложение (Streamlit UI + лаунчер `run.py`),
-`data/` — тестовые данные, `tests/` — тесты.
+`tests/` — тесты с фикстурами в `tests/fixtures/` (реальные выгрузки 1С и примеры для загрузчика).
 
 ## История
 
