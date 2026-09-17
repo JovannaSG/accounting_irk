@@ -386,3 +386,29 @@ def test_delete_user_lowercases_login(tmp_db):
     db_mod.upsert_user("Boss", "admin", "200000$aa$bb", [], active=True)
     assert db_mod.delete_user("boss") is True
     assert db_mod.get_user("BOSS") is None
+
+
+# ── Порядок истории: сортировка по настоящей дате, а не лексикографически ──
+
+def test_history_sorted_by_real_datetime(tmp_db):
+    r_dec = _sample_result("ord-dec")
+    r_dec["viewed_at"] = "25.12.2025 10:00"
+    r_jan = _sample_result("ord-jan")
+    r_jan["viewed_at"] = "02.01.2026 10:00"
+    db_mod.save_audit_log(r_dec)
+    db_mod.save_audit_log(r_jan)
+
+    history = db_mod.load_audit_history()
+    assert [h["audit_id"] for h in history] == ["ord-dec", "ord-jan"]
+
+
+def test_history_sorts_iso_and_legacy_mixed(tmp_db):
+    r_legacy = _sample_result("iso-legacy")
+    r_legacy["viewed_at"] = "02.01.2026 10:00"
+    r_iso = _sample_result("iso-new")
+    r_iso["viewed_at"] = "2026-01-15 09:30:00"
+    db_mod.save_audit_log(r_legacy)
+    db_mod.save_audit_log(r_iso)
+
+    history = db_mod.load_audit_history()
+    assert [h["audit_id"] for h in history] == ["iso-legacy", "iso-new"]

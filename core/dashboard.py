@@ -262,3 +262,42 @@ def find_result(history: list[dict], db_name: str) -> dict | None:
         idx += 1
 
     return None
+
+
+def find_result_safe(
+    history: list[dict],
+    target_base: str,
+    target_period: str | None = None
+) -> dict | None:
+    """
+    Безопасный поиск результата аудита по Базе и Периоду.
+    Возвращает последнее (свежее) совпадение (LIFO).
+    Учитывает период в имени и числовой префикс «12;ИП Иванов».
+    """
+
+    i: int = len(history) - 1
+
+    while i >= 0:
+        res = history[i]
+        entry_base = str(res.get("db_name") or "")
+        _, clean_base = split_base_number(entry_base)
+        period = str(res.get("period") or "").strip()
+
+        candidates = {entry_base}
+        if clean_base:
+            candidates.add(clean_base)
+        if period:
+            candidates.add(f"{entry_base} ({period})")
+            if clean_base:
+                candidates.add(f"{clean_base} ({period})")
+
+        if target_base in candidates:
+            if target_period is not None and target_period != "—":
+                if period == target_period:
+                    return res
+            else:
+                return res
+
+        i -= 1
+
+    return None

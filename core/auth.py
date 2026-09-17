@@ -58,6 +58,8 @@ def _normalize_url(url: object) -> str:
         host, _, tail = rest.partition("/")
         if tail.endswith("/en"):
             tail = tail[:-3]
+        elif tail == "en":
+            tail = ""
         return f"{scheme.lower()}://{host.lower()}/{tail}"
     return s.lower()
 

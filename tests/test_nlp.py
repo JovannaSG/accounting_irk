@@ -183,3 +183,23 @@ def test_auditor_without_documents_no_nlp(minimal_osv):
 def test_recommendations_present():
     from core.auditor import RECOMMENDATIONS
     assert NLP_TITLE in RECOMMENDATIONS
+
+
+def test_safe_amount_guards_none_and_nan():
+    """None/NaN в сумме не ломают экспорт (0.0 вместо исключения)."""
+    from core.nlp import _safe_amount
+    assert _safe_amount(None) == 0.0
+    assert _safe_amount(float("nan")) == 0.0
+    assert _safe_amount("") == 0.0
+    assert _safe_amount(1500.5) == 1500.5
+
+
+def test_detection_tolerates_nan_amount():
+    df = docs([
+        ["2026-01-10", "Платеж №1", "ООО Тень", "60.01", "оплата", None, "Обнал по чеку"],
+        ["2026-01-11", "Платеж №2", "ООО Свет", "60.01", "оплата", float("nan"), "Обнал"],
+    ])
+    res = detect_payment_risks(df)
+    assert len(res) == 2
+    assert res["Сумма"].isna().sum() == 0
+    assert (res["Сумма"] == 0.0).all()

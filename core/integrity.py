@@ -53,7 +53,8 @@ def check_bookkeeping_identity(df: pd.DataFrame) -> list[str]:
     # больше чем на 1 рубль (ошибка округления) — колонки, скорее всего, сдвинуты
     active_rows = df[(df[required_cols] > 0).any(axis=1)]
     if not active_rows.empty:
-        violation_rate = (diff > 1.0).sum() / len(active_rows)
+        active_diff = diff[active_rows.index]
+        violation_rate = (active_diff > 1.0).sum() / len(active_rows)
         if violation_rate > 0.1:  # порог 10%
             warnings.append(WARN_COLUMN_SHIFT)
 

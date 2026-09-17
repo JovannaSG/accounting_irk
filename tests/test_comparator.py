@@ -165,3 +165,19 @@ def test_duplicate_rows_within_frame():
     assert len(result["resolved"]) == 2
     assert result["new"].iloc[0]["Счет"] == "60.01"
     assert result["pending"].empty
+
+
+def test_period_distinguishes_otherwise_identical_rows():
+    """Тот же счёт/контрагент в разных периодах — разные записи, а не «без изменений»."""
+    old = _df([{
+        "Проверка": "Красное сальдо", "Уровень": "error", "Период": "2026-01-31",
+        "Счет": "51", "Субконто": "-", "Сумма": 100.0, "Комментарий": "",
+    }])
+    new = _df([{
+        "Проверка": "Красное сальдо", "Уровень": "error", "Период": "2026-02-28",
+        "Счет": "51", "Субконто": "-", "Сумма": 100.0, "Комментарий": "",
+    }])
+    result = compare_audits(old, new)
+    assert result["pending"].empty
+    assert len(result["resolved"]) == 1
+    assert len(result["new"]) == 1

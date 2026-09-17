@@ -138,3 +138,13 @@ def test_normalize_url_keeps_en_internal_segment():
         auth._normalize_url("https://host/en/bases/1")
         == "https://host/en/bases/1"
     )
+
+
+def test_normalize_url_strips_host_level_en():
+    """URL вида scheme://host/en (путь = ровно «en») — тоже не часть базы."""
+    assert auth._normalize_url("https://a.example/en") == "https://a.example/"
+    assert auth._normalize_url("https://a.example/en/") == "https://a.example/"
+    assert (
+        auth._normalize_url("HTTPS://Msk1.1cFresh.com/en")
+        == "https://msk1.1cfresh.com/"
+    )

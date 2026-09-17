@@ -25,6 +25,7 @@ from core.integrity import validate_osv_integrity
 
 ACCOUNT_CODE_RE = re.compile(r"^[0-9]+(?:\.[A-Za-zА-Яа-я0-9]+)*$")
 TOTAL_KEYWORDS: tuple = ("total", "итого", "всего", "итог", "итого по")
+_TOTAL_PATTERN = re.compile(r"^(итого|total)\b")
 
 # Значения колонки «Показатели» в ОСВ, выведенной по БУ/НУ/БУ-НУ.
 # Из такой ведомости аудит использует только строки БУ; НУ/БУ-НУ и Вал.
@@ -371,7 +372,7 @@ def extract_osv(
         if not c0 and not c1:
             continue
         low = c0.lower()
-        if low.startswith(TOTAL_KEYWORDS):
+        if _TOTAL_PATTERN.match(low):
             continue
         if indicator_mode:
             ind = row[2] if len(row) > 2 else None
@@ -487,9 +488,12 @@ def _attach_integrity(df: pd.DataFrame, info: dict, db_name: str, source_type: s
 def _decode_csv(data: bytes) -> pd.DataFrame:
     for enc in ("utf-8-sig", "cp1251"):
         try:
-            return pd.read_csv(io.BytesIO(data), dtype=str, encoding=enc)
+            df = pd.read_csv(io.BytesIO(data), dtype=str, encoding=enc)
         except UnicodeDecodeError:
             continue
+        if len(df.columns) == 1 and ";" in str(df.columns[0]):
+            df = pd.read_csv(io.BytesIO(data), dtype=str, encoding=enc, sep=";")
+        return df
     raise ValueError("Не удалось определить кодировку CSV-файла")
 
 

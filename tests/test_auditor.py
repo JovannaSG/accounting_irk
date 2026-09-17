@@ -230,18 +230,22 @@ def test_red_balance_negative_debit_ap_catches_real_73_xls():
     assert red[0]["level"] == "error"
 
 
-def test_red_balance_negative_credit_active_flagged():
+def test_red_balance_negative_credit_active_not_flagged_when_parent_positive():
+    # Минус в колонке ОСВ (КК = -100) не флагается, если итог родительского
+    # счёта положительный (Фикс 2): у 51 нетто = +100, счёт не красный.
     df = osv([
         ["2026-01-31", "51", "Расчетный", "A", 0, 0, 0, 0, 0, -100],
     ])
     auditor = AutoAuditor1C(df, checks={"red_balance"})
     auditor.run_audit()
-    red = [e for e in auditor.errors if "Красное сальдо" in e.title]
-    assert len(red) == 1
-    assert red[0]["level"] == "error"
+    assert not [e for e in auditor.errors if "Красное сальдо" in e.title]
 
 
-def test_red_balance_negative_debit_19_xls():
+def test_red_balance_negative_debit_19_xls_not_flagged_when_parent_positive():
+    # Реальный файл: счёт 19 в целом положительный, негативные строки один.
+    # аналитики (переплата НДС по отдельным поставщикам) — развёрнутое
+    # сальдо внутри счёта (Фикс 2): минус по активной аналитике при
+    # не-красном итоге счёта не флагается.
     from core.loaders import load_osv_file
     with open("tests/fixtures/Оборотно-сальдовая ведомость по счету 19 за 1-st half year of 2026.xls", "rb") as f:
         data = f.read()
@@ -249,12 +253,181 @@ def test_red_balance_negative_debit_19_xls():
     auditor = AutoAuditor1C(df, closing_accounts=["90"], checks={"red_balance"})
     auditor.run_audit()
     red = [e for e in auditor.errors if "Красное сальдо" in e.title]
-    assert len(red) >= 1
-    accounts = sorted(set(red[0]["data"]["Счет"]))
-    assert "19" in accounts
-    assert red[0]["level"] == "error"
-    rows = red[0]["data"]
-    assert len(rows) >= 6
+    assert not red
+
+
+def test_red_balance_active_positive_parent_not_flagged():
+    # Минус в одной группе активного счёта при плюсе в другой: итог по счёту
+    # положительный — развёрнутое сальдо, не флагаем (Фикс 2).
+    df = osv([
+        ["2026-01-31", "19.03", "АЛЬФА ООО", "A", 0, 0, 0, 0, -5000, 0],
+        ["2026-01-31", "19.03", "БЕТА ООО", "A", 0, 0, 0, 0, 20000, 0],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance"})
+    auditor.run_audit()
+    assert not [e for e in auditor.errors if "Красное сальдо" in e.title]
+
+
+def test_red_balance_active_zero_parent_not_flagged():
+    # Копеечный минус при обнулении счёта (артефакт «распила» аналитики
+    # между строкой с договором и без): итог по счёту 0 — не красный.
+    df = osv([
+        ["2026-01-31", "19.05", "ФТС ДОГОВОР", "A", 0, 0, 0, 0, -0.07, 0],
+        ["2026-01-31", "19.05", "ФТС БЕЗ ДОГОВОРА", "A", 0, 0, 0, 0, 0.07, 0],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance"})
+    auditor.run_audit()
+    assert not [e for e in auditor.errors if "Красное сальдо" in e.title]
+
+
+def test_red_balance_active_parent_red_all_groups_flagged():
+    # Итог по счёту красный — флагаются все красные группы (обе).
+    df = osv([
+        ["2026-01-31", "50", "Касса A", "A", 0, 0, 0, 0, 0, 5000],
+        ["2026-01-31", "50", "Касса B", "A", 0, 0, 0, 0, 0, 3000],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance"})
+    auditor.run_audit()
+    red = [e for e in auditor.errors if "Красное сальдо" in e.title]
+    assert len(red) == 1
+    assert len(red[0]["data"]) == 2
+    assert set(red[0]["data"]["Счет"]) == {"50"}
+
+
+def test_red_balance_active_single_negative_parent_flagged():
+    # Единственная группа счёта — итог счёта красный, флагается.
+    df = osv([
+        ["2026-01-31", "57", "Основной", "A", 0, 0, 747910.10, 786029.72, 0, 38119.62],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance"})
+    auditor.run_audit()
+    red = [e for e in auditor.errors if "Красное сальдо" in e.title]
+    assert len(red) == 1
+    assert "57" in set(red[0]["data"]["Счет"])
+
+
+def test_red_balance_active_mixed_parents_only_red_parent_flagged():
+    # Два родителя: 19 в плюсе (не флагаем), 50 в минусе (флагаем).
+    df = osv([
+        ["2026-01-31", "19.03", "АЛЬФА ООО", "A", 0, 0, 0, 0, -5000, 0],
+        ["2026-01-31", "19.04", "БЕТА ООО", "A", 0, 0, 0, 0, 20000, 0],
+        ["2026-01-31", "50", "Касса", "A", 0, 0, 0, 0, 0, 1000],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance"})
+    auditor.run_audit()
+    red = [e for e in auditor.errors if "Красное сальдо" in e.title]
+    assert len(red) == 1
+    assert set(red[0]["data"]["Счет"]) == {"50"}
+
+
+# ---------------- 4.7 Внутренняя пересортица по аналитике активного счета ----------------
+def test_internal_mismatch_positive_parent_warning():
+    # Минус по аналитике при положительном итоге счета (БЗК NOVAYA-паттерн):
+    # warning 4.7, ошибки «Красное сальдо» нет, сумма = модуль минуса.
+    df = osv([
+        ["2026-01-31", "19.04", "ИРКУТСКЭНЕРГОСБЫТ ООО", "A", 0, 0, 0, 0, -299131.20, 0],
+        ["2026-01-31", "19.04", "ИРКУТСКИЙ ЦСМ ФБУ", "A", 0, 0, 0, 0, 3000000, 0],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance", "active_internal_mismatch"})
+    auditor.run_audit()
+    red = [e for e in auditor.errors if "Красное сальдо" in e.title]
+    assert not red
+    mis = [e for e in auditor.errors if "Внутренняя пересортица" in e.title]
+    assert len(mis) == 1
+    assert mis[0]["level"] == "warning"
+    assert len(mis[0]["data"]) == 1
+    assert set(mis[0]["data"]["Счет"]) == {"19"}
+    assert mis[0]["amount"] == pytest.approx(299131.20)
+
+
+def test_internal_mismatch_zero_parent_warning():
+    # Копеечный артефакт «распила» аналитики при обнуленном счете (ФТС -0,07):
+    # итог 19 = 0 — не красный, флагаем warning.
+    df = osv([
+        ["2026-01-31", "19.05", "ФТС ДОГОВОР", "A", 0, 0, 0, 0, -0.07, 0],
+        ["2026-01-31", "19.05", "ФТС БЕЗ ДОГОВОРА", "A", 0, 0, 0, 0, 0.07, 0],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance", "active_internal_mismatch"})
+    auditor.run_audit()
+    assert not [e for e in auditor.errors if "Красное сальдо" in e.title]
+    mis = [e for e in auditor.errors if "Внутренняя пересортица" in e.title]
+    assert len(mis) == 1
+    assert mis[0]["level"] == "warning"
+
+
+def test_internal_mismatch_negative_parent_no_warning():
+    # Итог счета красный (58 Подпругина): только ошибка 4.1, без двойного warning 4.7.
+    df = osv([
+        ["2026-01-31", "58.03", "Подпругина", "A", 0, 0, 0, 0, 0, 200000],
+        ["2026-01-31", "58.03", "Другое", "A", 0, 0, 0, 0, 100000, 0],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance", "active_internal_mismatch"})
+    auditor.run_audit()
+    red = [e for e in auditor.errors if "Красное сальдо" in e.title]
+    assert len(red) == 1
+    assert not [e for e in auditor.errors if "Внутренняя пересортица" in e.title]
+
+
+def test_internal_mismatch_passive_excluded():
+    # Пассивный счет (66, -1,80) не попадает в 4.7 — фильтр только «Тип» = A.
+    df = osv([
+        ["2026-01-31", "66", "Тонирование", "P", 0, 0, 0, 0, 0, -1.80],
+    ])
+    auditor = AutoAuditor1C(df, checks={"active_internal_mismatch"})
+    auditor.run_audit()
+    assert not [e for e in auditor.errors if "Внутренняя пересортица" in e.title]
+
+
+def test_internal_mismatch_resolved_within_period_quiet_whole():
+    # Минус в январе, закрыт к концу (мультипериод): за весь период тихо,
+    # помесячный слайс (январь) — warning.
+    df = osv([
+        ["2026-01-31", "19.04", "ЕСП АО", "A", 0, 0, 0, 0, -901.64, 0],
+        ["2026-01-31", "19.04", "БОРИСЕНКО", "A", 0, 0, 0, 0, 5000, 0],
+        ["2026-02-28", "19.04", "ЕСП АО", "A", 0, 0, 0, 0, 0, 0],
+        ["2026-02-28", "19.04", "БОРИСЕНКО", "A", 0, 0, 0, 0, 5000, 0],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance", "active_internal_mismatch"})
+    auditor.run_audit()
+    assert not [e for e in auditor.errors if "Внутренняя пересортица" in e.title]
+    jan = df[df["Период"] == "2026-01-31"]
+    auditor_m = AutoAuditor1C(jan, checks={"red_balance", "active_internal_mismatch"})
+    auditor_m.run_audit()
+    mis = [e for e in auditor_m.errors if "Внутренняя пересортица" in e.title]
+    assert len(mis) == 1
+
+
+def test_internal_mismatch_persists_to_end_whole_period():
+    # Минус по аналитике держится до конца диапазона при плюсовом счете: warning
+    # виден и за весь период.
+    df = osv([
+        ["2026-01-31", "19.04", "ЕСП АО", "A", 0, 0, 0, 0, -901.64, 0],
+        ["2026-01-31", "19.04", "БОРИСЕНКО", "A", 0, 0, 0, 0, 5000, 0],
+        ["2026-02-28", "19.04", "ЕСП АО", "A", 0, 0, 0, 0, -901.64, 0],
+        ["2026-02-28", "19.04", "БОРИСЕНКО", "A", 0, 0, 0, 0, 5000, 0],
+    ])
+    auditor = AutoAuditor1C(df, checks={"red_balance", "active_internal_mismatch"})
+    auditor.run_audit()
+    mis = [e for e in auditor.errors if "Внутренняя пересортица" in e.title]
+    assert len(mis) == 1
+    assert len(mis[0]["data"]) == 1
+
+
+def test_internal_mismatch_real_19_xls():
+    # Реальный файл 19.xls: счет 19 в плюсе (+6,5 млн) — warning с 6 строками,
+    # в «Счет» родитель, в комментарии точный субсчет.
+    from core.loaders import load_osv_file
+    with open("tests/fixtures/Оборотно-сальдовая ведомость по счету 19 за 1-st half year of 2026.xls", "rb") as f:
+        data = f.read()
+    df, _ = load_osv_file("19.xls", data)
+    auditor = AutoAuditor1C(df, closing_accounts=["90"], checks={"red_balance", "active_internal_mismatch"})
+    auditor.run_audit()
+    assert not [e for e in auditor.errors if "Красное сальдо" in e.title]
+    mis = [e for e in auditor.errors if "Внутренняя пересортица" in e.title]
+    assert len(mis) == 1
+    assert len(mis[0]["data"]) == 6
+    assert set(mis[0]["data"]["Счет"]) == {"19"}
+    assert mis[0]["data"]["Комментарий"].astype(str).str.contains("на субсчете").any()
 
 
 # ---------------- 4.2 Развернутое сальдо ----------------
@@ -1775,3 +1948,24 @@ def test_get_raw_balances_empty_without_balances():
     raw = auditor.get_raw_balances("60")
     assert isinstance(raw, pd.DataFrame)
     assert raw.empty
+
+
+def test_from_findings_hydrates_default_attributes():
+    """from_findings (rebuild из истории) инициализирует атрибуты, как __init__."""
+    from core import ml
+
+    auditor = AutoAuditor1C.from_findings([])
+    assert auditor.checks == set()
+    assert auditor.balance_group_checks is False
+    assert auditor.stuck_balance_checks is False
+    assert auditor.ml_enabled is False
+    assert auditor.ml_amount_anomalies is False
+    assert auditor.ml_turnover_jumps is False
+    assert auditor.ml_duplicates is False
+    assert auditor.nlp_enabled is False
+    assert auditor.anomaly_k == ml.DEFAULT_K
+    assert auditor.anomaly_min_abs == ml.DEFAULT_MIN_ABS
+    assert auditor.anomaly_min_ops == ml.DEFAULT_MIN_OPS
+    assert auditor.jump_ratio == ml.DEFAULT_JUMP_RATIO
+    assert auditor.jump_min_abs == ml.DEFAULT_JUMP_MIN_ABS
+    assert auditor.dup_threshold == ml.DEFAULT_SIM_THRESHOLD

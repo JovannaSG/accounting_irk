@@ -291,3 +291,16 @@ def test_plan_override():
     data = open(REAL_XLS, "rb").read()
     df, _ = load_osv_file(REAL_XLS.name, data, plan_override="71:P, 999:A")
     assert df[df["Счет"] == "71"].iloc[0]["Тип"] == "P"
+
+
+def test_load_semicolon_csv():
+    """CSV с разделителем «;» (локаль) читается корректно."""
+    csv_text = (
+        "Период;Счет;Субконто;Тип;НачалоДебет;НачалоКредит;"
+        "ОборотДебет;ОборотКредит;КонецДебет;КонецКредит\n"
+        "2026-01-31;51;Расчетный счет;A;0;0;2000000;1500000;500000;0\n"
+    )
+    df, info = load_osv_file("osv.csv", csv_text.encode("utf-8"))
+    assert len(df) == 1
+    assert df.iloc[0]["Счет"] == "51"
+    assert float(df.iloc[0]["КонецДебет"]) == 500000.0

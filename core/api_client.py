@@ -66,10 +66,7 @@ class OneCClient:
                 break
 
             all_records.extend(chunk)
-
-            if len(chunk) < params.get("$top", 1000):
-                break
-            params["$skip"] = params.get("$skip", 0) + params.get("$top", 1000)
+            params["$skip"] = params.get("$skip", 0) + len(chunk)
 
         return all_records
 

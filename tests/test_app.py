@@ -284,15 +284,10 @@ def test_batch_audit_loads_and_audits(tmp_path, monkeypatch):
     """Batch-режим загружает несколько баз из JSON и аудитует каждую."""
     from core.api_client import OneCClient
 
-    # AppTest.from_file создаёт свежий контекст — монкейпатч на модуль не действует.
-    # Пишем JSON в реальный корень, но БЕЗОПАСНО: бэкап/восстановление.
-    real_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    json_path = os.path.join(real_root, "client_databases.json")
-
-    backup: bytes | None = None
-    if os.path.exists(json_path):
-        with open(json_path, "rb") as f:
-            backup = f.read()
+    # Файл баз изолируем в tmp_path через переменную окружения:
+    # тест не трогает реальный client_databases.json в корне проекта.
+    batch_json = tmp_path / "client_databases.json"
+    monkeypatch.setenv("AUDIT_BATCH_JSON_PATH", str(batch_json))
 
     json_content = (
         '[{"name": "База А", "url": "https://a.1cfresh.com/x",'
@@ -302,59 +297,50 @@ def test_batch_audit_loads_and_audits(tmp_path, monkeypatch):
         '{"name": "База без пароля", "url": "https://c.1cfresh.com/x",'
         ' "login": "", "password": ""}]'
     )
+    batch_json.write_text(json_content, encoding="utf-8")
 
-    try:
-        with open(json_path, "w", encoding="utf-8") as f:
-            f.write(json_content)
+    fake_df = pd.DataFrame([
+        ["2026-01-31", "20", "-", "A", 0.0, 100.0, 0.0, 0.0, 0.0, 100.0],
+    ], columns=[
+        "Период", "Счет", "Субконто", "Тип",
+        "НачалоДебет", "НачалоКредит", "ОборотДебет", "ОборотКредит",
+        "КонецДебет", "КонецКредит",
+    ])
 
-        fake_df = pd.DataFrame([
-            ["2026-01-31", "20", "-", "A", 0.0, 100.0, 0.0, 0.0, 0.0, 100.0],
-        ], columns=[
-            "Период", "Счет", "Субконто", "Тип",
-            "НачалоДебет", "НачалоКредит", "ОборотДебет", "ОборотКредит",
-            "КонецДебет", "КонецКредит",
-        ])
+    def fake_fetch(self, start, end):
+        return fake_df.copy(), {}
 
-        def fake_fetch(self, start, end):
-            return fake_df.copy(), {}
+    monkeypatch.setattr(OneCClient, "fetch_osv_monthly", fake_fetch)
 
-        monkeypatch.setattr(OneCClient, "fetch_osv_monthly", fake_fetch)
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.run()
+    assert not at.exception
 
-        at = AppTest.from_file(APP, default_timeout=30)
-        at.run()
-        assert not at.exception
+    at.sidebar.radio(key="data_source").set_value("📊 Аудит всех баз")
+    at.run()
+    assert not at.exception
 
-        at.sidebar.radio(key="data_source").set_value("📊 Аудит всех баз")
-        at.run()
-        assert not at.exception
+    caption_texts = [c.value for c in at.caption]
+    assert any("3" in t for t in caption_texts)
 
-        caption_texts = [c.value for c in at.caption]
-        assert any("3" in t for t in caption_texts)
+    at.sidebar.button(key="btn_fetch_batch").click()
+    at.run()
+    assert not at.exception
 
-        at.sidebar.button(key="btn_fetch_batch").click()
-        at.run()
-        assert not at.exception
+    assert "batch_datasets" in at.session_state
+    batch = at.session_state["batch_datasets"]
+    assert len(batch) == 2
+    assert batch[0]["name"] == "База А"
+    assert batch[1]["name"] == "База Б"
 
-        assert "batch_datasets" in at.session_state
-        batch = at.session_state["batch_datasets"]
-        assert len(batch) == 2
-        assert batch[0]["name"] == "База А"
-        assert batch[1]["name"] == "База Б"
+    at.button(key="btn_audit").click()
+    at.run()
+    assert not at.exception
 
-        at.button(key="btn_audit").click()
-        at.run()
-        assert not at.exception
-
-        history = at.session_state["audit_history"]
-        names = [h["db_name"] for h in history]
-        assert "База А" in names
-        assert "База Б" in names
-    finally:
-        if backup is not None:
-            with open(json_path, "wb") as f:
-                f.write(backup)
-        elif os.path.exists(json_path):
-            os.remove(json_path)
+    history = at.session_state["audit_history"]
+    names = [h["db_name"] for h in history]
+    assert "База А" in names
+    assert "База Б" in names
 
 
 # ── Панель управления пользователями (ТЗ §11, админ) ──

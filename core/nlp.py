@@ -22,6 +22,16 @@ NLP_COLUMNS: list[str] = [
     "Сумма", "Комментарий",
 ]
 
+
+def _safe_amount(value: object) -> float:
+    """Защитный перевод суммы в float: None/NaN/нечисловое значение -> 0.0."""
+    if value is None:
+        return 0.0
+    try:
+        return float(value) if not pd.isna(value) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
 # Кураторские правила: (категория, регулярное выражение, описание маркера)
 # Текст проверяется в нижнем регистре; шаблоны пишутся только строчными
 RISK_PATTERNS: list[tuple[str, str, str]] = [
@@ -153,8 +163,7 @@ def detect_payment_risks(
                 "Документ": r.get("Документ", ""),
                 "Контрагент": r.get("Контрагент", ""),
                 "Вид": r.get("Вид", ""),
-                # float() защитит от проброса numpy-типов в JSON при сохранении в SQLite
-                "Сумма": float(r.get("Сумма", 0.0)),
+                "Сумма": _safe_amount(r.get("Сумма", 0.0)),
                 "Комментарий": (
                     f"[{category}] {'; '.join(markers)} "
                     f"— назначение платежа: «{snippet}»"

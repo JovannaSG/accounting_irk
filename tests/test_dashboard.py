@@ -13,6 +13,7 @@ from core.dashboard import (
     dashboard_to_csv,
     dashboard_to_excel,
     find_result,
+    find_result_safe,
     split_base_number,
 )
 import core.db
@@ -238,6 +239,38 @@ def test_find_result_matches_clean_name():
     history = [result(db="База 1"), result(db="12;ИП Иванов")]
     assert find_result(history, "ИП Иванов")["db_name"] == "12;ИП Иванов"
     assert find_result(history, "12;ИП Иванов")["db_name"] == "12;ИП Иванов"
+
+
+def test_find_result_safe_prefers_latest():
+    history = [
+        result(db="База 1"), result(db="База 2"),
+        {"db_name": "База 1", "viewed_at": "13.08.2026 10:00",
+         "details": details([]), "total_flags": 7},
+    ]
+    res = find_result_safe(history, "База 1")
+    assert res["total_flags"] == 7
+
+
+def test_find_result_safe_matches_period_suffixed_clean_name():
+    r = result(db="12;ИП Иванов")
+    r["period"] = "01.2026"
+    history = [r]
+    res = find_result_safe(history, "ИП Иванов (01.2026)", target_period="01.2026")
+    assert res is not None
+    assert res["db_name"] == "12;ИП Иванов"
+
+
+def test_find_result_safe_filters_by_period():
+    r1 = result(db="База 1")
+    r1["period"] = "01.2026"
+    r1["total_flags"] = 1
+    r2 = result(db="База 1")
+    r2["period"] = "02.2026"
+    r2["total_flags"] = 9
+    history = [r1, r2]
+    assert find_result_safe(history, "База 1 (02.2026)", "02.2026")["total_flags"] == 9
+    assert find_result_safe(history, "База 1", "01.2026")["total_flags"] == 1
+    assert find_result_safe(history, "База 1", "03.2026") is None
 
 
 def test_block_dfs_splits_by_check_type():

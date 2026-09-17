@@ -32,6 +32,7 @@ from core.dashboard import (
     build_dashboard_df,
     dashboard_to_csv,
     dashboard_to_excel,
+    find_result_safe,
     split_base_number,
 )
 from core.loaders import load_osv_file
@@ -578,41 +579,6 @@ def _render_dashboard_exports(result: dict) -> None:
         c_pdf.error(f"PDF недоступен: {exc}")
 
 
-def find_result_safe(
-    history: list[dict],
-    target_base: str,
-    target_period: str | None = None
-) -> dict | None:
-    """
-    Безопасный поиск результата аудита по Базе и Периоду без использования for.
-    Возвращает последнее (свежее) совпадение (LIFO).
-    """
-
-    i: int = len(history) - 1
-
-    while i >= 0:
-        res = history[i]
-
-        # Имя базы может иметь вид «12;ИП Иванов» — в мастер-таблице номер
-        # уходит в первую колонку, а здесь сравниваем по чистому имени.
-        entry_base = str(res.get("db_name") or "")
-        _, clean_base = split_base_number(entry_base)
-
-        if entry_base == target_base or clean_base == target_base:
-
-            if target_period is not None and target_period != "—":
-                res_period = str(res.get("period", ""))
-
-                if res_period == target_period:
-                    return res
-            else:
-                return res
-
-        i -= 1
-
-    return None
-
-
 def _render_dashboard(history: list[dict]) -> None:
     """
     Сводный дашборд по базам (Master-Detail)
@@ -1032,7 +998,10 @@ elif data_source.startswith("☁️"):
 elif data_source.startswith("📊"):
     merge_mode = "Объединить в одну базу"
 
-    _BATCH_JSON_PATH = os.path.join(_PROJECT_ROOT, "client_databases.json")
+    _BATCH_JSON_PATH = os.environ.get(
+        "AUDIT_BATCH_JSON_PATH",
+        os.path.join(_PROJECT_ROOT, "client_databases.json"),
+    )
 
     if not os.path.exists(_BATCH_JSON_PATH):
         st.sidebar.error(
@@ -1092,6 +1061,12 @@ with st.sidebar.expander("⚙️ Настройки проверок"):
     chk_unclosed = st.checkbox("4.3 Незакрытое сальдо на конец месяца", value=True)
     chk_000 = st.checkbox("4.4 Счет 000", value=True)
     chk_settlements = st.checkbox("4.5 Незакрытые расчеты с контрагентами", value=True)
+    chk_mismatch = st.checkbox(
+        "4.7 Внутренняя пересортица по аналитике активного счета",
+        value=True,
+        help="Предупреждение: итог по активному счету положительный, но по "
+             "конкретной аналитике (субсчет/договор) сложился минус.",
+    )
     st.caption(
         "«Незакрытые расчеты» и «Расхождение документов и остатков ОСВ» "
         "работают только при загруженном «Реестре документов (CSV)»."
@@ -1509,7 +1484,8 @@ checks_data = [
     ("expanded_balance", chk_expanded),
     ("unclosed_month_end", chk_unclosed),
     ("account_000", chk_000),
-    ("settlements", chk_settlements)
+    ("settlements", chk_settlements),
+    ("active_internal_mismatch", chk_mismatch)
 ]
 checks = set()
 i = 0

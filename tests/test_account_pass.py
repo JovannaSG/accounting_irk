@@ -188,3 +188,27 @@ def test_to_pdf_contains_pass_section():
     # Дублирующий раздел «Отчет по счетам» удален из печатного отчета
     assert "Отчет по счетам" not in text
     assert "Стр." in text  # нумерация страниц
+
+
+def test_to_excel_colors_pass_sheet_by_level():
+    """Лист «Проход по счетам»: колонка «Уровень» ищется по заголовку и красится."""
+    pass_data = _make_pass()
+    df = osv([["2026-01-31", "50", "-", "A", 0, 0, 0, 0, 0, 5000]])
+    auditor = AutoAuditor1C(df)
+    auditor.run_audit()
+
+    import openpyxl
+
+    wb = openpyxl.load_workbook(io.BytesIO(auditor.to_excel(account_pass=pass_data)))
+    ws = wb["Проход по счетам"]
+    headers = [c.value for c in ws[1]]
+    assert "Уровень" in headers
+    lvl_col = headers.index("Уровень")
+
+    error_fills = 0
+    for row in ws.iter_rows(min_row=2):
+        if row[lvl_col].value == "error":
+            fill = row[lvl_col].fill
+            if fill and fill.start_color and fill.start_color.rgb.endswith("FFC7CE"):
+                error_fills += 1
+    assert error_fills >= 1

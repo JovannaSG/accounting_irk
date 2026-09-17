@@ -74,11 +74,13 @@ CHECK_KEYS: dict[str, str] = {
     "unclosed_month_end": "4.3 Незакрытое сальдо на конец месяца",
     "account_000": "4.4 Счет 000",
     "settlements": "4.5 Незакрытые расчеты с контрагентами",
+    "active_internal_mismatch": "4.7 Внутренняя пересортица по аналитике активного счета",
 }
 
 RECOMMENDATIONS: dict[str, str] = {
     "Красное сальдо: активный счет с кредитовым остатком": "Проверьте проводки по счету и корректность начальных остатков.",
     "Красное сальдо: пассивный счет с дебетовым остатком": "Проверьте проводки по счету. Дебетовый остаток на пассивном счете указывает на переплату или ошибку.",
+    "Внутренняя пересортица по аналитике активного счета": "Итог по счету положительный, но по конкретной аналитике (субсчет/договор) сформировался минус. Проверьте корректность ввода документов.",
     "Развернутое сальдо по аналитике": "У одного контрагента одновременно дебетовый и кредитовый остаток. Проверьте зачет аванса.",
     "Незакрытое сальдо на конец месяца (закрываемые счета)": "Выполните регламентную операцию «Закрытие месяца».",
     "Зависшее сальдо (не меняется между периодами)": "Проверьте, не «повисли» ли расчеты, которые должны были закрыться.",
@@ -135,6 +137,7 @@ SECTION_SPECS: list[tuple[str, tuple[str, ...]]] = [
     ("Красное и развернутое сальдо", (
         "Красное сальдо: активный счет с кредитовым остатком",
         "Красное сальдо: пассивный счет с дебетовым остатком",
+        "Внутренняя пересортица по аналитике активного счета",
         "Развернутое сальдо по аналитике",
     )),
     ("Расчеты с контрагентами", (
@@ -507,6 +510,7 @@ class AutoAuditor1C:
             "Красное сальдо: активный счет с кредитовым остатком",
             "Красное сальдо: пассивный счет с дебетовым остатком",
             "Красное сальдо: субконто активно-пассивного счета противоположно итогу",
+            "Внутренняя пересортица по аналитике активного счета",
             "Развернутое сальдо по аналитике",
             "Незакрытое сальдо на конец месяца (закрываемые счета)",
             "Зависшее сальдо (не меняется между периодами)",
@@ -691,6 +695,23 @@ class AutoAuditor1C:
                 | (end_rows["КонецКредит"] < -EPS)
             ),
         )
+
+        # Фикс 2: для активных счетов не флагаем красное по аналитике, если
+        # итог по родительскому счёту на конец периода не красный. Минус в
+        # одной группе при плюсе в другой — развёрнутое сальдо (например,
+        # переплата НДС у одного поставщика), счёт в целом не в минусе.
+        if active_end_keys:
+            act_end = end_rows[end_rows["Тип"] == "A"].copy()
+            if not act_end.empty:
+                act_end["_parent"] = act_end["Счет"].map(account_group)
+                act_end["_net"] = act_end["КонецДебет"] - act_end["КонецКредит"]
+                parent_total = act_end.groupby("_parent")["_net"].transform("sum")
+                red_parents = set(act_end.loc[parent_total < -EPS, "_parent"])
+                active_end_keys = {
+                    key for key in active_end_keys
+                    if account_group(key[1]) in red_parents
+                }
+
         passive_end_keys = _end_keys(
             end_rows,
             (end_rows["Тип"] == "P")
@@ -785,6 +806,60 @@ class AutoAuditor1C:
                     "Красное сальдо: субконто активно-пассивного счета противоположно итогу",
                     ap_negative
                 )
+
+    def check_active_internal_mismatch(self) -> None:
+        b = self.balances
+        if b.empty:
+            return
+
+        # 4.7 — «пересортица» внутри активного счета: итог по счету на конец
+        # диапазона положительный (или ноль), но по конкретной аналитике
+        # (субсчет/договор) сложился минус. Это warning, а не ошибка: баланс
+        # сходится, но внутри аналитики есть расхождение (например, переплата
+        # НДС у одного поставщика). Зеркалит check_red_balance (та же логика
+        # end_rows), но фильтр родителя инвертирован: если итог счета красный,
+        # 4.1 уже пометил это как ошибку — здесь не дублируем.
+        key_cols = ["Организация", "Счет", "Субконто", "Договор"]
+        pkey = period_sort_series(b["Период"])
+        group_max = (
+            b.assign(_pkey=pkey)
+            .groupby(key_cols, dropna=False)["_pkey"]
+            .transform("max")
+        )
+        unparsed_period = pd.isna(group_max)
+        end_rows = b[unparsed_period | (pkey == group_max)]
+
+        active_end = end_rows[end_rows["Тип"] == "A"].copy()
+        if active_end.empty:
+            return
+        active_end["_parent"] = active_end["Счет"].map(account_group)
+        active_end["_net"] = active_end["КонецДебет"] - active_end["КонецКредит"]
+
+        parent_net = active_end.groupby("_parent")["_net"].sum()
+        ok_parents = set(parent_net[parent_net >= -EPS].index)
+
+        mask_negative = (
+            (active_end["_net"] < -EPS)
+            | (active_end["КонецДебет"] < -EPS)
+            | (active_end["КонецКредит"] < -EPS)
+        )
+        candidates = active_end[mask_negative]
+        candidates = candidates[candidates["_parent"].isin(ok_parents)]
+        if candidates.empty:
+            return
+
+        mismatch = self._annotate_since(
+            b,
+            b.index.isin(candidates.index),
+            "Итог по счету положительный, но по аналитике сформировался минус",
+            "отрицательное сальдо с"
+        )
+        if not mismatch.empty:
+            self._add(
+                "warning",
+                "Внутренняя пересортица по аналитике активного счета",
+                mismatch
+            )
 
     def check_expanded_balance(self) -> None:
         b = self.balances
@@ -1405,6 +1480,8 @@ class AutoAuditor1C:
         self.errors = []
         if self._check_enabled("red_balance"):
             self.check_red_balance()
+        if self._check_enabled("active_internal_mismatch"):
+            self.check_active_internal_mismatch()
         if self._check_enabled("expanded_balance"):
             self.check_expanded_balance()
         if self._check_enabled("unclosed_month_end"):
@@ -1447,6 +1524,21 @@ class AutoAuditor1C:
                 amount=float(e.get("amount") or 0.0),
             ))
         instance.errors = findings
+        instance.closing_accounts = set()
+        instance.checks: set[str] | None = set()
+        instance.balance_group_checks = False
+        instance.stuck_balance_checks = False
+        instance.ml_enabled = False
+        instance.ml_amount_anomalies = False
+        instance.ml_turnover_jumps = False
+        instance.ml_duplicates = False
+        instance.nlp_enabled = False
+        instance.anomaly_k = ml.DEFAULT_K
+        instance.anomaly_min_abs = ml.DEFAULT_MIN_ABS
+        instance.anomaly_min_ops = ml.DEFAULT_MIN_OPS
+        instance.jump_ratio = ml.DEFAULT_JUMP_RATIO
+        instance.jump_min_abs = ml.DEFAULT_JUMP_MIN_ABS
+        instance.dup_threshold = ml.DEFAULT_SIM_THRESHOLD
         return instance
 
     def summary_df(self) -> pd.DataFrame:
@@ -1896,15 +1988,19 @@ class AutoAuditor1C:
                             for cell in row_cells:
                                 cell.number_format = _EXCEL_MONEY_FORMAT
 
-            sheets_to_color = [("Сводный отчет", 1), ("Детальный отчет", 1)]
+            sheets_to_color = ["Сводный отчет", "Детальный отчет"]
             if not pass_details.empty:
-                sheets_to_color.append(("Проход по счетам", 2))
+                sheets_to_color.append("Проход по счетам")
 
-            for sheet, level_col in sheets_to_color:
+            for sheet in sheets_to_color:
                 ws = wb[sheet]
                 _finish_table_sheet(ws)
+                header = [c.value for c in ws[1]]
+                if "Уровень" not in header:
+                    continue
+                lvl_col = header.index("Уровень")
                 for row in ws.iter_rows(min_row=2):
-                    level = row[level_col].value
+                    level = row[lvl_col].value
                     if level == "error":
                         fill = red_fill
                     else:

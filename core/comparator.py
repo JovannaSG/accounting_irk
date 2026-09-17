@@ -33,9 +33,10 @@ def compare_audits(
                 return df[name].fillna("").astype(str).str.strip()
             return pd.Series([""] * len(df), index=df.index)
 
-        # Ключ ошибки: Тип проверки + Счет + Контрагент
+        # Ключ ошибки: Период + Тип проверки + Счет + Контрагент
         return (
-            _get_col("Проверка") + "|"
+            _get_col("Период") + "|"
+            + _get_col("Проверка") + "|"
             + _get_col("Счет") + "|"
             + _get_col("Субконто")
         )

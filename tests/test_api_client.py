@@ -395,3 +395,29 @@ def test_fetch_osv_account_subconto_filters_and_resolves():
     assert "$select" in params, "В запросе отсутствует обязательный параметр $select"
     assert "ExtDimension1" in params["$select"], "В $select не запрошено первое субконто (ExtDimension1)"
     assert "ExtDimension2" in params["$select"], "В $select не запрошено второе субконто (ExtDimension2)"
+
+
+def test_pagination_does_not_stop_on_short_page():
+    """OData-сервер может отдавать меньше $top на страницу — это не конец данных."""
+
+    class CappedSession(FakeSession):
+        """Имитирует сервер с внутренним лимитом страницы 500 при $top=1000."""
+
+        def get(self, endpoint, params, timeout):
+            self.calls.append((endpoint, dict(params), timeout))
+            if endpoint in self.errors:
+                return self.errors[endpoint]
+            page = self.pages.get(endpoint, [])
+            skip = params.get("$skip", 0)
+            return FakeResponse({"value": page[skip:skip + 500]})
+
+    rows = [_make_osv_row("60") for _ in range(1200)]
+    session = CappedSession(pages={REGISTER_EP: rows, CHART_EP: _chart_rows(["60"])})
+    client = OneCClient(FRESH_BASE, "u", "p")
+    client.session = session
+
+    df = client.fetch_osv("2026-01-01T00:00:00", "2026-06-30T23:59:59")
+
+    assert len(df) == 1200
+    reg_skips = [c[1]["$skip"] for c in session.calls if c[0] == REGISTER_EP]
+    assert reg_skips == [0, 500, 1000, 1200]

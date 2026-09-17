@@ -593,6 +593,19 @@ def load_audit_history(
         history.append(entry)
 
     conn.close()
+
+    # viewed_at хранится как DD.MM.YYYY HH:MM — лексикографическая сортировка даёт
+    # неверный порядок. Сортируем по распарсенной дате (работает и для legacy, и для ISO).
+    def _viewed_ts(entry: dict) -> datetime:
+        val = str(entry.get("viewed_at") or "").strip()
+        for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(val, fmt)
+            except ValueError:
+                continue
+        return datetime.min
+
+    history.sort(key=_viewed_ts)
     return history
 
 
